@@ -193,27 +193,12 @@ class OutputLimits(BaseModel):
 
 DEFAULT_CLAUDE_CODE_TOOLS: tuple[str, ...] = (
     "Read(./**)",
-    "Edit(./**)",
-    "Write(./**)",
+    "Edit(./**)",  # Edit rules cover every file-editing tool, Write included; Write(...) rules are ignored
     "Glob",
     "Grep",
-    "Bash(make *)",
-    "Bash(cmake *)",
-    "Bash(gcc *)",
-    "Bash(cc *)",
-    "Bash(arm-none-eabi-gcc *)",
-    "Bash(arm-none-eabi-size *)",
-    "Bash(arm-none-eabi-objdump *)",
-    "Bash(qemu-system-arm *)",
-    "Bash(pandoc *)",
-    "Bash(python *)",
-    "Bash(python3 *)",
-    "Bash(pytest *)",
-    "Bash(git *)",
-    "Bash(ls *)",
-    "Bash(mkdir *)",
-    "Bash(timeout *)",
-    "Bash(./*)",
+    # Bash runs inside Claude Code's OS sandbox (bubblewrap): writes limited to the workspace, no network,
+    # sensitive paths unreadable. Sandboxed commands are auto-allowed, so per-command patterns add nothing.
+    "Bash",
 )
 """Allowed tools for Claude Code in the workspace: edit, build, test, QEMU. No web tools. File tools are
 scoped to the workspace (``./**`` is relative to Claude Code's cwd); a bare ``Read``/``Edit``/``Write`` rule

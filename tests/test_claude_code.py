@@ -19,6 +19,7 @@ from maf.providers.claude_code import (
     ClaudeCodeProvider,
     ClaudeCodeTimeout,
     CompletedProcess,
+    builtin_tools,
     sandbox_settings,
     subprocess_runner,
 )
@@ -86,7 +87,7 @@ def test_sandbox_settings(tmp_path: Path) -> None:
             "enabled": True,
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
-            "autoAllowBashIfSandboxed": False,
+            "autoAllowBashIfSandboxed": True,
             "filesystem": {"allowWrite": [str(tmp_path.resolve())], "denyRead": ["~/.ssh", "/srv/vault/"]},
             "network": {"allowedDomains": []},
         },
@@ -113,7 +114,12 @@ def test_default_tools_have_no_unscoped_file_rules(tmp_path: Path) -> None:
     argv = provider.build_argv(_req())
     listed = argv[argv.index("--allowedTools") + 1 : argv.index("--disallowedTools")]
     assert not {"Read", "Edit", "Write", "MultiEdit", "NotebookEdit"} & set(listed)
-    assert {"Read(./**)", "Edit(./**)", "Write(./**)"} <= set(listed)
+    assert {"Read(./**)", "Edit(./**)"} <= set(listed)
+    assert "Write" in _flag(argv, "--tools").split(",")  # available, governed by the Edit rule
+
+
+def test_builtin_tools_strips_rule_patterns() -> None:
+    assert builtin_tools(("Read(./**)", "Bash", "Bash(make *)", "Glob")) == ["Read", "Bash", "Glob"]
 
 
 def test_build_argv_minimal(tmp_path: Path) -> None:
@@ -129,12 +135,15 @@ def test_build_argv_minimal(tmp_path: Path) -> None:
         "--permission-mode", "dontAsk",
         "--permission-prompts", "none",
         "--no-session-persistence",
-        "--bare",
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--tools", ",".join(builtin_tools(TOOLS)),
         "--settings", json.dumps(sandbox_settings(tmp_path / "ws"), separators=(",", ":")),
         "--allowedTools", *TOOLS,
         "--disallowedTools", "WebFetch", "WebSearch",
     ]  # fmt: skip
     assert "--add-dir" not in argv
+    assert "--bare" not in argv  # simple mode would hide Write/Glob/Grep
     assert DISALLOWED_TOOLS == ("WebFetch", "WebSearch")
 
 
@@ -189,8 +198,8 @@ def test_build_env_drops_other_keys_and_scopes_temp_dirs(
         tmp_path, _out("claude_code_success"), extra_env={"FOO": "bar"}, path_prepend=[Path("/venv/bin")]
     )
     env = provider.build_env()
-    assert env["ANTHROPIC_API_KEY"] == "sk-ant-test-not-real"
-    assert env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+    assert "ANTHROPIC_API_KEY" not in env  # sandboxed Bash inherits the env; the key goes via apiKeyHelper
+    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in env  # disables the OS sandbox in CLI 2.1.284
     assert env["LC_ALL"] == "C.UTF-8"
     for dropped in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "CLAUDECODE", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"):
         assert dropped not in env
@@ -229,11 +238,16 @@ def test_parse_output_without_result(stdout: str) -> None:
 
 
 def test_complete_success(tmp_path: Path, api_key: None) -> None:
-    provider, runner = _provider(tmp_path, _out("claude_code_success"))
+    provider, runner = _provider(tmp_path, _out("claude_code_success"), secrets_dir=tmp_path / "secrets")
     req = _req(system="sys")
     result = provider.complete(req)
     call = runner.calls[0]
-    assert call["argv"] == provider.build_argv(req)
+    settings = json.loads(_flag(call["argv"], "--settings"))
+    helper = settings["apiKeyHelper"]
+    assert call["argv"] == provider.build_argv(req, api_key_helper=helper)
+    assert helper.startswith(f"cat {tmp_path / 'secrets'}/anthropic-")
+    assert not list((tmp_path / "secrets").iterdir())  # key file removed after the call
+    assert "ANTHROPIC_API_KEY" not in call["env"]
     assert call["stdin"] == "Implement the allocator."
     assert call["cwd"] == tmp_path / "ws"
     assert call["timeout"] == 120.0
@@ -249,6 +263,22 @@ def test_complete_success(tmp_path: Path, api_key: None) -> None:
     assert result.usage.cached_input_tokens == 480000
     assert result.raw["num_turns"] == 37
     assert result.parsed is None
+
+
+def test_key_file_holds_key_with_private_mode_during_call(tmp_path: Path, api_key: None) -> None:
+    seen: dict[str, Any] = {}
+
+    def runner(argv: list[str], stdin: str, cwd: Path, env: dict[str, str], timeout: float) -> CompletedProcess:
+        path = Path(json.loads(_flag(argv, "--settings"))["apiKeyHelper"].split(" ", 1)[1])
+        seen["key"], seen["mode"] = path.read_text(), path.stat().st_mode & 0o777
+        return _out("claude_code_success")
+
+    provider = ClaudeCodeProvider(
+        tmp_path / "ws", executable=Path("/opt/claude"), allowed_tools=TOOLS, runner=runner, secrets_dir=tmp_path / "s"
+    )
+    provider.complete(_req())
+    assert seen == {"key": "sk-ant-test-not-real", "mode": 0o600}
+    assert not list((tmp_path / "s").iterdir())
 
 
 def test_complete_structured(tmp_path: Path, api_key: None) -> None:

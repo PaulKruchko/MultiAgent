@@ -10,7 +10,9 @@ CLI facts, verified from ``claude --help`` (v2.1.284) and strings in the binary:
   ``--permission-mode dontAsk`` (anything not allowed is denied, no prompts),
   ``--permission-prompts none``, ``--no-session-persistence``, ``--json-schema <schema>``,
   ``--append-system-prompt <text>``, ``--settings <json>``, ``--add-dir`` (NOT used: no dirs outside cwd),
-  ``--bare`` (skip hooks/CLAUDE.md/plugins; auth strictly ``ANTHROPIC_API_KEY``).
+  ``--tools <list>`` (the built-in tool set), ``--setting-sources ""`` (no user/project/local settings, so no
+  hooks or plugins), ``--strict-mcp-config`` (no MCP servers). ``--bare`` is NOT used: it forces a simple mode
+  that exposes only Bash/Read/Edit, which ``--tools`` cannot widen (verified live 2026-09-28).
 - Result JSON (single object): ``type="result"``, ``subtype`` in {``success``, ``error_max_turns``,
   ``error_during_execution``, ``error_max_budget_usd``}, ``is_error``, ``result`` (final text),
   ``session_id``, ``total_cost_usd``, ``duration_ms``, ``duration_api_ms``, ``num_turns``,
@@ -20,16 +22,19 @@ Sandbox: the subprocess cwd is ``workspaces/<run_id>/``. Writes outside it are p
 (a) no ``--add-dir``, (b) ``--permission-mode dontAsk`` with an explicit allowlist, and
 (c) Claude Code's OS sandbox for Bash via ``--settings``:
 ``{"sandbox": {"enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false,
-"autoAllowBashIfSandboxed": false, "filesystem": {"allowWrite": ["<workspace>"]},
+"autoAllowBashIfSandboxed": true, "filesystem": {"allowWrite": ["<workspace>"]},
 "network": {"allowedDomains": []}}}`` (bubblewrap is installed at /usr/bin/bwrap). Web tools are disallowed.
 
 File tools are allowed only with a workspace scope (``Read(./**)``, ``Edit(./**)``, ``Write(./**)``;
 ``check_scoped_tools`` rejects bare rules), and ``SENSITIVE_READ_PATHS`` are denied to both the file tools
 (``permissions.deny``) and sandboxed Bash (``sandbox.filesystem.denyRead``).
 
-The subprocess env is built from an allowlist (``PATH``, ``HOME``, locale, ``ANTHROPIC_API_KEY``...), so
-other credentials and ``CLAUDECODE`` (nested-session detection) never reach it, and
-``CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`` asks the CLI to strip its API key from Bash children.
+The subprocess env is built from an allowlist (``PATH``, ``HOME``, locale...), so credentials and ``CLAUDECODE``
+(nested-session detection) never reach it. ``ANTHROPIC_API_KEY`` is NOT in the env either (sandboxed Bash
+inherits the CLI's env): the key goes to the CLI through ``apiKeyHelper`` (``cat`` of a per-call 0600 file
+under ``~/.config/maf/secrets``, which the sandbox cannot read), deleted when the call ends.
+``CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`` is NOT used: in CLI 2.1.284 it forces the default permission mode and
+the OS sandbox stops confining Bash writes (verified live 2026-09-28).
 ``TMPDIR`` and ``MPLCONFIGDIR`` point into ``<workspace>/.maf/`` because the sandbox only permits
 writes inside the workspace.
 """
@@ -39,8 +44,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
 import signal
 import subprocess
+import tempfile
 from collections.abc import Callable, Sequence
 from datetime import date
 from pathlib import Path
@@ -67,7 +74,7 @@ PATH_SCOPED_TOOLS = frozenset({"Read", "Edit", "Write", "MultiEdit", "NotebookEd
 """File tools whose allow rules must carry a path scope: a bare rule matches every path on the machine."""
 
 ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ")
-"""Inherited variables passed to the CLI (plus ``LC_*`` and ``ANTHROPIC_API_KEY``). Everything else, such as
+"""Inherited variables passed to the CLI (plus ``LC_*``). Everything else, such as
 cloud or GitHub tokens, is dropped, so Bash children cannot copy it into workspace artifacts."""
 
 SENSITIVE_READ_PATHS: tuple[str, ...] = (
@@ -164,23 +171,32 @@ def _kill_group(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
-def sandbox_settings(workspace: Path, deny_read: Sequence[str] = SENSITIVE_READ_PATHS) -> dict[str, Any]:
+DEFAULT_SECRETS_DIR = Path.home() / ".config" / "maf" / "secrets"
+"""Per-call API key files for ``apiKeyHelper``. Must sit under a ``SENSITIVE_READ_PATHS`` entry (``~/.config``)."""
+
+
+def sandbox_settings(
+    workspace: Path, deny_read: Sequence[str] = SENSITIVE_READ_PATHS, api_key_helper: str | None = None
+) -> dict[str, Any]:
     """The ``--settings`` JSON object shown in the module docstring, bound to ``workspace``.
 
     ``deny_read`` entries are ``~``-relative or absolute paths. They become ``Read``/``Edit`` deny rules
     (``~/x/**`` or ``//abs/x/**``) and ``sandbox.filesystem.denyRead`` entries."""
     rules = [_rule_path(p) for p in deny_read]
-    return {
+    settings: dict[str, Any] = {
         "permissions": {"deny": [f"{tool}({rule})" for rule in rules for tool in ("Read", "Edit")]},
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
-            "autoAllowBashIfSandboxed": False,
+            "autoAllowBashIfSandboxed": True,
             "filesystem": {"allowWrite": [str(workspace.resolve())], "denyRead": list(deny_read)},
             "network": {"allowedDomains": []},
         },
     }
+    if api_key_helper is not None:
+        settings["apiKeyHelper"] = api_key_helper
+    return settings
 
 
 def _rule_path(path: str) -> str:
@@ -189,6 +205,15 @@ def _rule_path(path: str) -> str:
     if base.startswith("/"):
         base = "/" + base
     return f"{base}/**"
+
+
+def builtin_tools(allowed: Sequence[str]) -> list[str]:
+    """Tool names for ``--tools``: the distinct names in ``allowed`` rules (``Bash(make *)`` -> ``Bash``).
+    ``Edit`` implies ``Write``: Edit rules govern both, and Write must still be listed to be available."""
+    names = [rule.split("(", 1)[0].strip() for rule in allowed]
+    if "Edit" in names:
+        names.append("Write")
+    return list(dict.fromkeys(names))
 
 
 def check_scoped_tools(tools: Sequence[str]) -> None:
@@ -220,6 +245,7 @@ class ClaudeCodeProvider:
         deny_read: Sequence[str] = SENSITIVE_READ_PATHS,
         turn_context_tokens: int = DEFAULT_TURN_CONTEXT_TOKENS,
         turn_output_tokens: int = DEFAULT_TURN_OUTPUT_TOKENS,
+        secrets_dir: Path = DEFAULT_SECRETS_DIR,
     ) -> None:
         """``path_prepend`` puts directories (e.g. the project venv's ``bin``) first on the CLI's ``PATH``.
         ``deny_read`` lists paths no tool may read. ``turn_*_tokens`` size one model turn, the amount the CLI
@@ -235,8 +261,9 @@ class ClaudeCodeProvider:
         self._deny_read = tuple(deny_read)
         self._turn_context_tokens = turn_context_tokens
         self._turn_output_tokens = turn_output_tokens
+        self.secrets_dir = secrets_dir
 
-    def build_argv(self, request: CompletionRequest) -> list[str]:
+    def build_argv(self, request: CompletionRequest, api_key_helper: str | None = None) -> list[str]:
         """Pure argv construction (unit-tested). ``request.system`` goes via ``--append-system-prompt``;
         ``request.json_schema`` via ``--json-schema json.dumps(schema)``; ``max_budget_usd`` is required.
 
@@ -256,8 +283,10 @@ class ClaudeCodeProvider:
             "--permission-mode", "dontAsk",
             "--permission-prompts", "none",
             "--no-session-persistence",
-            "--bare",
-            "--settings", json.dumps(sandbox_settings(self.workspace, self._deny_read), separators=(",", ":")),
+            "--setting-sources", "",
+            "--strict-mcp-config",
+            "--tools", ",".join(builtin_tools(self.allowed_tools)),
+            "--settings", json.dumps(sandbox_settings(self.workspace, self._deny_read, api_key_helper), separators=(",", ":")),
         ]  # fmt: skip
         if request.system:
             argv += ["--append-system-prompt", request.system]
@@ -278,15 +307,9 @@ class ClaudeCodeProvider:
         return "\n\n".join(f"## {labels[m.role]}\n\n{m.content}" for m in request.messages)
 
     def build_env(self) -> dict[str, str]:
-        """Subprocess environment from an allowlist (``ENV_ALLOWLIST``, ``LC_*``, ``ANTHROPIC_API_KEY``), with
-        ``CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`` so the CLI strips its credentials from Bash children, plus
-        workspace-local temp dirs."""
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k in ENV_ALLOWLIST or k.startswith("LC_") or k == "ANTHROPIC_API_KEY"
-        }
-        env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+        """Subprocess environment from an allowlist (``ENV_ALLOWLIST``, ``LC_*``) plus workspace-local temp
+        dirs. No credentials: the API key reaches the CLI via ``apiKeyHelper``."""
+        env = {k: v for k, v in os.environ.items() if k in ENV_ALLOWLIST or k.startswith("LC_")}
         if self._path_prepend:
             env["PATH"] = os.pathsep.join([*(str(p) for p in self._path_prepend), env.get("PATH", "")])
         scratch = self.workspace.resolve() / ".maf"
@@ -306,15 +329,17 @@ class ClaudeCodeProvider:
         - A timeout, a crash without a JSON result, or a runner failure charges ``worst_case_cost``
           (budget plus one turn), since the real spend is unknown.
         """
-        argv = self.build_argv(request)
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ProviderError("ANTHROPIC_API_KEY is not set (required for Claude Code API billing)", provider=PROVIDER)
         env = self.build_env()
-        if not env.get("ANTHROPIC_API_KEY"):
-            raise ProviderError("ANTHROPIC_API_KEY is not set (required by claude --bare)", provider=PROVIDER)
         for directory in (self.workspace, Path(env["TMPDIR"]), Path(env["MPLCONFIGDIR"])):
             directory.mkdir(parents=True, exist_ok=True)
 
         unknown_spend = self.worst_case_cost(request)  # charged whenever the CLI's own cost report is missing
+        key_file = self._write_key_file(api_key)
         try:
+            argv = self.build_argv(request, api_key_helper=f"cat {shlex.quote(str(key_file))}")
             proc = self._runner(argv, self.build_stdin(request), self.workspace, env, self.timeout_s)
         except ClaudeCodeTimeout as exc:
             raise ProviderError(str(exc), provider=PROVIDER, cost_usd=unknown_spend) from exc
@@ -324,6 +349,8 @@ class ClaudeCodeProvider:
             raise ProviderError(
                 f"Claude Code runner failed: {type(exc).__name__}: {exc}", provider=PROVIDER, cost_usd=unknown_spend
             ) from exc
+        finally:
+            key_file.unlink(missing_ok=True)
 
         try:
             out = self.parse_output(proc.stdout)
@@ -370,6 +397,14 @@ class ClaudeCodeProvider:
             session_id=out.session_id,
             raw=out.model_dump(mode="json"),
         )
+
+    def _write_key_file(self, api_key: str) -> Path:
+        """A fresh 0600 file holding ``api_key`` in ``secrets_dir`` (0700), for the CLI's ``apiKeyHelper``."""
+        self.secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix="anthropic-", dir=self.secrets_dir)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(api_key)
+        return Path(name)
 
     def worst_case_cost(self, request: CompletionRequest, on: date | None = None) -> float:
         """``request.max_budget_usd`` plus ``turn_headroom_usd``: the CLI checks its cap only between turns."""
