@@ -1,0 +1,25 @@
+{
+  "id": "msg_01XyZ7pQ2nV8rT4kLm9sA3bC",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "The user wants a critique...",
+      "signature": "EqQBCkgIBxABGAIiQL..."
+    },
+    {
+      "type": "text",
+      "text": "{\"verdict\": \"acc"
+    }
+  ],
+  "stop_reason": "max_tokens",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 3000,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 64000
+  }
+}

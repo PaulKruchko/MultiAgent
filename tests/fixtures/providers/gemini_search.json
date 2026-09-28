@@ -1,0 +1,56 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "text": "Considering ITER parameters...",
+            "thought": true
+          },
+          {
+            "text": "## Summary\n\nITER targets Q=10 at 500 MW fusion power."
+          }
+        ]
+      },
+      "finish_reason": "STOP",
+      "index": 0,
+      "grounding_metadata": {
+        "web_search_queries": [
+          "ITER fusion power Q=10",
+          "ITER burn control impurity seeding"
+        ],
+        "grounding_chunks": [
+          {
+            "web": {
+              "uri": "https://www.iter.org/mach",
+              "title": "iter.org"
+            }
+          },
+          {
+            "web": {
+              "uri": "https://doi.org/10.1088/0029-5515/47/6/S01",
+              "title": "Nuclear Fusion"
+            }
+          },
+          {
+            "web": {
+              "uri": "https://www.iter.org/mach",
+              "title": "iter.org"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "usage_metadata": {
+    "prompt_token_count": 150000,
+    "cached_content_token_count": 0,
+    "candidates_token_count": 9000,
+    "thoughts_token_count": 3000,
+    "tool_use_prompt_token_count": 4200,
+    "total_token_count": 166200
+  },
+  "model_version": "gemini-3.8-flash",
+  "response_id": "Yx3ZaK2pLpGz"
+}

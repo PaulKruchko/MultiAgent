@@ -1,0 +1,17 @@
+# A complete user config, as it would live at ~/.config/maf/config.yaml.
+vault_path: ~/Vaults/MAF
+workspaces_path: /srv/maf/workspaces
+budget_usd: 40
+tier: max
+review: true
+max_crosscheck_loops: 1
+stage_model_overrides:
+  crosscheck:
+    chatgpt: gpt-6-sol
+  final:
+    claude: claude-opus-5-5
+output_limits:
+  chatgpt: 8000
+  claude_code_budget_usd: 5.0
+provider_timeout_s: 120
+mcp_port: 9000

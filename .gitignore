@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MultiAgent framework
+.venv/
+workspaces/
+__pycache__/
