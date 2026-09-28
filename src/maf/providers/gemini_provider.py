@@ -7,7 +7,11 @@ SDK facts, verified by introspecting google-genai 2.25.0:
 - ``client.models.generate_content(model=, contents=, config=types.GenerateContentConfig(...))``.
   Config fields used: ``system_instruction``, ``max_output_tokens``, ``tools``,
   ``response_mime_type="application/json"`` + ``response_json_schema`` (a plain dict schema),
-  ``thinking_config=types.ThinkingConfig(thinking_level=...)``.
+  ``thinking_config=types.ThinkingConfig(thinking_level=...)``,
+  ``automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)`` (fields ``disable``,
+  ``maximum_remote_calls``, ``ignore_call_history``). The adapter passes no Python-callable tools, so AFC never
+  ran a function; left enabled it only routed each call through the SDK's AFC loop (still one request) and
+  logged "Direct use of automatic function calling (AFC) in Models.generate_content is not recommended".
 - Search grounding: ``tools=[types.Tool(google_search=types.GoogleSearch())]``. Sources are in
   ``response.candidates[0].grounding_metadata.grounding_chunks[i].web.{uri,title}`` and
   queries in ``.web_search_queries`` (one billable query each).
@@ -134,7 +138,10 @@ class GeminiProvider:
 
         ``schema_in_prompt`` is the search fallback: no ``response_json_schema``; the schema goes in
         the system instruction instead and the output is validated locally."""
-        config: dict[str, Any] = {"max_output_tokens": request.max_output_tokens}
+        config: dict[str, Any] = {
+            "max_output_tokens": request.max_output_tokens,
+            "automatic_function_calling": {"disable": True},  # exactly one request per call, no AFC warning
+        }
         system = request.system
         if request.json_schema is not None:
             if schema_in_prompt:

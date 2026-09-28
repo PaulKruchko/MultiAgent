@@ -2,17 +2,34 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import shutil
+import tempfile
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
 from maf import handoff as hf
 from maf.handoff import HandoffInvalid, HandoffKind
+from maf.providers.base import SandboxUnavailable
+from maf.providers.claude_code import (
+    PREFLIGHT_COMMAND,
+    PREFLIGHT_FILE,
+    PREFLIGHT_OUTPUT,
+    PREFLIGHT_SCHEMA,
+    ClaudeCodeProvider,
+    CompletedProcess,
+    format_budget,
+    preflight_budget_usd,
+)
 from maf.stages.execution import (
     MODE_GUIDANCE,
     ExecutionBackend,
     demote_headings,
+    ensure_sandbox,
     extract_document,
     parse_artifact_paths,
     promote_headings,
@@ -84,6 +101,164 @@ def ready(stage_env: StageEnv, sample_bodies: dict[str, str]) -> StageEnv:
     stage_env.put("01-ingestion", HandoffKind.INGESTION, sample_bodies["ingestion"], from_="gemini")
     stage_env.put("02-strategy", HandoffKind.STRATEGY, sample_bodies["strategy"], from_="chatgpt")
     return stage_env
+
+
+class FakeClaudeCli:
+    """Stands in for the ``claude`` binary behind a real ``ClaudeCodeProvider``: answers the sandbox preflight by
+    hashing the probe file in its cwd and writing the digest to ``PREFLIGHT_OUTPUT`` (or wrongly, with
+    ``preflight_ok=False``) and every other prompt with ``body``."""
+
+    def __init__(self, body: str, *, preflight_ok: bool = True, preflight_cost: float = 0.04, cost: float = 1.5):
+        self.body = body
+        self.preflight_ok = preflight_ok
+        self.preflight_cost = preflight_cost
+        self.cost = cost
+        self.calls: list[tuple[list[str], str]] = []
+
+    def __call__(
+        self, argv: Sequence[str], stdin: str, cwd: Path, env: dict[str, str], timeout: float
+    ) -> CompletedProcess:
+        self.calls.append((list(argv), stdin))
+        payload: dict[str, object] = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 2}
+        if PREFLIGHT_COMMAND in stdin:
+            data = (cwd / PREFLIGHT_FILE).read_bytes()
+            digest = hashlib.sha256(data if self.preflight_ok else b"other").hexdigest()
+            (cwd / PREFLIGHT_OUTPUT).write_text(f"{digest}  {env['TMPDIR']}/claude-1000/maf-preflight\n")
+            payload |= {"result": "", "structured_output": {"digest": digest}, "total_cost_usd": self.preflight_cost}
+        else:
+            payload |= {"result": self.body, "total_cost_usd": self.cost}
+        return CompletedProcess(returncode=0, stdout=json.dumps(payload))
+
+    @property
+    def prompts(self) -> list[str]:
+        return [stdin for _argv, stdin in self.calls]
+
+
+@pytest.fixture
+def real_code(
+    ready: StageEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[..., FakeClaudeCli]]:
+    """Install a real ``ClaudeCodeProvider`` (fake CLI runner, short private TMPDIR base) as the claude_code role."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-real")
+    base = Path(tempfile.mkdtemp(prefix="m", dir="/tmp"))  # 14 bytes: TMPDIR fits max_tmpdir_bytes()
+
+    def install(body: str, **kw: object) -> FakeClaudeCli:
+        cli = FakeClaudeCli(body, **kw)  # type: ignore[arg-type]
+        ready.fakes.claude_code = ClaudeCodeProvider(  # type: ignore[assignment]
+            ready.paths.workspace,
+            executable=Path("/opt/claude"),
+            allowed_tools=ready.settings.claude_code_tools,
+            runner=cli,
+            secrets_dir=tmp_path / "secrets",
+            tmp_base=base,
+            turn_context_tokens=10_000,
+            turn_output_tokens=1_000,
+        )
+        return cli
+
+    yield install
+    shutil.rmtree(base, ignore_errors=True)
+
+
+def _flag(argv: list[str], name: str) -> str:
+    return argv[argv.index(name) + 1]
+
+
+def _ledger(env: StageEnv) -> list[tuple[str, str, float]]:
+    return [(e.stage, e.purpose, e.cost_usd) for e in env.ledger.entries]
+
+
+@pytest.mark.parametrize("mode", ["code", "mixed"])
+def test_code_modes_run_the_sandbox_preflight_first(
+    ready: StageEnv, real_code: Callable[..., FakeClaudeCli], mode: str
+) -> None:
+    ready.workspace_file("src/alloc.c")
+    cli = real_code(CODE_BODY)
+    output = ExecutionBackend().run_stage(ready.ctx("execution", mode=mode))  # type: ignore[arg-type]
+
+    preflight, execution = cli.calls
+    assert PREFLIGHT_COMMAND in preflight[1]
+    budget = format_budget(preflight_budget_usd(ready.settings.model_for("claude_code", "execution")))
+    assert (_flag(preflight[0], "--effort"), _flag(preflight[0], "--max-budget-usd")) == ("low", budget)
+    assert json.loads(_flag(preflight[0], "--json-schema")) == PREFLIGHT_SCHEMA
+    assert MODE_GUIDANCE[mode] in execution[1]  # type: ignore[index]
+    assert _ledger(ready) == [("execution", "preflight", 0.04), ("execution", "execution", 1.5)]
+    assert {(e.provider, e.agent) for e in ready.ledger.entries} == {("claude_code", "claude")}
+    assert output.notes[0].handoff.meta.cost_usd == pytest.approx(1.5)  # the note's own calls only
+    assert ready.fakes.claude_code.sandbox_verified is True  # type: ignore[attr-defined]
+    assert not (ready.paths.workspace / PREFLIGHT_FILE).exists()
+
+
+def test_preflight_budget_comes_from_settings(ready: StageEnv, real_code: Callable[..., FakeClaudeCli]) -> None:
+    ready.settings = ready.settings.model_copy(update={"claude_code_preflight_budget_usd": 0.3})
+    cli = real_code(CODE_BODY)
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="code"))
+    assert _flag(cli.calls[0][0], "--max-budget-usd") == "0.3000"
+
+
+def test_max_tier_preflight_budget_covers_a_fable_turn(ready: StageEnv, real_code: Callable[..., FakeClaudeCli]) -> None:
+    """A flat $0.15 cap was below the price of one Fable first turn (about 13k tokens at $12.50/M), so every max-tier
+    code run would have stopped at the preflight. Unset, the cap scales with the model."""
+    ready.settings = ready.settings.model_copy(update={"tier": "max"})
+    assert ready.settings.claude_code_preflight_budget_usd is None
+    cli = real_code(CODE_BODY)
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="code"))
+    argv = cli.calls[0][0]
+    assert _flag(argv, "--model") == "claude-fable-5-1"
+    assert _flag(argv, "--max-budget-usd") == format_budget(preflight_budget_usd("claude-fable-5-1")) == "1.0911"
+    assert _ledger(ready)[0][:2] == ("execution", "preflight")
+
+
+def test_preflight_runs_once_per_run(
+    ready: StageEnv, real_code: Callable[..., FakeClaudeCli], sample_bodies: dict[str, str]
+) -> None:
+    cli = real_code(CODE_BODY)
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="code"))
+    ready.put("04-crosscheck", HandoffKind.CROSSCHECK, sample_bodies["crosscheck"], from_="maf")
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="code", round=2))
+    assert [PREFLIGHT_COMMAND in p for p in cli.prompts] == [True, False, False]
+    assert [purpose for _stage, purpose, _cost in _ledger(ready)] == ["preflight", "execution", "execution"]
+
+
+def test_prose_mode_never_preflights(ready: StageEnv, real_code: Callable[..., FakeClaudeCli]) -> None:
+    cli = real_code(CODE_BODY)
+    ready.fakes.claude.script(PROSE_BODY)
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="prose"))
+    assert cli.calls == []
+    assert [purpose for _stage, purpose, _cost in _ledger(ready)] == ["execution"]
+    assert ready.fakes.claude_code.sandbox_verified is False  # type: ignore[attr-defined]
+
+
+def test_failed_preflight_stops_before_any_real_work(ready: StageEnv, real_code: Callable[..., FakeClaudeCli]) -> None:
+    cli = real_code(CODE_BODY, preflight_ok=False)
+    with pytest.raises(SandboxUnavailable, match="preflight failed") as info:
+        ExecutionBackend().run_stage(ready.ctx("execution", mode="code"))
+    assert info.value.cost_usd == 0.04 and info.value.retryable is False
+    assert len(cli.calls) == 1  # no execution session, no retry
+    assert _ledger(ready) == [("execution", "preflight", 0.04)]  # the preflight's spend is metered
+    assert not (ready.paths.workspace / ".maf" / "execution-r1.md").exists()
+    assert not (ready.paths.workspace / PREFLIGHT_FILE).exists()
+
+
+def test_sandbox_failure_during_execution_is_not_repaired(
+    ready: StageEnv, real_code: Callable[..., FakeClaudeCli]
+) -> None:
+    broken = CODE_BODY.replace(
+        "TLSF.", "TLSF. Sandbox is required but failed to initialize: Failed to create bridge sockets after 5 attempts"
+    )
+    cli = real_code(broken)
+    with pytest.raises(SandboxUnavailable, match="bridge sockets") as info:
+        ExecutionBackend().run_stage(ready.ctx("execution", mode="code"))
+    assert info.value.cost_usd == 1.5
+    assert len(cli.calls) == 2  # preflight, execution; no repair call
+    entry = ready.ledger.entries[-1]
+    assert (entry.purpose, entry.cost_usd) == ("execution", 1.5)
+    assert entry.error is not None and entry.error.startswith("SandboxUnavailable")
+
+
+def test_ensure_sandbox_skips_providers_without_preflight(ready: StageEnv) -> None:
+    ensure_sandbox(ready.ctx("execution", mode="code"))  # FakeProvider has no preflight
+    assert ready.fakes.claude_code.calls == [] and not ready.ledger.entries
 
 
 def test_code_mode_runs_claude_code_and_embeds_images(ready: StageEnv) -> None:

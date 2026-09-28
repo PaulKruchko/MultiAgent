@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from maf.types import AgentName, StageName, Tier, Usage
 
@@ -229,6 +229,14 @@ class Settings(BaseModel):
     claude_code_turn_output_tokens: int = Field(default=64_000, gt=0)
     """Size of one Claude Code model turn. The CLI checks ``--max-budget-usd`` between turns, so the price of
     one such turn is held back from the clamp to keep the run cap hard."""
+    claude_code_tmp_base: Path = Path("/tmp")
+    """Parent of Claude Code's private ``TMPDIR`` (``<base>/maf-<12 random hex>``, one per provider instance). Sockets
+    live under ``TMPDIR``, and Claude Code gives sandboxed commands ``TMPDIR=<TMPDIR>/claude-<uid>``, which must fit in
+    44 bytes. So the base may be at most 15 bytes for a 4-digit uid (``max_tmpdir_bytes``, checked before each call)."""
+    claude_code_preflight_budget_usd: float | None = Field(default=None, gt=0)
+    """``--max-budget-usd`` of the sandbox preflight that execution runs before the first code/mixed-mode call. None
+    scales it with the model's price (``maf.providers.claude_code.preflight_budget_usd``: about $0.44 on
+    claude-opus-5-5, $1.09 on claude-fable-5-1); a flat $0.15 is less than Fable's first turn."""
     provider_timeout_s: float = 600.0
 
     freertos_path: Path | None = Field(
@@ -248,6 +256,13 @@ class Settings(BaseModel):
     def _workspaces_outside_vault(self) -> Settings:
         check_workspaces_outside_vault(self.vault_path, self.workspaces_path)
         return self
+
+    @field_validator("claude_code_tmp_base")
+    @classmethod
+    def _absolute_tmp_base(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError(f"claude_code_tmp_base must be an absolute path, got {str(value)!r}")
+        return value
 
     @property
     def mcp_budget_ceiling_usd(self) -> float:
@@ -284,7 +299,15 @@ def default_config_path() -> Path:
     return Path.home() / ".config" / "maf" / "config.yaml"
 
 
-_PATH_FIELDS = ("vault_path", "workspaces_path", "python_executable", "claude_executable", "freertos_path", "mcp_inbox")
+_PATH_FIELDS = (
+    "vault_path",
+    "workspaces_path",
+    "python_executable",
+    "claude_executable",
+    "claude_code_tmp_base",
+    "freertos_path",
+    "mcp_inbox",
+)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

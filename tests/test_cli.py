@@ -20,15 +20,22 @@ from maf.types import STAGE_ORDER, RunStatus, StageName
 
 @dataclass
 class Backend:
-    """Minimal stage backend: no notes, optionally raising once."""
+    """Minimal stage backend: no notes, optionally raising once. ``unresolved`` > 0 makes a crosscheck loop back."""
 
     name: StageName
     error: BaseException | None = None
+    unresolved: int = 0
+    calls: int = 0
 
     def run_stage(self, ctx: StageContext) -> StageOutput:
+        self.calls += 1
         if self.error is not None:
             error, self.error = self.error, None
             raise error
+        if self.name == "crosscheck":
+            return StageOutput(
+                notes=[], index_updates={"unresolved_critical": self.unresolved}, loop_back=self.unresolved > 0
+            )
         return StageOutput(notes=[])
 
 
@@ -93,7 +100,8 @@ def test_global_options_work_before_or_after_the_subcommand(argv: list[str]) -> 
 def test_parser_other_commands() -> None:
     p = cli.build_parser()
     r = p.parse_args(["resume", "r1", "--note", "go", "--budget", "40"])
-    assert (r.command, r.run_id, r.note, r.budget) == ("resume", "r1", "go", 40.0)
+    assert (r.command, r.run_id, r.note, r.budget, r.extra_round) == ("resume", "r1", "go", 40.0, False)
+    assert p.parse_args(["resume", "r1", "--extra-round"]).extra_round is True
     s = p.parse_args(["status", "r1", "--json"])
     assert (s.command, s.json) == ("status", True)
     ls = p.parse_args(["list", "--limit", "5"])
@@ -132,12 +140,18 @@ def test_help_exits_0(capsys: pytest.CaptureFixture[str]) -> None:
         (RunStatus.AWAITING_REVIEW, 0),
         (RunStatus.PENDING, 0),
         (RunStatus.RUNNING, 0),
+        (RunStatus.COMPLETED_WITH_ISSUES, 2),
         (RunStatus.FAILED, 1),
-        (RunStatus.BUDGET_EXCEEDED, 3),
+        (RunStatus.BUDGET_EXCEEDED, 1),
     ],
 )
 def test_exit_code_for(status: RunStatus, code: int) -> None:
     assert cli.exit_code_for(status) == code
+
+
+def test_exit_code_for_covers_every_status() -> None:
+    for status in RunStatus:
+        assert cli.exit_code_for(status) in (cli.EXIT_OK, cli.EXIT_FAILED, cli.EXIT_WITH_ISSUES)
 
 
 def test_bad_config_file_exits_2(env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -181,9 +195,9 @@ def test_run_failure_exits_1(env: Env, capsys: pytest.CaptureFixture[str]) -> No
     assert "failed: execution" in capsys.readouterr().err
 
 
-def test_run_budget_exceeded_exits_3_then_resume_exits_0(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_budget_exceeded_exits_1_then_resume_exits_0(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
     env.backends["strategy"].error = BudgetExceeded(cap_usd=1.0, spent_usd=0.9, requested_usd=0.5, what="strategy")
-    assert cli.main(env.argv("run", "x", "--budget", "1")) == cli.EXIT_BUDGET
+    assert cli.main(env.argv("run", "x", "--budget", "1")) == cli.EXIT_FAILED
     captured = capsys.readouterr()
     run_id = captured.out.splitlines()[0]
     assert "--budget" in captured.err
@@ -191,6 +205,81 @@ def test_run_budget_exceeded_exits_3_then_resume_exits_0(env: Env, capsys: pytes
     index = env.pipeline().status(run_id)
     assert (index.status, index.budget_usd) == (RunStatus.COMPLETED, 3.0)
     assert (Path(index.workspace) / ".maf" / "review-note.md").read_text(encoding="utf-8").strip() == "carry on"
+
+
+def test_run_completed_with_issues_exits_2_with_a_clear_final_line(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    env.backends["crosscheck"].unresolved = 3
+    assert cli.main(env.argv("run", "x")) == cli.EXIT_WITH_ISSUES == 2
+    captured = capsys.readouterr()
+    lines = captured.out.strip().splitlines()
+    run_id = lines[0]
+    assert any("run completed with issues: 3 unresolved critical issue(s)" in line for line in lines)
+    assert lines[-1] == str(env.vault / "runs" / run_id / "05-final.md")
+    last = captured.err.strip().splitlines()[-1]
+    assert last.startswith("completed with issues: 3 unresolved critical issue(s) after the cross-check loop cap")
+    assert f"maf resume {run_id} --extra-round" in last
+    assert env.pipeline().status(run_id).status == RunStatus.COMPLETED_WITH_ISSUES
+    assert env.backends["execution"].calls == 3
+
+
+def test_resume_refuses_completed_with_issues_without_extra_round(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    env.backends["crosscheck"].unresolved = 1
+    cli.main(env.argv("run", "x"))
+    run_id = capsys.readouterr().out.splitlines()[0]
+    calls = {name: b.calls for name, b in env.backends.items()}
+
+    assert cli.main(env.argv("resume", run_id, "--note", "try harder")) == cli.EXIT_WITH_ISSUES
+    err = capsys.readouterr().err
+    assert f"maf: {run_id} is completed_with_issues; nothing to resume" in err
+    assert {name: b.calls for name, b in env.backends.items()} == calls
+    assert not (Path(env.pipeline().status(run_id).workspace) / ".maf" / "review-note.md").exists()
+
+    env.backends["crosscheck"].unresolved = 0
+    assert cli.main(env.argv("resume", run_id, "--extra-round", "--note", "try harder")) == cli.EXIT_OK
+    index = env.pipeline().status(run_id)
+    assert (index.status, index.round) == (RunStatus.COMPLETED, 4)
+    assert (env.backends["execution"].calls, env.backends["final"].calls) == (4, 2)
+
+
+
+def test_legacy_completed_run_with_open_criticals_can_take_an_extra_round(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run.md written before completed_with_issues existed (``status: completed``, ``unresolved_critical: 9``)
+    shows as completed_with_issues everywhere, and ``--extra-round`` is allowed on it."""
+    cli.main(env.argv("run", "legacy"))
+    run_id = capsys.readouterr().out.splitlines()[0]
+    run_md = env.vault / "runs" / run_id / "run.md"
+    text = run_md.read_text(encoding="utf-8")
+    assert "\nstatus: completed\n" in text and "\nunresolved_critical: 0\n" in text
+    run_md.write_text(text.replace("\nunresolved_critical: 0\n", "\nunresolved_critical: 9\n"), encoding="utf-8")
+
+    assert cli.main(env.argv("status", run_id)) == 0
+    out = capsys.readouterr().out
+    assert "status:   completed_with_issues" in out and "unresolved critical: 9" in out
+    assert cli.main(env.argv("list", "--json")) == 0
+    assert json.loads(capsys.readouterr().out)[0]["status"] == "completed_with_issues"
+    assert cli.main(env.argv("resume", run_id)) == cli.EXIT_WITH_ISSUES
+    assert f"maf: {run_id} is completed_with_issues; nothing to resume" in capsys.readouterr().err
+    assert cli.main(env.argv("resume", run_id, "--extra-round")) == cli.EXIT_OK
+    index = env.pipeline().status(run_id)
+    assert (index.status, index.round, index.unresolved_critical) == (RunStatus.COMPLETED, 2, 0)
+    assert env.backends["execution"].calls == 2
+
+def test_resume_extra_round_on_other_statuses_is_a_usage_error(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    cli.main(env.argv("run", "x"))
+    run_id = capsys.readouterr().out.splitlines()[0]
+    assert cli.main(env.argv("resume", run_id, "--extra-round")) == cli.EXIT_USAGE
+    assert "only applies to completed_with_issues" in capsys.readouterr().err
+
+
+def test_run_failure_reports_error_and_spend_on_one_line(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    env.backends["execution"].error = RuntimeError("Sandbox is required but failed to initialize:\n  bridge sockets")
+    assert cli.main(env.argv("run", "x", "--budget", "4")) == cli.EXIT_FAILED
+    last = capsys.readouterr().err.strip().splitlines()[-1]
+    assert last == (
+        "failed: execution: RuntimeError: Sandbox is required but failed to initialize: bridge sockets (spent $0.0000 of $4.00)"
+    )
 
 
 def test_run_missing_file_exits_2(env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -234,6 +323,19 @@ def test_status_text_and_json(env: Env, capsys: pytest.CaptureFixture[str]) -> N
     assert cli.main(env.argv("status", run_id, "--json")) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["run_id"] == run_id and data["status"] == "completed"
+
+
+def test_status_and_list_show_completed_with_issues(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    env.backends["crosscheck"].unresolved = 2
+    cli.main(env.argv("run", "issues probe"))
+    run_id = capsys.readouterr().out.splitlines()[0]
+    assert cli.main(env.argv("status", run_id)) == 0
+    out = capsys.readouterr().out
+    assert "status:   completed_with_issues" in out and "unresolved critical: 2" in out
+    assert cli.main(env.argv("list")) == 0
+    assert "completed_with_issues" in capsys.readouterr().out
+    assert cli.main(env.argv("list", "--json")) == 0
+    assert json.loads(capsys.readouterr().out)[0]["status"] == "completed_with_issues"
 
 
 def test_status_unknown_exits_2(env: Env, capsys: pytest.CaptureFixture[str]) -> None:

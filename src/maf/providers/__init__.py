@@ -18,6 +18,7 @@ from maf.providers.base import (
     Provider,
     ProviderError,
     ProviderRefusal,
+    SandboxUnavailable,
     StructuredOutputError,
 )
 from maf.providers.claude_code import SENSITIVE_READ_PATHS, ClaudeCodeProvider
@@ -43,7 +44,8 @@ def build_providers(settings: Settings, workspace: Path) -> Providers:
     """Construct real adapters (lazy SDK clients, no network at construction).
     ``claude_code`` is bound to ``workspace`` with ``settings.claude_code_tools`` and may not read the vault
     or ``SENSITIVE_READ_PATHS`` (stages copy what it needs into the prompt); the configured
-    Python's ``bin`` directory goes first on its ``PATH`` so ``python`` resolves to the project venv."""
+    Python's ``bin`` directory goes first on its ``PATH`` so ``python`` resolves to the project venv, and its short
+    private ``TMPDIR`` lives under ``settings.claude_code_tmp_base``."""
     timeout = settings.provider_timeout_s
     python_bin = settings.python_executable.parent
     return Providers(
@@ -59,6 +61,7 @@ def build_providers(settings: Settings, workspace: Path) -> Providers:
             deny_read=(*SENSITIVE_READ_PATHS, str(settings.vault_path.expanduser().resolve())),
             turn_context_tokens=settings.claude_code_turn_context_tokens,
             turn_output_tokens=settings.claude_code_turn_output_tokens,
+            tmp_base=settings.claude_code_tmp_base,
         ),
     )
 
@@ -77,6 +80,7 @@ __all__ = [
     "ProviderError",
     "ProviderRefusal",
     "Providers",
+    "SandboxUnavailable",
     "StructuredOutputError",
     "build_providers",
 ]

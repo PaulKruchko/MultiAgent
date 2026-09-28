@@ -3,14 +3,20 @@
 Owner: orchestration.
 
     maf run "<brief>" [--file PATH ...] [--budget USD] [--tier default|max] [--review] [--no-wait]
-    maf resume RUN_ID [--note TEXT] [--budget USD]
+    maf resume RUN_ID [--note TEXT] [--budget USD] [--extra-round]
     maf status RUN_ID [--json]
     maf list [--json] [--limit N]
     maf serve [--host 127.0.0.1] [--port 8765]
 
 Global options: ``--vault PATH``, ``--workspaces PATH``, ``--config PATH``.
-Exit codes: 0 completed or awaiting review; 1 failed; 2 usage error; 3 budget exceeded.
-``run`` prints the run_id first, then progress lines per stage, then the path of 05-final.md.
+Exit codes of ``run``/``resume`` follow the run's status: 0 completed (also awaiting review, or started with
+``--no-wait``); 2 completed_with_issues; 1 failed or budget exceeded. Usage errors (bad arguments, unknown run,
+bad config) also exit 2, before any run starts; the output tells them apart.
+``run`` prints the run_id first, then progress lines per stage, then the path of 05-final.md on stdout.
+A completed_with_issues run then ends with one stderr line naming the unresolved critical count and the last
+cross-check note; failed and budget-exceeded runs end with the error on stderr.
+``resume`` refuses a completed_with_issues run (exit 2, nothing runs) unless ``--extra-round`` is given, which
+runs one more execution + cross-check pass and then final again.
 ``run --no-wait`` creates the run, starts ``maf resume RUN_ID`` as a detached process (output in
 ``workspace/.maf/run.log``) and returns immediately.
 """
@@ -29,12 +35,14 @@ from maf.config import Settings, load_settings
 from maf.handoff import HandoffKind
 from maf.pipeline import Pipeline
 from maf.types import RunStatus
-from maf.vault import RunIndex, note_name
+from maf.vault import RunIndex, latest_crosscheck, note_name
 
 EXIT_OK = 0
 EXIT_FAILED = 1
+"""Failed or budget exceeded: the run stopped without a final report."""
 EXIT_USAGE = 2
-EXIT_BUDGET = 3
+EXIT_WITH_ISSUES = 2
+"""completed_with_issues: final ran after the cross-check loop cap with unresolved critical issues."""
 
 _GLOBAL_OPTIONS = ("vault", "workspaces", "config")
 
@@ -98,6 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("run_id")
     resume.add_argument("--note", help="direction for later stages (stored as the review note)")
     resume.add_argument("--budget", type=_positive_float, metavar="USD", help="new spend cap")
+    resume.add_argument("--extra-round", action="store_true",
+                        help="completed_with_issues runs only: one more execution + cross-check pass, then final")
 
     status = sub.add_parser("status", parents=[common], help="show one run")
     status.add_argument("run_id")
@@ -114,10 +124,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def exit_code_for(status: RunStatus) -> int:
-    if status == RunStatus.FAILED:
+    if status in (RunStatus.FAILED, RunStatus.BUDGET_EXCEEDED):
         return EXIT_FAILED
-    if status == RunStatus.BUDGET_EXCEEDED:
-        return EXIT_BUDGET
+    if status == RunStatus.COMPLETED_WITH_ISSUES:
+        return EXIT_WITH_ISSUES
     # COMPLETED and AWAITING_REVIEW are successes; PENDING/RUNNING mean "started" (--no-wait).
     return EXIT_OK
 
@@ -139,17 +149,30 @@ def _print_progress(index: RunIndex, message: str) -> None:
     print(f"[{index.run_id}] {message}", flush=True)
 
 
+def _spend(index: RunIndex) -> str:
+    return f"spent ${index.spent_usd:.4f} of ${index.budget_usd:.2f}"
+
+
 def _report(pipeline: Pipeline, index: RunIndex, out: TextIO, err: TextIO) -> int:
     paths = pipeline.vault.paths(index.run_id)
-    if index.status == RunStatus.COMPLETED:
-        print(paths.note(note_name(HandoffKind.FINAL)), file=out)
+    if index.status.finished:
+        print(paths.note(note_name(HandoffKind.FINAL)), file=out, flush=True)
+    if index.status == RunStatus.COMPLETED_WITH_ISSUES:
+        crosscheck = latest_crosscheck(index)
+        where = f"; see {paths.note(crosscheck)}" if crosscheck else ""
+        print(
+            f"completed with issues: {index.unresolved_critical} unresolved critical issue(s) after the cross-check "
+            f"loop cap{where} ({_spend(index)}; one more pass: maf resume {index.run_id} --extra-round)",
+            file=err,
+        )
     elif index.status == RunStatus.AWAITING_REVIEW:
         print(f"awaiting review: edit {paths.note(note_name(HandoffKind.STRATEGY))} then run: maf resume {index.run_id}", file=out)
     elif index.status == RunStatus.BUDGET_EXCEEDED:
         print(f"budget exceeded: {index.error}", file=err)
         print(f"raise the cap with: maf resume {index.run_id} --budget USD", file=err)
     elif index.status == RunStatus.FAILED:
-        print(f"failed: {index.error}", file=err)
+        error = " ".join((index.error or "unknown error").split())  # one line, even for multi-line provider output
+        print(f"failed: {error} ({_spend(index)})", file=err)
     return exit_code_for(index.status)
 
 
@@ -195,9 +218,19 @@ def _cmd_run(args: argparse.Namespace, pipeline: Pipeline) -> int:
 
 def _cmd_resume(args: argparse.Namespace, pipeline: Pipeline) -> int:
     try:
-        index = pipeline.resume(args.run_id, note=args.note, budget_usd=args.budget, progress=_print_progress)
+        before = pipeline.status(args.run_id)
+        if before.status == RunStatus.COMPLETED_WITH_ISSUES and not args.extra_round:
+            print(f"maf: {args.run_id} is {before.status.value}; nothing to resume (--extra-round runs one more "
+                  "execution + cross-check pass)", file=sys.stderr)
+            return _report(pipeline, before, sys.stdout, sys.stderr)
+        index = pipeline.resume(
+            args.run_id, note=args.note, budget_usd=args.budget, extra_round=args.extra_round, progress=_print_progress
+        )
     except FileNotFoundError:
         print(f"maf: no such run: {args.run_id}", file=sys.stderr)
+        return EXIT_USAGE
+    except ValueError as exc:
+        print(f"maf: {exc}", file=sys.stderr)
         return EXIT_USAGE
     except RuntimeError as exc:
         print(f"maf: {exc}", file=sys.stderr)
@@ -214,6 +247,8 @@ def _status_lines(index: RunIndex) -> list[str]:
         f"tier:     {index.tier}",
         f"spent:    ${index.spent_usd:.4f} of ${index.budget_usd:.2f}",
     ]
+    if index.unresolved_critical or index.status == RunStatus.COMPLETED_WITH_ISSUES:
+        lines.append(f"unresolved critical: {index.unresolved_critical}")
     if index.spend_by_agent:
         lines.append("by agent: " + ", ".join(f"{a} ${usd:.4f}" for a, usd in sorted(index.spend_by_agent.items())))
     if index.handoffs:
@@ -257,7 +292,7 @@ def _cmd_list(args: argparse.Namespace, pipeline: Pipeline) -> int:
         return EXIT_OK
     width = max(len(r.run_id) for r in runs)
     for r in runs:
-        print(f"{r.run_id:<{width}}  {r.status.value:<15}  {r.stage:<10}  ${r.spent_usd:>8.4f}  {r.created:%Y-%m-%d %H:%M}")
+        print(f"{r.run_id:<{width}}  {r.status.value:<21}  {r.stage:<10}  ${r.spent_usd:>8.4f}  {r.created:%Y-%m-%d %H:%M}")
     return EXIT_OK
 
 

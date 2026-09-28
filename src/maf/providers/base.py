@@ -125,6 +125,15 @@ class StructuredOutputError(ProviderError):
     """``json_schema`` was requested but the output did not parse or validate."""
 
 
+class SandboxUnavailable(ProviderError):
+    """Claude Code's OS sandbox cannot run commands (e.g. bubblewrap or its socket bridge failed to start).
+    Never retryable: every further session would pay for work whose Bash calls all fail. Stages let it
+    propagate, so the run stops (FAILED) instead of looping on a broken sandbox."""
+
+    def __init__(self, message: str, *, provider: ProviderName, cost_usd: float = 0.0) -> None:
+        super().__init__(message, provider=provider, cost_usd=cost_usd, retryable=False)
+
+
 @runtime_checkable
 class Provider(Protocol):
     """What stages and the ledger rely on. Implementations must be safe to call from worker threads."""

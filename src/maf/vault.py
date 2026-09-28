@@ -34,7 +34,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import BinaryIO, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from maf.config import check_workspaces_outside_vault
 from maf.handoff import Handoff, HandoffKind, dump_frontmatter, load_frontmatter, parse_handoff, render_handoff
@@ -49,7 +49,7 @@ class RunIndex(BaseModel):
     run_id: str
     status: RunStatus = RunStatus.PENDING
     stage: StageName = "ingestion"
-    """The stage to run next (or the one running/failed). ``final`` + ``completed`` means done."""
+    """The stage to run next (or the one running/failed). ``final`` + ``completed``/``completed_with_issues`` means done."""
     completed_stages: list[StageName] = Field(default_factory=list)
     round: int = 1
     """Current execution/crosscheck pass (1-based)."""
@@ -62,6 +62,7 @@ class RunIndex(BaseModel):
     spend_by_agent: dict[AgentName, float] = Field(default_factory=dict)
     spend_by_provider: dict[ProviderName, float] = Field(default_factory=dict)
     unresolved_critical: int = 0
+    """Critical issues left unresolved by the latest cross-check; > 0 at final means ``completed_with_issues``."""
     created: datetime
     updated: datetime
     workspace: str
@@ -74,6 +75,14 @@ class RunIndex(BaseModel):
     input_files: list[str] = Field(default_factory=list)
     """Workspace-relative paths of user-supplied files (under ``inputs/``)."""
     tags: list[str] = Field(default_factory=lambda: ["maf", "maf/run"])
+
+    @model_validator(mode="after")
+    def _completed_with_open_criticals(self) -> RunIndex:
+        """``completed`` with ``unresolved_critical > 0`` reads as ``completed_with_issues``. The pipeline no longer
+        writes that pair, but runs finished before ``completed_with_issues`` existed still have it in run.md."""
+        if self.status == RunStatus.COMPLETED and self.unresolved_critical > 0:
+            self.status = RunStatus.COMPLETED_WITH_ISSUES
+        return self
 
 
 class RunPaths(BaseModel):
@@ -458,12 +467,36 @@ def _money(value: float) -> str:
     return f"{value:.4f}"
 
 
+_CROSSCHECK_NOTE_RE = re.compile(rf"^{re.escape(_NOTE_BASE[HandoffKind.CROSSCHECK])}(?:-r\d+)?$")
+
+
+def latest_crosscheck(index: RunIndex) -> str | None:
+    """Name of the last ``04-crosscheck[-rN]`` note recorded in ``index.handoffs`` (None if there is none)."""
+    return next((name for name in reversed(index.handoffs) if _CROSSCHECK_NOTE_RE.match(name)), None)
+
+
+def _issues_callout(index: RunIndex) -> list[str]:
+    """The ``completed_with_issues`` warning that opens ``## Status`` (empty for every other status)."""
+    if index.status != RunStatus.COMPLETED_WITH_ISSUES:
+        return []
+    crosscheck = latest_crosscheck(index)
+    where = f"; see `## Unresolved Critical` in {wikilink(crosscheck)}" if crosscheck else ""
+    final = _NOTE_BASE[HandoffKind.FINAL]
+    return [
+        f"> [!warning] Completed with {index.unresolved_critical} unresolved critical issue(s)",
+        f"> The cross-check loop cap was reached with {index.unresolved_critical} critical issue(s) still open{where}. "
+        f"{wikilink(final)} lists them under Limitations; do not treat this run's deliverables as verified.",
+        "",
+    ]
+
+
 def render_run_body(index: RunIndex) -> str:
-    """Body of run.md: ``# <run_id>``; ``## Brief`` (quoted); ``## Status``; ``## Handoffs``
+    """Body of run.md: ``# <run_id>``; ``## Brief`` (quoted); ``## Status`` (opened by a warning callout
+    linking the last cross-check when the status is ``completed_with_issues``); ``## Handoffs``
     (wikilink bullets); ``## Cost`` (markdown table Agent | USD with a Total row, then Provider | USD);
     ``## Workspace`` (the path as inline code)."""
     brief = "\n".join(f"> {line}" if line.strip() else ">" for line in index.brief.strip().split("\n"))
-    status = [
+    status = _issues_callout(index) + [
         f"- Status: **{index.status.value}**",
         f"- Stage: {index.stage}",
         f"- Round: {index.round}",

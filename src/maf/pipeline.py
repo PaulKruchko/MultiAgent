@@ -7,17 +7,26 @@ re-running the recorded ``stage`` (stages are idempotent). Transitions (``next_s
 
     ingestion -> strategy -> [review gate if index.review] -> execution -> crosscheck
     crosscheck --loop_back and round <= max_crosscheck_loops--> execution (round += 1)
-    crosscheck --pass, or loops exhausted--> final -> COMPLETED
+    crosscheck --pass, or loops exhausted--> final -> COMPLETED (unresolved_critical == 0)
+                                                   -> COMPLETED_WITH_ISSUES (loops exhausted, unresolved_critical > 0)
 
 Review gate: after strategy with ``review=True``, the status becomes AWAITING_REVIEW with ``stage="execution"``.
 ``resume(run_id, note=...)`` re-reads 02-strategy.md (the user may have edited it in Obsidian),
 re-validates it (invalid means FAILED with the errors, and the user can fix and resume again),
 and continues.
 
+COMPLETED and COMPLETED_WITH_ISSUES are both terminal: ``run`` and ``resume`` return them unchanged.
+``resume(run_id, extra_round=True)`` is the one way to continue a COMPLETED_WITH_ISSUES run: it schedules one
+more execution + crosscheck pass (round + 1, reading the last cross-check's unresolved issues) and then final
+again. The loop cap still applies, so a pass that leaves critical issues open goes straight to final.
+
 Error mapping for a stage attempt:
 - ``BudgetExceeded``: BUDGET_EXCEEDED (resumable after raising the budget: ``maf resume --budget``)
 - ``HandoffInvalid`` (after its one repair): FAILED
-- ``ProviderError`` / any other exception: FAILED (``error`` records type and message)
+- ``ProviderError``: FAILED at once. Stages never swallow a non-retryable one (``StageContext.call`` retries
+  only ``retryable`` token-provider errors, never Claude Code), so an infrastructure failure such as a Claude
+  Code sandbox that cannot start ends the run before any crosscheck loop can re-pay against it.
+- any other exception: FAILED (``error`` records type and message)
 The ledger totals are mirrored into run.md after every stage and on every failure.
 """
 
@@ -40,7 +49,7 @@ from pydantic import ValidationError
 from maf.config import Settings
 from maf.handoff import HandoffInvalid, HandoffKind, validate_handoff
 from maf.ledger import BudgetExceeded, Ledger
-from maf.providers import Providers
+from maf.providers import ProviderError, Providers
 from maf.stages.base import StageBackend, StageContext, StageOutput
 from maf.types import STAGE_ORDER, RunStatus, StageName, Tier
 from maf.vault import RunIndex, RunPaths, Vault, atomic_write_text, note_name
@@ -88,11 +97,13 @@ def next_step(index: RunIndex, finished: StageName, output: StageOutput, max_loo
     - After strategy with ``index.review``: ``Step("execution", round, AWAITING_REVIEW)``.
     - After crosscheck with ``loop_back`` and ``index.round <= max_loops``: ``Step("execution", round+1, RUNNING)``.
     - After crosscheck otherwise: ``Step("final", round, RUNNING)``.
-    - After final: ``Step(None, round, COMPLETED)``.
+    - After final: ``Step(None, round, COMPLETED)``, or ``COMPLETED_WITH_ISSUES`` when ``index.unresolved_critical > 0``
+      (final was reached only because the loop cap was hit).
     - Otherwise the next stage in ``STAGE_ORDER``, RUNNING.
     """
     if finished == "final":
-        return Step(None, index.round, RunStatus.COMPLETED)
+        status = RunStatus.COMPLETED_WITH_ISSUES if index.unresolved_critical > 0 else RunStatus.COMPLETED
+        return Step(None, index.round, status)
     if finished == "strategy" and index.review:
         return Step("execution", index.round, RunStatus.AWAITING_REVIEW)
     if finished == "crosscheck":
@@ -246,13 +257,12 @@ class Pipeline:
     # ------------------------------------------------------------------ run and resume
 
     def run(self, run_id: str, *, progress: ProgressFn | None = None) -> RunIndex:
-        """Advance ``run_id`` from its recorded stage until COMPLETED, AWAITING_REVIEW, FAILED or
-        BUDGET_EXCEEDED. Returns the final index. Never raises for stage errors (they are recorded);
+        """Advance ``run_id`` from its recorded stage until COMPLETED, COMPLETED_WITH_ISSUES, AWAITING_REVIEW,
+        FAILED or BUDGET_EXCEEDED. Returns the final index. Never raises for stage errors (they are recorded);
         raises only for a missing run, or ``RuntimeError`` if another thread or process is advancing the run.
 
-        A run that is COMPLETED, AWAITING_REVIEW, FAILED or BUDGET_EXCEEDED is returned unchanged:
-        continuing one of those is an explicit decision, made with ``resume``. A run left RUNNING by a
-        crashed process is continued from its recorded stage."""
+        A run in any of those statuses is returned unchanged: continuing one is an explicit decision, made
+        with ``resume``. A run left RUNNING by a crashed process is continued from its recorded stage."""
         with self._guard(run_id):
             index = self.vault.read_index(run_id)
             if index.status not in (RunStatus.PENDING, RunStatus.RUNNING):
@@ -265,21 +275,33 @@ class Pipeline:
         *,
         note: str | None = None,
         budget_usd: float | None = None,
+        extra_round: bool = False,
         progress: ProgressFn | None = None,
     ) -> RunIndex:
         """Continue a non-completed run. ``note`` is stored as the review note passed to later stages
-        (persisted in ``workspace/.maf/review-note.md``). ``budget_usd`` raises the cap. A COMPLETED run
-        is returned unchanged."""
+        (persisted in ``workspace/.maf/review-note.md``). ``budget_usd`` raises the cap.
+
+        COMPLETED and COMPLETED_WITH_ISSUES runs are returned unchanged (nothing is written), except that
+        ``extra_round=True`` on a COMPLETED_WITH_ISSUES run schedules one more execution + crosscheck pass at
+        ``round + 1`` followed by final (see the module docstring). ``extra_round`` on any other status raises
+        ``ValueError``."""
         if budget_usd is not None and budget_usd <= 0:
             raise ValueError(f"budget must be positive, got {budget_usd}")
         with self._guard(run_id):
             index = self.vault.read_index(run_id)
-            if index.status == RunStatus.COMPLETED:
+            if extra_round and index.status != RunStatus.COMPLETED_WITH_ISSUES:
+                raise ValueError(
+                    f"extra_round only applies to {RunStatus.COMPLETED_WITH_ISSUES.value} runs; "
+                    f"{run_id} is {index.status.value}"
+                )
+            if index.status.finished and not extra_round:
                 return index
             if budget_usd is not None:
                 index.budget_usd = budget_usd
             if note is not None:
                 atomic_write_text(self.review_note_path(run_id), note.strip() + "\n")
+            if extra_round:
+                self._schedule_extra_round(index)
 
             if self._past_review_gate(index):
                 errors = self._strategy_errors(run_id)
@@ -371,6 +393,15 @@ class Pipeline:
             return True
 
     @staticmethod
+    def _schedule_extra_round(index: RunIndex) -> None:
+        """Point a COMPLETED_WITH_ISSUES index at execution ``round + 1``. 05-final leaves ``handoffs`` so the
+        list stays chronological; the note itself stays on disk until the new final pass overwrites it."""
+        final = note_name(HandoffKind.FINAL)
+        index.stage = "execution"
+        index.round += 1
+        index.handoffs = [name for name in index.handoffs if name != final]
+
+    @staticmethod
     def _past_review_gate(index: RunIndex) -> bool:
         """True when the next stage is the first execution pass of a reviewed run."""
         return index.review and index.stage == "execution" and index.round == 1 and "strategy" in index.completed_stages
@@ -425,6 +456,11 @@ class Pipeline:
                 return self._stop(index, ledger, RunStatus.BUDGET_EXCEEDED, str(exc), progress)
             except HandoffInvalid as exc:
                 return self._stop(index, ledger, RunStatus.FAILED, f"{stage}: {exc}", progress)
+            except ProviderError as exc:
+                # Reaching here means no retry applied (non-retryable, Claude Code, or retries used up): stop
+                # now rather than let the crosscheck loop re-pay against a broken provider or sandbox.
+                log.error("run %s: stage %s: provider error (retryable=%s): %s", run_id, stage, exc.retryable, exc)
+                return self._stop(index, ledger, RunStatus.FAILED, f"{stage}: {_describe(exc)}", progress)
             except KeyboardInterrupt:
                 self._stop(index, ledger, RunStatus.FAILED, f"{stage}: interrupted", progress)
                 raise
@@ -526,6 +562,11 @@ class Pipeline:
         spend = f"${index.spent_usd:.4f} of ${index.budget_usd:.2f}"
         if index.status == RunStatus.COMPLETED:
             return f"{stage} done; run completed ({spend})"
+        if index.status == RunStatus.COMPLETED_WITH_ISSUES:
+            return (
+                f"{stage} done; run completed with issues: {index.unresolved_critical} unresolved critical "
+                f"issue(s) after the cross-check loop cap ({spend})"
+            )
         if index.status == RunStatus.AWAITING_REVIEW:
             return f"{stage} done; awaiting review of 02-strategy ({spend})"
         return f"{stage} done; next {index.stage} round {index.round} ({spend})"

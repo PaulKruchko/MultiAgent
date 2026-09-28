@@ -3,7 +3,9 @@
 Owner: stages.
 
 Mode (``ctx.index.mode``):
-- ``code`` / ``mixed``: Claude Code (``claude_code`` role) in the workspace. The prompt is written to
+- ``code`` / ``mixed``: Claude Code (``claude_code`` role) in the workspace. Before the first Claude Code call
+  of the run (in this process), ``ensure_sandbox`` runs the provider's sandbox preflight as a metered call
+  (``purpose="preflight"``); ``SandboxUnavailable`` propagates and stops the run. The prompt is written to
   ``workspace/.maf/execution-r<round>.md`` for traceability and sent on stdin. The final message must be
   the EXECUTION handoff body; ``## Artifacts`` lists workspace-relative paths, one per bullet, as
   ``- `path` - description``. PNGs under the workspace referenced there are copied to ``assets/`` and
@@ -43,6 +45,9 @@ from maf.stages.base import (
     write_workspace_file,
 )
 from maf.types import ExecutionMode, StageName
+
+PREFLIGHT_PURPOSE = "preflight"
+"""Ledger ``purpose`` of the Claude Code sandbox preflight."""
 
 FREERTOS_DIR = "FreeRTOS-Kernel"
 """Workspace-relative location of the provisioned FreeRTOS kernel (``Settings.freertos_path``)."""
@@ -93,6 +98,7 @@ class ExecutionBackend:
     def _run_code(
         self, ctx: StageContext, mode: ExecutionMode, consumed: list[str], inputs: str, fix_context: str
     ) -> Handoff:
+        ensure_sandbox(ctx)
         kernel = provision_freertos(ctx.settings.freertos_path, ctx.paths.workspace)
         prompt = render_prompt(
             "execution_code",
@@ -148,6 +154,26 @@ class ExecutionBackend:
         title, document = extract_document(handoff.section("Artifacts"))
         write_workspace_file(ctx, PROSE_DOCUMENT, promote_headings(document))
         return with_sections(handoff, {"Artifacts": f"- `{PROSE_DOCUMENT}` - {title}"})
+
+
+def ensure_sandbox(ctx: StageContext) -> None:
+    """Run the Claude Code provider's sandbox preflight through ``ctx.call`` (metered: ``ctx.stage``, purpose
+    ``preflight``, never retried) unless that provider already passed it. Providers are built once per run in a
+    process, so this is once per run; a resumed process checks again. Crosscheck calls it too, which matters only
+    for a process resumed straight into crosscheck.
+
+    ``SandboxUnavailable`` (and any other preflight failure) propagates, so the run stops before paying for a
+    session whose Bash calls would all fail. The budget is ``claude_code_preflight_budget_usd``; None lets the
+    provider scale it with the model. Providers without a ``preflight`` method (test fakes) are skipped."""
+    provider = ctx.providers.for_role("claude_code")
+    preflight = getattr(provider, "preflight", None)
+    if preflight is None or getattr(provider, "sandbox_verified", False):
+        return
+    preflight(
+        ctx.model("claude_code"),
+        ctx.settings.claude_code_preflight_budget_usd,
+        call=lambda request: ctx.call("claude_code", request, purpose=PREFLIGHT_PURPOSE),
+    )
 
 
 def provision_freertos(source: Path | None, workspace: Path) -> str | None:

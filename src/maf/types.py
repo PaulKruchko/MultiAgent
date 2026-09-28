@@ -33,12 +33,21 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     AWAITING_REVIEW = "awaiting_review"
     COMPLETED = "completed"
+    COMPLETED_WITH_ISSUES = "completed_with_issues"
+    """Final ran, but only because the cross-check loop cap was hit: ``unresolved_critical > 0``."""
     FAILED = "failed"
     BUDGET_EXCEEDED = "budget_exceeded"
 
     @property
     def terminal(self) -> bool:
-        return self in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.BUDGET_EXCEEDED)
+        return self in (
+            RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_ISSUES, RunStatus.FAILED, RunStatus.BUDGET_EXCEEDED
+        )
+
+    @property
+    def finished(self) -> bool:
+        """The final stage ran (05-final exists), with or without unresolved critical issues."""
+        return self in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_ISSUES)
 
 
 class Usage(BaseModel):

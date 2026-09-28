@@ -64,6 +64,20 @@ def test_next_step_ignores_loop_back_outside_crosscheck() -> None:
     assert next_step(_index(), "execution", _out(True), 2) == Step("crosscheck", 1, RunStatus.RUNNING)
 
 
+def test_next_step_final_with_unresolved_critical_is_completed_with_issues() -> None:
+    assert next_step(_index(round=3, unresolved_critical=2), "final", _out(), 2) == Step(
+        None, 3, RunStatus.COMPLETED_WITH_ISSUES
+    )
+    assert next_step(_index(round=3, unresolved_critical=0), "final", _out(), 2) == Step(None, 3, RunStatus.COMPLETED)
+
+
+def test_completed_with_issues_is_terminal_and_finished() -> None:
+    status = RunStatus.COMPLETED_WITH_ISSUES
+    assert status.value == "completed_with_issues"
+    assert status.terminal and status.finished
+    assert RunStatus.COMPLETED.finished and not RunStatus.FAILED.finished and not RunStatus.BUDGET_EXCEEDED.finished
+
+
 def test_allowed_index_updates() -> None:
     assert ALLOWED_INDEX_UPDATES == {"mode", "unresolved_critical"}
 
@@ -134,6 +148,10 @@ def _defaults(bodies: dict[str, str]) -> dict[StageName, StageFn]:
     return {"ingestion": ingestion, "strategy": strategy, "execution": execution, "crosscheck": crosscheck, "final": final}
 
 
+def _defaults_for(h: "Harness") -> dict[StageName, StageFn]:
+    return _defaults(h.bodies)
+
+
 def _loop(ctx: StageContext) -> StageOutput:
     body = (
         "## Summary\n\nOne critical issue left.\n\n## Issues\n\n- [critical] GPT-1: broken\n\n## Rulings\n\nNone.\n\n"
@@ -150,6 +168,7 @@ class Harness:
     def __init__(self, settings: Settings, fake_providers, sample_bodies: dict[str, str]) -> None:  # type: ignore[no-untyped-def]
         self.settings = settings
         self.fakes = fake_providers
+        self.bodies = sample_bodies
         defaults = _defaults(sample_bodies)
         self.backends = {stage: ScriptedBackend(stage, defaults[stage]) for stage in STAGE_ORDER}
         self.ticks = 0
@@ -279,9 +298,12 @@ def test_run_missing_raises(h: Harness) -> None:
 def test_crosscheck_loops_are_capped(h: Harness) -> None:
     h["crosscheck"].default = _loop
     run_id = h.pipeline.create("x").run_id
-    index = h.pipeline.run(run_id)
+    messages: list[str] = []
+    index = h.pipeline.run(run_id, progress=lambda _i, m: messages.append(m))
 
-    assert index.status == RunStatus.COMPLETED
+    assert index.status == RunStatus.COMPLETED_WITH_ISSUES
+    assert index.error is None
+    assert any("run completed with issues: 1 unresolved critical issue(s)" in m for m in messages)
     assert h["execution"].calls == 3  # 1 + max_crosscheck_loops
     assert [c.index.round for c in h["execution"].contexts] == [1, 2, 3]
     assert [c.index.round for c in h["crosscheck"].contexts] == [1, 2, 3]
@@ -290,6 +312,59 @@ def test_crosscheck_loops_are_capped(h: Harness) -> None:
     assert index.unresolved_critical == 1
     assert "03-execution-r2" in index.handoffs and "04-crosscheck-r3" in index.handoffs
     assert index.handoffs[-1] == "05-final"
+    # run.md says so in the frontmatter and opens ## Status with a callout linking the last cross-check.
+    run_md = h.pipeline.vault.paths(run_id).run_md.read_text(encoding="utf-8")
+    assert "\nstatus: completed_with_issues\n" in run_md
+    status_block = run_md.split("## Status\n\n", 1)[1]
+    assert status_block.startswith("> [!warning] Completed with 1 unresolved critical issue(s)\n")
+    assert "[[04-crosscheck-r3]]" in status_block.split("\n\n", 1)[0]
+    # Terminal: run() and a plain resume() leave it alone.
+    assert h.pipeline.run(run_id) == index
+    assert h.pipeline.resume(run_id, note="ignored", budget_usd=99.0) == index
+    assert not h.pipeline.review_note_path(run_id).exists()
+    assert (h["execution"].calls, h["final"].calls) == (3, 1)
+
+
+def test_extra_round_runs_one_more_pass_then_final(h: Harness) -> None:
+    h["crosscheck"].default = _loop
+    run_id = h.pipeline.create("x").run_id
+    assert h.pipeline.run(run_id).status == RunStatus.COMPLETED_WITH_ISSUES
+
+    h["crosscheck"].default = _defaults_for(h)["crosscheck"]  # the extra pass resolves everything
+    index = h.pipeline.resume(run_id, extra_round=True, note="focus on GPT-1", budget_usd=30.0)
+
+    assert index.status == RunStatus.COMPLETED, index.error
+    assert (index.round, index.unresolved_critical, index.budget_usd) == (4, 0, 30.0)
+    assert [c.index.round for c in h["execution"].contexts] == [1, 2, 3, 4]
+    assert h["execution"].contexts[-1].review_note == "focus on GPT-1"
+    assert h["final"].calls == 2
+    # 05-final moved to the end, after the extra pass's notes.
+    assert index.handoffs[-3:] == ["03-execution-r4", "04-crosscheck-r4", "05-final"]
+    assert index.handoffs.count("05-final") == 1
+    assert index.completed_stages[-3:] == ["execution", "crosscheck", "final"]
+
+
+def test_extra_round_that_leaves_issues_open_ends_with_issues_again(h: Harness) -> None:
+    h["crosscheck"].default = _loop
+    run_id = h.pipeline.create("x").run_id
+    h.pipeline.run(run_id)
+    index = h.pipeline.resume(run_id, extra_round=True)
+    assert index.status == RunStatus.COMPLETED_WITH_ISSUES
+    assert index.round == 4
+    assert h["execution"].calls == 4  # exactly one extra pass: the loop cap still applies
+    assert h["final"].calls == 2
+
+
+@pytest.mark.parametrize("stopped", ["completed", "failed", "awaiting_review"])
+def test_extra_round_only_applies_to_completed_with_issues(h: Harness, stopped: str) -> None:
+    if stopped == "failed":
+        h["strategy"].script = [lambda ctx: (_ for _ in ()).throw(KeyError("boom"))]
+    run_id = h.pipeline.create("x", review=stopped == "awaiting_review").run_id
+    index = h.pipeline.run(run_id)
+    assert index.status.value == stopped
+    with pytest.raises(ValueError, match="completed_with_issues"):
+        h.pipeline.resume(run_id, extra_round=True)
+    assert h.pipeline.status(run_id) == index  # nothing was written
 
 
 def test_single_loop_then_pass(h: Harness) -> None:
@@ -306,7 +381,7 @@ def test_zero_loops_goes_straight_to_final(h: Harness) -> None:
     h.settings.max_crosscheck_loops = 0
     h["crosscheck"].default = _loop
     index = h.pipeline.run(h.pipeline.create("x").run_id)
-    assert index.status == RunStatus.COMPLETED
+    assert index.status == RunStatus.COMPLETED_WITH_ISSUES
     assert h["execution"].calls == 1
 
 
@@ -449,6 +524,57 @@ def test_provider_error_records_partial_spend(h: Harness) -> None:
     assert index.error == "execution: ProviderError: hit budget"
     assert index.spent_usd == pytest.approx(0.75)
     assert index.spend_by_agent["claude"] == pytest.approx(0.75)
+
+
+class SandboxDown(ProviderError):
+    """Stands in for ``maf.providers.base.SandboxUnavailable``: a non-retryable infrastructure failure."""
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_provider_error_in_execution_fails_fast_without_crosscheck(h: Harness, retryable: bool) -> None:
+    """Claude Code is never retried, so even a retryable-flagged error ends the run at once."""
+    h.fakes.claude_code.script(
+        SandboxDown("Sandbox is required but failed to initialize", provider="claude_code", cost_usd=0.2, retryable=retryable)
+    )
+    h["execution"].script = [_metered("claude_code")]
+    index = h.pipeline.run(h.pipeline.create("x").run_id)
+    assert index.status == RunStatus.FAILED
+    assert (index.stage, index.round) == ("execution", 1)
+    assert index.error == "execution: SandboxDown: Sandbox is required but failed to initialize"
+    assert index.spent_usd == pytest.approx(0.2)
+    assert len(h.fakes.claude_code.calls) == 1
+    assert (h["crosscheck"].calls, h["final"].calls) == (0, 0)
+    assert index.handoffs == ["01a-routing", "01-ingestion", "02-strategy"]
+
+
+def test_real_sandbox_unavailable_fails_fast(h: Harness) -> None:
+    """The providers' own ``SandboxUnavailable`` (when present) takes the same generic non-retryable path."""
+    import maf.providers.base as provider_base
+
+    sandbox_error = getattr(provider_base, "SandboxUnavailable", None)
+    if sandbox_error is None:
+        pytest.skip("maf.providers.base.SandboxUnavailable not available")
+    h.fakes.claude_code.script(sandbox_error("bridge sockets failed", provider="claude_code", cost_usd=0.3))
+    h["execution"].script = [_metered("claude_code")]
+    index = h.pipeline.run(h.pipeline.create("x").run_id)
+    assert index.status == RunStatus.FAILED
+    assert index.error == "execution: SandboxUnavailable: bridge sockets failed"
+    assert index.spent_usd == pytest.approx(0.3)
+    assert h["crosscheck"].calls == 0
+
+
+def test_provider_error_in_crosscheck_never_loops_back(h: Harness) -> None:
+    def broken_fix_pass(ctx: StageContext) -> StageOutput:
+        raise SandboxDown("bridge sockets", provider="claude_code", cost_usd=0.1)
+
+    h["crosscheck"].script = [broken_fix_pass]
+    h["crosscheck"].default = _loop
+    index = h.pipeline.run(h.pipeline.create("x").run_id)
+    assert index.status == RunStatus.FAILED
+    assert (index.stage, index.round) == ("crosscheck", 1)
+    assert index.error == "crosscheck: SandboxDown: bridge sockets"
+    assert (h["execution"].calls, h["crosscheck"].calls, h["final"].calls) == (1, 1, 0)
+    assert index.unresolved_critical == 0
 
 
 def test_unexpected_exception_fails_with_type(h: Harness) -> None:

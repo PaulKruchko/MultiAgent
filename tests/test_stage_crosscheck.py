@@ -19,8 +19,9 @@ from maf.stages.crosscheck import (
     parse_fix_report,
     unresolved_critical,
 )
+from maf.providers.base import SandboxUnavailable
 from maf.types import Usage
-from test_stages_base import StageEnv, prompt_of, stage_env  # noqa: F401
+from test_stages_base import SandboxedFake, StageEnv, prompt_of, stage_env  # noqa: F401
 
 
 def critique(prefix: str, *issues: str) -> str:
@@ -131,6 +132,97 @@ def test_unfixed_critical_loops_back(ready: StageEnv) -> None:
     assert final.meta.to == "execution"
     assert final.section("Unresolved Critical") == "- [critical] GPT-1: free() lacks a range check"
     assert "- GPT-1: not fixed - breaks the 2 KB limit" in final.section("Applied Fixes")
+    assert "Loop cap reached" not in final.section("Summary")
+
+
+def test_unfixed_critical_at_the_loop_cap_says_the_run_ends_with_issues(ready: StageEnv, sample_bodies: dict[str, str]) -> None:
+    rnd = ready.settings.max_crosscheck_loops + 1
+    ready.put(f"03-execution-r{rnd}", HandoffKind.EXECUTION, sample_bodies["execution"], round=rnd)
+    script_disputed_round(ready, {"fixed": [], "not_fixed": [{"id": "GPT-1", "reason": "no"}], "summary": ""})
+    output = CrosscheckBackend().run_stage(ready.ctx("crosscheck", mode="code", round=rnd))
+    note = output.notes[-1].handoff
+    assert output.loop_back is True  # the pipeline, not the stage, enforces the cap
+    assert note.section("Verdict") == "LOOP"
+    assert note.meta.to == "final"
+    assert (
+        f"Loop cap reached (max {ready.settings.max_crosscheck_loops} loop(s)): the run goes to final and ends "
+        "`completed_with_issues` with 1 critical issue(s) unresolved."
+    ) in note.section("Summary")
+
+
+def test_indented_continuations_in_debate_notes_need_no_repair(ready: StageEnv) -> None:
+    ready.fakes.chatgpt.script(
+        "## Summary\n\nReviewed.\n\n## Issues\n\n- [critical] GPT-1: free() lacks a range check\n"
+        "  - reproduced with a foreign pointer\n\n- [minor] GPT-2: README lacks an example\n",
+    )
+    ready.fakes.gemini.script(critique("GEM"))
+    ready.fakes.claude.script(
+        critique("CLA"),
+        rebuttal("- GPT-1 [accept]: adding a debug range check\n  - ALLOC_DEBUG guards it", "- GPT-2 [accept]: will add"),
+    )
+    ready.fakes.claude_code.script({"fixed": ["GPT-1", "GPT-2"], "not_fixed": [], "summary": "done"})
+    output = CrosscheckBackend().run_stage(ready.ctx("crosscheck", mode="code"))
+
+    assert len(ready.fakes.chatgpt.calls) == 1 and len(ready.fakes.claude.calls) == 2  # no repair calls
+    note = output.notes[-1].handoff
+    assert note.section("Issues").splitlines() == [
+        "- [critical] GPT-1: free() lacks a range check - reproduced with a foreign pointer",
+        "- [minor] GPT-2: README lacks an example",
+    ]
+    fix_prompt = prompt_of(ready.fakes.claude_code.calls[0])
+    assert "Author response [accept]: adding a debug range check - ALLOC_DEBUG guards it" in fix_prompt
+
+
+@pytest.fixture
+def sandboxed(ready: StageEnv) -> SandboxedFake:
+    """A claude_code fake with the real sandbox preflight, as in a process resumed straight into crosscheck."""
+    fake = SandboxedFake(name="claude_code", agent="claude", cost_per_call=0.50, worst_case_usd=2.0)
+    fake.workspace = ready.paths.workspace
+    ready.fakes.claude_code = fake
+    return fake
+
+
+def test_resumed_code_crosscheck_verifies_the_sandbox_before_the_critiques(
+    ready: StageEnv, sandboxed: SandboxedFake
+) -> None:
+    order: list[str] = []
+    ready.fakes.chatgpt.default = lambda _r: order.append("critique") or critique("GPT", "critical:bug")
+    ready.fakes.gemini.script(critique("GEM"))
+    ready.fakes.claude.script(critique("CLA"), rebuttal("- GPT-1 [accept]: yes"))
+    sandboxed.script(
+        lambda _r: order.append("preflight") or {"digest": sandboxed.probe_digest()},
+        {"fixed": ["GPT-1"], "not_fixed": [], "summary": "done"},
+    )
+    output = CrosscheckBackend().run_stage(ready.ctx("crosscheck", mode="code"))
+
+    assert order == ["preflight", "critique"]
+    assert [r.schema_name for r in sandboxed.calls] == ["preflight", "fix_report"]
+    assert sandboxed.sandbox_verified is True
+    assert [(e.stage, e.purpose) for e in ready.ledger.entries if e.provider == "claude_code"] == [
+        ("crosscheck", "preflight"), ("crosscheck", "fixes"),
+    ]
+    assert output.notes[-1].handoff.meta.cost_usd == pytest.approx(0.50)  # the fix pass only
+    assert output.notes[-1].handoff.section("Verdict") == "PASS"
+
+
+def test_failed_preflight_stops_crosscheck_before_anything_else_is_paid(
+    ready: StageEnv, sandboxed: SandboxedFake
+) -> None:
+    sandboxed.script({"digest": "Sandbox is required but failed to initialize"})
+    with pytest.raises(SandboxUnavailable, match="preflight failed"):
+        CrosscheckBackend().run_stage(ready.ctx("crosscheck", mode="code"))
+    assert [len(f.calls) for f in ready.fakes.all()] == [0, 0, 0, 1]
+    assert [(e.stage, e.purpose, e.cost_usd) for e in ready.ledger.entries] == [("crosscheck", "preflight", 0.04)]
+
+
+def test_verified_sandbox_and_prose_mode_skip_the_preflight(ready: StageEnv, sandboxed: SandboxedFake) -> None:
+    for mode, verified in (("code", True), ("prose", False)):
+        sandboxed.sandbox_verified = verified
+        ready.fakes.chatgpt.script(critique("GPT"))
+        ready.fakes.gemini.script(critique("GEM"))
+        ready.fakes.claude.script(critique("CLA"))
+        CrosscheckBackend().run_stage(ready.ctx("crosscheck", mode=mode))  # type: ignore[arg-type]
+    assert sandboxed.calls == []
 
 
 def test_no_issues_skips_rebuttal_adjudication_and_fixes(ready: StageEnv) -> None:

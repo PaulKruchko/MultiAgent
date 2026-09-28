@@ -34,6 +34,8 @@ flowchart TD
     C3 --> C4[Claude applies fixes] --> CC[04-crosscheck-rN]
     CC -->|LOOP and round <= 2| E
     CC -->|PASS or loops exhausted| F[Claude final] --> FIN[05-final + deliverables/]
+    FIN -->|unresolved_critical == 0| DONE([COMPLETED])
+    FIN -->|loops exhausted, unresolved_critical > 0| ISSUES([COMPLETED_WITH_ISSUES])
 ```
 
 Every model call goes through `ledger.metered_call(ledger, provider, request, stage=...)`, usually
@@ -43,7 +45,8 @@ through `StageContext.call`. There is no other path to a provider.
 
 ### types.py (frozen)
 `AgentName`, `ProviderName`, `StageName`, `STAGE_ORDER`, `Tier`, `ExecutionMode`, `Severity`,
-`RunStatus` (with `.terminal`), and `Usage`. **Usage normalization**: `input_tokens` is the total
+`RunStatus` (with `.terminal`, and `.finished` for the two statuses that reached final: `completed` and
+`completed_with_issues`), and `Usage`. **Usage normalization**: `input_tokens` is the total
 billed input including cache reads and writes; `cached_input_tokens` and `cache_write_tokens` are subsets
 of it; `output_tokens` includes reasoning/thinking; `search_queries` counts billable grounding queries.
 
@@ -57,6 +60,9 @@ of it; `output_tokens` includes reasoning/thinking; `search_queries` counts bill
   run, owner A must verify them on the official pricing pages** (fetching docs is free).
 - `ModelPrice.cost(usage)` = `(in - cached - write)*input + cached*cached_input + write*(cache_write or input) + out*output`, all per 1e6, `+ search_queries*search_query_usd`.
 - `load_settings(path, **overrides)`: defaults, then YAML, then env (`MAF_VAULT`, `MAF_WORKSPACES`, `MAF_BUDGET_USD`), then non-None overrides.
+- Claude Code sandbox settings: `claude_code_tmp_base` (absolute, default `/tmp`; parent of the provider's
+  `TMPDIR`, see providers) and `claude_code_preflight_budget_usd` (the preflight's `--max-budget-usd`; default None,
+  which scales it with the model, see providers).
 
 ### ledger.py (A)
 - JSON Lines at `runs/<id>/ledger.jsonl`, one `LedgerEntry` per call, append with fsync. `Ledger.load`
@@ -73,17 +79,52 @@ of it; `output_tokens` includes reasoning/thinking; `search_queries` counts bill
 `worst_case_cost(request, on=None) -> float` (no paid calls). Adapters expose pure `build_params`/`to_result`
 (or `build_argv`/`parse_output`) that are unit-tested against recorded payloads in
 `tests/fixtures/providers/*.json`. SDK clients are injected (a test double) or created lazily. Adapters raise only
-`ProviderError`/`ProviderRefusal`/`StructuredOutputError`, and never raw SDK exceptions.
+`ProviderError`/`ProviderRefusal`/`StructuredOutputError`/`SandboxUnavailable` (Claude Code), and never raw SDK exceptions.
 
 | Adapter | Call | Structured output | Usage mapping |
 |---|---|---|---|
 | `OpenAIProvider` | `client.responses.create(model, instructions, input, max_output_tokens, reasoning={"effort"}, text={"format": {"type":"json_schema","name","schema","strict":True}}, store=False)` | `text.format` json_schema; `json.loads(response.output_text)` | `usage.input_tokens`, `.input_tokens_details.cached_tokens`, `.input_tokens_details.cache_write_tokens` (required in openai 3.20; billed at the input rate unless the price row has a cache-write rate), `.output_tokens`, `.output_tokens_details.reasoning_tokens` |
-| `GeminiProvider` | `client.models.generate_content(model, contents, config=GenerateContentConfig(system_instruction, max_output_tokens, tools=[Tool(google_search=GoogleSearch())], response_mime_type, response_json_schema, thinking_config))`; files via `client.files.upload(file=, config=UploadFileConfig(mime_type=))` and poll until ACTIVE | `response_json_schema` (fall back to prompt + local validation if the schema cannot be combined with search) | in = `prompt_token_count + tool_use_prompt_token_count`; cached = `cached_content_token_count`; out = `candidates_token_count + thoughts_token_count`; queries = `len(grounding_metadata.web_search_queries)` |
+| `GeminiProvider` | `client.models.generate_content(model, contents, config=GenerateContentConfig(system_instruction, max_output_tokens, tools=[Tool(google_search=GoogleSearch())], response_mime_type, response_json_schema, thinking_config, automatic_function_calling=AutomaticFunctionCallingConfig(disable=True)))`; files via `client.files.upload(file=, config=UploadFileConfig(mime_type=))` and poll until ACTIVE | `response_json_schema` (fall back to prompt + local validation if the schema cannot be combined with search) | in = `prompt_token_count + tool_use_prompt_token_count`; cached = `cached_content_token_count`; out = `candidates_token_count + thoughts_token_count`; queries = `len(grounding_metadata.web_search_queries)` |
 | `ClaudeProvider` | `client.messages.stream(model, max_tokens, system, messages, thinking={"type":"adaptive"}, output_config={"effort", "format"})` then `.get_final_message()` | `output_config.format = {"type":"json_schema","schema"}` | in = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`; cached = `cache_read_input_tokens`; write = `cache_creation_input_tokens`; out = `output_tokens` |
 | `ClaudeCodeProvider` | `claude -p --output-format json --model M --effort E --max-budget-usd B --permission-mode dontAsk --permission-prompts none --allowedTools ... --disallowedTools WebFetch WebSearch --no-session-persistence --setting-sources "" --strict-mcp-config --tools Bash,Read,Edit,Write,Glob,Grep --settings <sandbox json> [--append-system-prompt S] [--json-schema J]` with the prompt on stdin and cwd = workspace | `--json-schema`, read `structured_output` | `cost_usd = total_cost_usd` (authoritative); worst case = `max_budget_usd` |
 
 Claude model rules (opus-5-5 and fable-5-1): thinking cannot be disabled, no sampling params, no prefill,
 no forced `tool_choice`, `stop_reason == "refusal"` raises `ProviderRefusal`, and effort must be set explicitly (Opus 5.5 defaults to `medium`).
+
+Claude Code sandbox (verified live 2026-09-28):
+- `TMPDIR` = `<claude_code_tmp_base>/maf-<12 random hex>` (`/tmp/maf-…`, 21 bytes), picked once per provider instance
+  (so `build_env` and `build_argv` agree), a 0700 directory owned by the user (created, or checked and its mode
+  repaired, before each call) and removed when the provider is garbage-collected or the process exits. The name is
+  random because the `--settings` argv is visible to every local user: a name derived from the workspace could be
+  created first by someone else, blocking every call. If the path is unusable anyway (another user's directory, a
+  symlink, a file), the provider switches once to a fresh random name; a second failure is a `ProviderError` (cost 0).
+  It is listed in `sandbox.filesystem.allowWrite` after the workspace, and is the only writable path outside it. The
+  sandbox creates its Unix sockets under `TMPDIR`; the former `<workspace>/.maf/tmp` pushed them past the 108-byte
+  `sun_path` limit for long run slugs, so every Bash call failed. The binding limit is the CLI's: sandboxed commands
+  get `TMPDIR=<TMPDIR>/claude-<uid>`, budgeted at 44 bytes (`CLI_CHILD_TMPDIR_MAX_BYTES`) so their own sockets fit,
+  while the runtime's sockets add at most 35 bytes to `TMPDIR`. So a `TMPDIR` longer than
+  `max_tmpdir_bytes() = 44 - len("/claude-<uid>")` (32 bytes for a 4-digit uid, which allows a `claude_code_tmp_base`
+  of at most 15 bytes) is refused before spawning (`ProviderError`, cost 0, not retryable). `MPLCONFIGDIR` stays in
+  `<workspace>/.maf/mpl`.
+- `SandboxUnavailable(ProviderError)` (always `retryable=False`): `complete` raises it when the result text, stderr or
+  a string in `structured_output` matches `SANDBOX_FAILURE_PATTERNS` ("Sandbox is required but failed to initialize",
+  "Failed to create bridge sockets", "the sandbox failed to initialize", `bwrap: …`), with `cost_usd = total_cost_usd`
+  (the worst case when there is no JSON result). It is checked before the error and structured-output checks, so it
+  never surfaces as a `StructuredOutputError`, which the fix pass tolerates.
+- `preflight(model, budget_usd=None, call=)` writes 4096 random bytes to `<workspace>/.maf/preflight.bin` and asks for
+  exactly one Bash command (effort `low`, `--json-schema {digest: string}`):
+  `cp .maf/preflight.bin "$TMPDIR/maf-preflight" && sha256sum "$TMPDIR/maf-preflight" | tee .maf/preflight.out`.
+  It reads the workspace, writes `$TMPDIR` (only a successful copy is hashed) and writes the workspace. The digest must
+  match `hashlib` both in the answer and in `.maf/preflight.out` (read by Python, never through a symlink), so a
+  sandbox that starts but cannot write where compilers and `tempfile` do also fails; either miss raises
+  `SandboxUnavailable`. Both files are always deleted. Success sets `sandbox_verified` on the provider instance
+  (cleared by any later sandbox failure).
+- The preflight's budget, when not given, is `preflight_budget_usd(model)`: 3 turns of 25k context tokens plus 1,024
+  output tokens at the worst-case rate (`token_worst_case`), at least $0.15. That is about $0.44 on claude-opus-5-5 and
+  $1.09 on claude-fable-5-1; a flat $0.15 was less than one Fable first turn (13k to 21k tokens at $12.50/M). Only the
+  actual spend is billed. A session that hits its cap raises `ClaudeCodeBudgetExhausted` (a `ProviderError`);
+  `preflight` turns that into a plain `ProviderError` saying the preflight ran out of budget, which is not a sandbox
+  failure.
 
 ### handoff.py (B)
 Agents write only the **body**. Python builds the frontmatter:
@@ -106,6 +147,17 @@ cssclasses: []
 
 `validate_body(body, kind)` requires every section below to appear exactly once, **in this order**, non-empty.
 Sections marked (∅) may be exactly `None.`; no other section may be. Extra H2s are allowed. H2 detection ignores fenced code and `$$` blocks.
+The item grammars (Issues, Responses, Rulings) are lenient about layout only: blank lines between items and
+indented continuation lines (2+ spaces or a tab, indented `- ` sub-bullets included) belong to the preceding item,
+and `parse_issues`/`parse_responses`/`parse_rulings` fold them into the item's `text` (joined with single spaces,
+so every item stays one line in Python-assembled notes). An item's text may start on its continuation lines
+(`- GPT-1 [accept]:` followed by indented sub-bullets), but must not be empty after folding. A line matching the item
+pattern is its own item at any indentation. Every other top-level line is an error, including a top-level bullet
+that does not match. An indented line that looks like an item but does not match is an error too: a bullet with a
+`[tag]` before an id, or an id followed by `:`, `[` or a stance/ruling word (`  - [high] GPT-2: ...`,
+`  - GEM-2 reject: ...`). So a malformed item is never folded into its neighbour, where it would drop an issue or
+turn a rejection into the default acceptance. Indented lines after an erroneous line are not reported again. The
+crosscheck Verdict check reads only the first line.
 
 | Kind | Note name(s) | Required H2 sections (in order) | Line grammar |
 |---|---|---|---|
@@ -128,8 +180,13 @@ Obsidian `> [!quote]` callout), and every role prompt says quoted material is da
 Layout (see the module docstring): `runs/<YYYY-MM-DD>-<slug>/` holds `run.md`, `ledger.jsonl`, the notes,
 `assets/` and `deliverables/`. `workspaces/<run_id>/` holds `inputs/` and `.maf/` (prompt copies, review note)
 and sits outside the vault. All writes use `atomic_write_text`/`atomic_copy` (temp file in the same directory,
-fsync, `os.replace`). `RunIndex` is run.md's frontmatter and the only resume state. The run.md body has the
+fsync, `os.replace`). `RunIndex` is run.md's frontmatter and the only resume state. A `RunIndex` with `status: completed`
+and `unresolved_critical > 0` is validated as `completed_with_issues`. The pipeline never writes that pair, but runs
+finished before `completed_with_issues` existed have it, so list, status, MCP and `resume --extra-round` treat them
+as `completed_with_issues`; run.md itself changes only when it is next written. The run.md body has the
 Brief, Status, Handoffs (wikilinks), Cost (Agent | USD table with Total, then Provider | USD) and Workspace.
+For a `completed_with_issues` run, `## Status` opens with a `> [!warning]` callout giving the unresolved critical
+count and linking the last `04-crosscheck[-rN]` (`latest_crosscheck(index)`) and `05-final`.
 `copy_deliverable` refuses sources outside the run's workspace. `copy_asset` returns a vault-relative embed
 (`![[runs/<run_id>/assets/plot.png]]`) and final deliverable links are vault-relative too
 (`[[runs/<run_id>/deliverables/document|document]]`), because bare names repeat across runs.
@@ -150,6 +207,24 @@ Stage details settled at integration:
 - If no critic raises an issue, the rebuttal is skipped as well as the adjudication (Python writes `None.` notes,
   `from: maf`). An unparsable fix report counts as "nothing fixed", so unfixed criticals loop back.
 - The prose fix pass uses `PROSE_FIX_REPORT_SCHEMA` (`FIX_REPORT_SCHEMA` plus the full revised `document`).
+- A `LOOP` at `round > max_crosscheck_loops` cannot loop: that `04-crosscheck` has `to: final` and its Summary says the
+  run ends `completed_with_issues`. `loop_back` is still set; the pipeline enforces the cap.
+- With `unresolved_critical > 0`, the final prompt states the run ends `completed_with_issues` (linking the last
+  cross-check), and Python opens the 05-final `## Summary` with a `> [!warning] Run status: completed_with_issues`
+  callout and adds the `maf/completed-with-issues` tag, besides listing the issues under Limitations.
+- Stages never catch a non-retryable `ProviderError` (e.g. the providers' `SandboxUnavailable`); only
+  `StructuredOutputError` from triage and the fix report is handled in place.
+- Code/mixed execution calls `ensure_sandbox(ctx)` before its first Claude Code call: the provider's `preflight`
+  runs through `ctx.call("claude_code", ..., purpose="preflight")` (metered, stage `execution`, never retried,
+  budget `claude_code_preflight_budget_usd`, None meaning `preflight_budget_usd(model)`), unless that provider instance
+  already passed (`sandbox_verified`).
+  Providers are built once per `_advance`, so this is once per run per process; a resumed process checks again.
+  Prose mode never preflights, and providers without `preflight` (test fakes) are skipped. A failed preflight
+  raises `SandboxUnavailable` out of the stage before FreeRTOS is provisioned or the prompt is written.
+- Code/mixed crosscheck calls `ensure_sandbox(ctx)` first too (the fix pass is a Claude Code session). After execution
+  in the same process it is a no-op; a process resumed straight into crosscheck runs the preflight there (ledger stage
+  `crosscheck`), so a broken sandbox stops the run before the critiques and rebuttal are paid for.
+- The preflight's spend belongs to no note: the notes' `cost_usd` add up to the ledger total minus the preflights.
 
 **Consumption rules** (what each stage reads):
 
@@ -167,24 +242,42 @@ fixes use `claude_code` or `claude`; final uses `claude`. Critiques run concurre
 
 ### pipeline.py (E)
 `Pipeline(settings, vault=, providers_factory=, backends=, clock=)`. `create` makes no model calls. `run`
-advances until a stop status and never raises for stage errors. `resume(note=, budget_usd=)` continues.
-Both take an optional `progress=(index, message)` observer (the CLI prints it). `run` returns a FAILED,
-BUDGET_EXCEEDED or AWAITING_REVIEW run unchanged; only a run left RUNNING by a crash continues under `run`.
+advances until a stop status and never raises for stage errors. `resume(note=, budget_usd=, extra_round=)` continues.
+Both take an optional `progress=(index, message)` observer (the CLI prints it). `run` returns a COMPLETED,
+COMPLETED_WITH_ISSUES, FAILED, BUDGET_EXCEEDED or AWAITING_REVIEW run unchanged; only a run left RUNNING by a crash
+continues under `run`.
 The pure `next_step(index, finished, output, max_loops)` encodes the transitions:
 ingestion → strategy → (review gate) → execution → crosscheck → (execution again if `loop_back` and
-`round <= max_crosscheck_loops`, which allows up to 2 loops and 3 execution passes) → final → COMPLETED. After each stage the pipeline
+`round <= max_crosscheck_loops`, which allows up to 2 loops and 3 execution passes) → final → COMPLETED, or
+COMPLETED_WITH_ISSUES when `unresolved_critical > 0` (final was reached only because the loop cap was hit). After each stage the pipeline
 writes the notes, appends them to `index.handoffs`, applies the allowed `index_updates` (`mode`, `unresolved_critical`),
 mirrors ledger totals into the index, and writes run.md, in that order, so a crash repeats at most the current stage.
-Error mapping: `BudgetExceeded` → BUDGET_EXCEEDED; `HandoffInvalid` → FAILED; anything else → FAILED with `error`.
+Both completed statuses are terminal: `resume` returns them unchanged and writes nothing (no note, no budget), except
+`resume(extra_round=True)` on a COMPLETED_WITH_ISSUES run, which moves it to execution `round + 1` (05-final leaves
+`handoffs` until final runs again), runs that pass and its cross-check (the loop cap still applies, so normally exactly
+one extra pass), then final. `extra_round` on any other status raises `ValueError`.
+Error mapping: `BudgetExceeded` → BUDGET_EXCEEDED; `HandoffInvalid` → FAILED; `ProviderError` → FAILED at once (a
+non-retryable one such as `SandboxUnavailable` is never retried or swallowed, so no crosscheck loop-back follows it;
+partial spend is already in the ledger); anything else → FAILED with `error` (`"<stage>: <Type>: <message>"`).
 
 ### cli.py (E)
-`maf run | resume | status | list | serve`, with the global `--vault --workspaces --config`. Exit codes: 0 ok/awaiting review,
-1 failed, 2 usage, 3 budget exceeded.
+`maf run | resume | status | list | serve`, with the global `--vault --workspaces --config`. Exit codes of `run`/`resume`
+follow the run status: 0 completed (also awaiting review, or started with `--no-wait`), 2 completed_with_issues,
+1 failed or budget exceeded. Usage errors (bad arguments, unknown run, bad config, `--extra-round` on a run that is not
+completed_with_issues) also exit 2, before anything runs; the output tells them apart. A finished run prints the
+05-final path as the last stdout line; completed_with_issues then ends with one stderr line
+(`completed with issues: N unresolved critical issue(s) after the cross-check loop cap; see <04-crosscheck-rN.md> (...)`),
+failed with `failed: <error> (spent $X of $Y)`, budget exceeded with the error and a `--budget` hint.
+`maf resume` refuses a completed_with_issues run (exit 2, nothing runs or is written) unless `--extra-round` is given.
+`maf status` shows `unresolved critical: N` when non-zero.
 
 ### mcp_server.py (E)
 mcp 2.x `MCPServer` (renamed from FastMCP) serves streamable HTTP at `http://127.0.0.1:8765/mcp`, and only loopback addresses are allowed.
 Tools: `start_run` (write, returns `run_id` immediately; `RunManager` runs the pipeline on a single background worker thread),
 `get_run_status`, `get_run_result`, `list_runs` (read-only annotations). Tests use `mcp.Client(server)` in-process.
+`status` is the `RunStatus` value everywhere; `get_run_status` and `get_run_result` also return `unresolved_critical`,
+and `get_run_result` returns the 05-final body for both `completed` and `completed_with_issues`. The server
+instructions tell ChatGPT that `completed_with_issues` means the result is not verified.
 The tunnel (a systemd user unit for tunnel-client) and the Platform dashboard steps are manual and documented separately.
 
 ## 4. Ledger semantics (summary)
@@ -195,7 +288,12 @@ The tunnel (a systemd user unit for tunnel-client) and the Platform dashboard st
 4. Claude Code: `--max-budget-usd = min(per-call cap, remaining)`, and its worst case equals that value. Actual cost = `total_cost_usd`.
    With less than `MIN_CLAUDE_CODE_BUDGET_USD` ($0.0001) left, the call is refused with `BudgetExceeded`.
 5. Actual cost is always recorded, including partial spend on failures (`LedgerEntry.error` then holds the error text).
-   `run.md` shows spend by agent and by provider.
+   `run.md` shows spend by agent and by provider. The Claude Code sandbox preflight is an ordinary entry
+   (`stage=execution`, or `crosscheck` in a process resumed there; `purpose=preflight`). A wrong digest is detected
+   after the metered call returns, so that entry has no `error` and the `SandboxUnavailable` raised afterwards carries
+   the same spend for information only; an answer quoting the sandbox error makes `complete` raise inside the metered
+   call, so that entry carries the error. Either way the spend is recorded once. Its reservation is the preflight
+   budget plus one turn of headroom (about $0.44 + $2.28 on claude-opus-5-5), released when the call ends.
 6. "Remaining" for clamping and checks also subtracts worst cases reserved by in-flight calls, so the three
    concurrent critiques cannot jointly overshoot the cap.
 7. A model with no price row raises `UnknownModelPrice` from `worst_case_cost`; the run ends FAILED before any spend.
@@ -205,5 +303,9 @@ The tunnel (a systemd user unit for tunnel-client) and the Platform dashboard st
 - `tests/conftest.py` provides `FakeProvider` (scripted FIFO replies: str / dict → `parsed` / Exception / callable),
   `FakeProviders.factory()` for `Pipeline(providers_factory=...)`, `settings` (temp vault and workspaces), `sample_bodies`,
   `load_provider_fixture(name)`, and an autouse fixture that strips API keys so accidental live calls fail.
-- Provider tests use pure mapping functions with recorded JSON payloads and fake SDK clients. Claude Code tests inject a fake `Runner`.
+- Provider tests use pure mapping functions with recorded JSON payloads and fake SDK clients. Claude Code tests inject a fake `Runner`
+  and a short private `tmp_base` (`/tmp/mXXXXXXXX`, 14 bytes so `TMPDIR` fits `max_tmpdir_bytes()`, removed afterwards), so
+  no test creates real `/tmp/maf-*` directories.
+  Stage and e2e tests that need the preflight use `SandboxedFake` (`tests/test_stages_base.py`): a `FakeProvider` carrying
+  the real `ClaudeCodeProvider.preflight`, whose `preflight` request is answered from the script like any other.
 - There are no network calls and no subprocess calls to the real `claude`. `-m live` tests are opt-in and require approval (budget: $150 total, ask before $100).

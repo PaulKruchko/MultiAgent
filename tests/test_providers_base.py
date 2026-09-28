@@ -26,6 +26,8 @@ from maf.providers.base import (
     MESSAGE_OVERHEAD_TOKENS,
     PDF_TOKENS_PER_PAGE,
     Attachment,
+    ProviderError,
+    SandboxUnavailable,
     attachment_mime_type,
     estimate_attachment_tokens,
     estimate_request_tokens,
@@ -35,6 +37,7 @@ from maf.providers.base import (
     parse_json_output,
     token_worst_case,
 )
+from maf.providers.claude_code import max_tmpdir_bytes
 
 FIXTURES = Path(__file__).parent / "fixtures" / "providers"
 ON = date(2026, 9, 28)
@@ -155,6 +158,15 @@ def test_parse_json_output_invalid_schema() -> None:
 # --- small helpers ---------------------------------------------------------------------------
 
 
+def test_sandbox_unavailable_is_a_never_retryable_provider_error() -> None:
+    exc = SandboxUnavailable("bridge sockets", provider="claude_code", cost_usd=1.25)
+    assert isinstance(exc, ProviderError) and not isinstance(exc, StructuredOutputError)
+    assert (exc.provider, exc.cost_usd, exc.retryable, str(exc)) == ("claude_code", 1.25, False, "bridge sockets")
+    assert SandboxUnavailable("x", provider="claude_code").cost_usd == 0.0
+    with pytest.raises(TypeError):
+        SandboxUnavailable("x", provider="claude_code", retryable=True)  # type: ignore[call-arg]
+
+
 def test_get_field_handles_dicts_objects_and_none() -> None:
     class Obj:
         a = 1
@@ -227,6 +239,9 @@ def test_build_providers_constructs_all_adapters_without_network(settings: Setti
     assert code.executable == settings.claude_executable
     assert code.allowed_tools == settings.claude_code_tools
     assert code.timeout_s == settings.claude_code_timeout_s
+    assert code.sandbox_verified is False
+    assert len(str(code.tmpdir)) <= max_tmpdir_bytes() and not code.tmpdir.is_relative_to(workspace)
+    assert code.build_env()["TMPDIR"] == str(code.tmpdir)
     assert not workspace.exists()  # construction has no side effects
 
 
@@ -239,3 +254,18 @@ def test_build_providers_puts_project_python_first_on_path(tmp_path: Path) -> No
     code = build_providers(settings, tmp_path / "w" / "r").claude_code
     assert isinstance(code, ClaudeCodeProvider)
     assert code.build_env()["PATH"].split(":")[0] == str(venv_bin)
+
+
+def test_build_providers_passes_the_tmp_base_through(tmp_path: Path) -> None:
+    settings = Settings(vault_path=tmp_path / "v", workspaces_path=tmp_path / "w", claude_code_tmp_base=Path("/var/t"))
+    code = build_providers(settings, tmp_path / "w" / "r").claude_code
+    assert isinstance(code, ClaudeCodeProvider)
+    assert code.tmp_base == Path("/var/t") and code.tmpdir.parent == Path("/var/t")
+    assert code.build_env()["TMPDIR"] == str(code.tmpdir)
+
+
+def test_sandbox_unavailable_is_exported_as_a_provider_error() -> None:
+    from maf import providers
+
+    assert providers.SandboxUnavailable is SandboxUnavailable
+    assert issubclass(providers.SandboxUnavailable, providers.ProviderError)

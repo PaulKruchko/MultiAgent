@@ -35,19 +35,36 @@ inherits the CLI's env): the key goes to the CLI through ``apiKeyHelper`` (``cat
 under ``~/.config/maf/secrets``, which the sandbox cannot read), deleted when the call ends.
 ``CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`` is NOT used: in CLI 2.1.284 it forces the default permission mode and
 the OS sandbox stops confining Bash writes (verified live 2026-09-28).
-``TMPDIR`` and ``MPLCONFIGDIR`` point into ``<workspace>/.maf/`` because the sandbox only permits
-writes inside the workspace.
+``MPLCONFIGDIR`` points into ``<workspace>/.maf/``. ``TMPDIR`` is ``<tmp_base>/maf-<12 random hex>`` (``/tmp`` by
+default), picked once per provider instance: a private 0700 directory that is the one write location outside the
+workspace (``sandbox.filesystem.allowWrite`` lists both), removed when the provider is collected or the process
+exits. The name is random because the ``--settings`` argv shows it to every local user, and a predictable name could
+be created first by someone else. It must be short: the sandbox runtime creates its Unix sockets under ``TMPDIR``,
+and a ``TMPDIR`` inside a long workspace path pushed them past the 108-byte ``sun_path`` limit, so every Bash call
+failed with "Failed to create bridge sockets" (verified live 2026-09-28). ``complete`` refuses a ``TMPDIR`` longer
+than ``max_tmpdir_bytes()``, the CLI's own budget for the ``TMPDIR`` it gives sandboxed commands.
+
+Sandbox failures are fatal: output matching ``SANDBOX_FAILURE_PATTERNS`` raises ``SandboxUnavailable`` (with the
+real spend), and ``preflight`` proves sandboxed Bash can read the workspace and write both ``$TMPDIR`` and the
+workspace (``PREFLIGHT_COMMAND`` on a random file) before a run pays for real work.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import math
 import os
+import re
+import secrets
 import shlex
+import shutil
 import signal
+import stat
 import subprocess
 import tempfile
+import weakref
 from collections.abc import Callable, Sequence
 from datetime import date
 from pathlib import Path
@@ -59,6 +76,7 @@ from maf.providers.base import (
     CompletionRequest,
     CompletionResult,
     ProviderError,
+    SandboxUnavailable,
     StructuredOutputError,
     parse_json_output,
     token_worst_case,
@@ -95,6 +113,58 @@ SENSITIVE_READ_PATHS: tuple[str, ...] = (
 DEFAULT_TURN_CONTEXT_TOKENS = 200_000
 DEFAULT_TURN_OUTPUT_TOKENS = 64_000
 
+DEFAULT_TMP_BASE = Path("/tmp")
+TMPDIR_RANDOM_BYTES = 6
+"""``TMPDIR`` is ``<tmp_base>/maf-<12 random hex>``: 21 bytes under ``/tmp``."""
+CLI_CHILD_TMPDIR_MAX_BYTES = 44
+"""Claude Code 2.1.284 (``HXn`` in the binary) exports ``TMPDIR=<TMPDIR>/claude-<uid>`` to sandboxed commands, sized
+to at most 44 bytes so their own sockets keep 63 of the 108 ``sun_path`` bytes. A longer one is still used (without
+``CLAUDE_CODE_TMPDIR`` the CLI's fallback is the same directory), so ``check_tmpdir`` enforces the budget. It binds
+before the runtime's own sockets do: they add at most 35 bytes to ``TMPDIR`` (``claude-socks-<16 hex>.sock``;
+``srt-obs-*/s<8 hex>.sock`` and ``srt-mux-<pid>-<n>.sock`` are shorter), and ``cc-socks``/daemon sockets move to
+``/tmp`` on their own."""
+
+SANDBOX_FAILURE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bsandbox (?:is required but |has |had )?failed to initiali[sz]e", re.IGNORECASE),
+    re.compile(r"\bfailed to initiali[sz]e (?:the )?(?:\w+ )?sandbox\b", re.IGNORECASE),
+    re.compile(r"failed to create bridge sockets?", re.IGNORECASE),
+    re.compile(r"\bbwrap: \S"),
+)
+"""Sandbox start-up failures in Claude Code's output or stderr: the CLI's "Sandbox is required but failed to
+initialize: Failed to create bridge sockets after 5 attempts", a model's paraphrase of it ("the Bash sandbox failed
+to initialize"), or bubblewrap's own ``bwrap: ...`` errors. Deliberately narrow: a false match stops a healthy run."""
+
+PREFLIGHT_FILE = ".maf/preflight.bin"
+"""Workspace-relative random file the preflight hashes."""
+PREFLIGHT_OUTPUT = ".maf/preflight.out"
+"""Workspace-relative file the preflight command writes the digest to; Python reads it back."""
+PREFLIGHT_COMMAND = (
+    f'cp {PREFLIGHT_FILE} "$TMPDIR/maf-preflight" && sha256sum "$TMPDIR/maf-preflight" | tee {PREFLIGHT_OUTPUT}'
+)
+"""Reads the workspace, writes ``$TMPDIR`` (only a successful copy is hashed) and writes the workspace (``tee``): the
+two write locations every compiler, here-doc and Python ``tempfile`` call depends on."""
+PREFLIGHT_BYTES = 4096
+PREFLIGHT_MAX_OUTPUT_TOKENS = 1_024
+PREFLIGHT_MIN_BUDGET_USD = 0.15
+PREFLIGHT_TURNS = 3
+PREFLIGHT_CONTEXT_TOKENS = 25_000
+"""The default preflight cap (``preflight_budget_usd``) prices ``PREFLIGHT_TURNS`` turns of this much context (a
+first turn carries about 13-21k tokens of system prompt and tools) at the worst-case rate."""
+PREFLIGHT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"digest": {"type": "string"}},
+    "required": ["digest"],
+    "additionalProperties": False,
+}
+PREFLIGHT_PROMPT = (
+    "Sandbox health check. Use the Bash tool exactly once to run this command, and nothing else:\n\n"
+    f"{PREFLIGHT_COMMAND}\n\n"
+    "Answer with the 64-character hexadecimal digest it printed as `digest`. If the command failed, answer with "
+    "its error message as `digest` instead. Do not compute the digest any other way and do not use other tools."
+)
+
+_HEX_DIGEST = re.compile(r"\b[0-9a-fA-F]{64}\b")
+
 
 class ClaudeCodeOutput(BaseModel):
     """Parsed ``--output-format json`` result. Unknown keys are kept (``extra="allow"``)."""
@@ -128,6 +198,10 @@ Runner = Callable[[Sequence[str], str, Path, dict[str, str], float], CompletedPr
 
 class ClaudeCodeTimeout(ProviderError):
     """The CLI exceeded ``timeout_s`` and was killed. Spend is unknown, so ``complete`` charges the full budget."""
+
+
+class ClaudeCodeBudgetExhausted(ProviderError):
+    """The session stopped at its ``--max-budget-usd`` cap (``subtype == "error_max_budget_usd"``). Not retryable."""
 
 
 def subprocess_runner(
@@ -176,13 +250,20 @@ DEFAULT_SECRETS_DIR = Path.home() / ".config" / "maf" / "secrets"
 
 
 def sandbox_settings(
-    workspace: Path, deny_read: Sequence[str] = SENSITIVE_READ_PATHS, api_key_helper: str | None = None
+    workspace: Path,
+    deny_read: Sequence[str] = SENSITIVE_READ_PATHS,
+    api_key_helper: str | None = None,
+    tmpdir: Path | None = None,
 ) -> dict[str, Any]:
     """The ``--settings`` JSON object shown in the module docstring, bound to ``workspace``.
 
     ``deny_read`` entries are ``~``-relative or absolute paths. They become ``Read``/``Edit`` deny rules
-    (``~/x/**`` or ``//abs/x/**``) and ``sandbox.filesystem.denyRead`` entries."""
+    (``~/x/**`` or ``//abs/x/**``) and ``sandbox.filesystem.denyRead`` entries. ``tmpdir`` (the CLI's
+    ``TMPDIR``) is writable next to the workspace: the sandbox runtime puts its sockets there."""
     rules = [_rule_path(p) for p in deny_read]
+    allow_write = [str(workspace.resolve())]
+    if tmpdir is not None:
+        allow_write.append(str(tmpdir))
     settings: dict[str, Any] = {
         "permissions": {"deny": [f"{tool}({rule})" for rule in rules for tool in ("Read", "Edit")]},
         "sandbox": {
@@ -190,7 +271,7 @@ def sandbox_settings(
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
             "autoAllowBashIfSandboxed": True,
-            "filesystem": {"allowWrite": [str(workspace.resolve())], "denyRead": list(deny_read)},
+            "filesystem": {"allowWrite": allow_write, "denyRead": list(deny_read)},
             "network": {"allowedDomains": []},
         },
     }
@@ -228,6 +309,116 @@ def format_budget(usd: float) -> str:
     return f"{math.floor(usd * 10_000) / 10_000:.4f}"
 
 
+def scratch_tmpdir(base: Path = DEFAULT_TMP_BASE) -> Path:
+    """A new random ``<base>/maf-<12 hex>`` path (not created). Not derived from the workspace: the ``--settings``
+    argv shows the name to every local user, and a predictable one could be created first by someone else."""
+    return base / f"maf-{secrets.token_hex(TMPDIR_RANDOM_BYTES)}"
+
+
+def max_tmpdir_bytes(uid: int | None = None) -> int:
+    """Longest ``TMPDIR`` (in bytes) whose ``<TMPDIR>/claude-<uid>`` fits ``CLI_CHILD_TMPDIR_MAX_BYTES``: 32 for a
+    4-digit uid. ``uid`` defaults to ``os.getuid()``."""
+    return CLI_CHILD_TMPDIR_MAX_BYTES - len(f"/claude-{os.getuid() if uid is None else uid}")
+
+
+def check_tmpdir(tmpdir: Path) -> None:
+    """``ProviderError`` (cost 0, not retryable) when ``tmpdir`` is relative, or longer than ``max_tmpdir_bytes()``
+    (counted in bytes, as ``sun_path`` is), so sandboxed commands would get a ``TMPDIR`` too long for their sockets."""
+    if not tmpdir.is_absolute():
+        raise ProviderError(f"Claude Code TMPDIR must be absolute, got {str(tmpdir)!r}", provider=PROVIDER)
+    length, limit = len(os.fsencode(tmpdir)), max_tmpdir_bytes()
+    if length > limit:
+        raise ProviderError(
+            f"Claude Code TMPDIR {tmpdir} is {length} bytes long (at most {limit}): sandboxed commands get "
+            f"TMPDIR=<TMPDIR>/claude-{os.getuid()}, which must stay within {CLI_CHILD_TMPDIR_MAX_BYTES} bytes for "
+            "Unix socket paths under it to fit the 108-byte limit; set claude_code_tmp_base to a shorter directory",
+            provider=PROVIDER,
+        )
+
+
+def ensure_private_dir(path: Path) -> bool:
+    """Create ``path`` with mode 0700, or check an existing one: it must be a real directory (not a symlink)
+    owned by this user, and its mode is reset to 0700. ``ProviderError`` (cost 0) when it cannot be used.
+    The parent must exist. Returns True when this call created the directory."""
+    try:
+        path.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        created = False
+    except OSError as exc:
+        raise ProviderError(f"cannot create Claude Code TMPDIR {path}: {exc}", provider=PROVIDER) from exc
+    if path.is_symlink():
+        raise ProviderError(f"refusing Claude Code TMPDIR {path}: it is a symlink", provider=PROVIDER)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)  # no-follow closes the symlink race
+    except OSError as exc:
+        raise ProviderError(f"refusing Claude Code TMPDIR {path}: {exc.strerror or exc}", provider=PROVIDER) from exc
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid():
+            raise ProviderError(
+                f"refusing Claude Code TMPDIR {path}: owned by uid {info.st_uid}, not {os.getuid()}",
+                provider=PROVIDER,
+            )
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return created
+
+
+def sandbox_failure(*texts: str) -> str | None:
+    """The first line of ``texts`` matching ``SANDBOX_FAILURE_PATTERNS`` (stripped, capped at 300 characters),
+    or None."""
+    for text in texts:
+        for line in text.splitlines():
+            if any(pattern.search(line) for pattern in SANDBOX_FAILURE_PATTERNS):
+                return line.strip()[:300]
+    return None
+
+
+def reported_digest(parsed: dict[str, Any] | None) -> str | None:
+    """The lower-case SHA-256 hex digest in a preflight answer's ``digest`` field, or None."""
+    value = (parsed or {}).get("digest")
+    match = _HEX_DIGEST.search(value) if isinstance(value, str) else None
+    return match.group(0).lower() if match else None
+
+
+def written_digest(path: Path) -> str | None:
+    """The lower-case SHA-256 hex digest in the first ``PREFLIGHT_BYTES`` of the regular file ``path`` (not followed
+    if it is a symlink), or None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            return None
+        return reported_digest({"digest": fh.read(PREFLIGHT_BYTES).decode("ascii", "replace")})
+
+
+def preflight_budget_usd(model: str, on: date | None = None) -> float:
+    """Default ``--max-budget-usd`` of the preflight: ``PREFLIGHT_TURNS`` turns of ``PREFLIGHT_CONTEXT_TOKENS`` context
+    and ``PREFLIGHT_MAX_OUTPUT_TOKENS`` output at the worst-case rate (``token_worst_case``), at least
+    ``PREFLIGHT_MIN_BUDGET_USD``. About $0.44 on claude-opus-5-5 and $1.09 on claude-fable-5-1, whose first turn alone
+    can cost more than a flat $0.15. Only the actual spend is billed."""
+    turn = token_worst_case(model, PREFLIGHT_CONTEXT_TOKENS, PREFLIGHT_MAX_OUTPUT_TOKENS, on=on)
+    return max(PREFLIGHT_MIN_BUDGET_USD, PREFLIGHT_TURNS * turn)
+
+
+def preflight_request(model: str, budget_usd: float) -> CompletionRequest:
+    """The cheap sandbox check: low effort, a small budget, and ``PREFLIGHT_SCHEMA`` structured output."""
+    return CompletionRequest.simple(
+        model,
+        PREFLIGHT_PROMPT,
+        max_output_tokens=PREFLIGHT_MAX_OUTPUT_TOKENS,
+        json_schema=PREFLIGHT_SCHEMA,
+        schema_name="preflight",
+        effort="low",
+        max_budget_usd=budget_usd,
+    )
+
+
 class ClaudeCodeProvider:
     name: ProviderName = PROVIDER
     agent: AgentName = "claude"
@@ -246,10 +437,12 @@ class ClaudeCodeProvider:
         turn_context_tokens: int = DEFAULT_TURN_CONTEXT_TOKENS,
         turn_output_tokens: int = DEFAULT_TURN_OUTPUT_TOKENS,
         secrets_dir: Path = DEFAULT_SECRETS_DIR,
+        tmp_base: Path = DEFAULT_TMP_BASE,
     ) -> None:
         """``path_prepend`` puts directories (e.g. the project venv's ``bin``) first on the CLI's ``PATH``.
         ``deny_read`` lists paths no tool may read. ``turn_*_tokens`` size one model turn, the amount the CLI
-        can overshoot ``--max-budget-usd`` by (see ``turn_headroom_usd``)."""
+        can overshoot ``--max-budget-usd`` by (see ``turn_headroom_usd``). ``tmp_base`` holds this instance's
+        ``TMPDIR`` (``Settings.claude_code_tmp_base``)."""
         check_scoped_tools(allowed_tools)
         self.workspace = workspace
         self.executable = executable
@@ -262,6 +455,31 @@ class ClaudeCodeProvider:
         self._turn_context_tokens = turn_context_tokens
         self._turn_output_tokens = turn_output_tokens
         self.secrets_dir = secrets_dir
+        self.tmp_base = tmp_base
+        self._tmpdir: Path | None = None
+        self.sandbox_verified = False
+        """Set by a passing ``preflight``; cleared when a call reports a sandbox failure."""
+
+    @property
+    def tmpdir(self) -> Path:
+        """The CLI's ``TMPDIR``: a random ``scratch_tmpdir(tmp_base)``, picked on first use and kept, so ``build_env``
+        and ``build_argv`` agree. No I/O: ``complete`` creates it."""
+        if self._tmpdir is None:
+            self._tmpdir = scratch_tmpdir(self.tmp_base)
+        return self._tmpdir
+
+    def _prepare_tmpdir(self) -> None:
+        """Create ``tmpdir`` (0700) or re-check it before a call. If the path is unusable (another user's directory,
+        a symlink or a file: someone took the name after seeing it in ``ps``), switch once to a fresh random name
+        instead of blocking the run. A directory created here is removed when the provider is collected or the
+        process exits; nothing is read back from it."""
+        try:
+            created = ensure_private_dir(self.tmpdir)
+        except ProviderError:
+            self._tmpdir = None
+            created = ensure_private_dir(self.tmpdir)
+        if created:
+            weakref.finalize(self, shutil.rmtree, self.tmpdir, ignore_errors=True)
 
     def build_argv(self, request: CompletionRequest, api_key_helper: str | None = None) -> list[str]:
         """Pure argv construction (unit-tested). ``request.system`` goes via ``--append-system-prompt``;
@@ -286,7 +504,10 @@ class ClaudeCodeProvider:
             "--setting-sources", "",
             "--strict-mcp-config",
             "--tools", ",".join(builtin_tools(self.allowed_tools)),
-            "--settings", json.dumps(sandbox_settings(self.workspace, self._deny_read, api_key_helper), separators=(",", ":")),
+            "--settings", json.dumps(
+                sandbox_settings(self.workspace, self._deny_read, api_key_helper, tmpdir=self.tmpdir),
+                separators=(",", ":"),
+            ),
         ]  # fmt: skip
         if request.system:
             argv += ["--append-system-prompt", request.system]
@@ -307,14 +528,14 @@ class ClaudeCodeProvider:
         return "\n\n".join(f"## {labels[m.role]}\n\n{m.content}" for m in request.messages)
 
     def build_env(self) -> dict[str, str]:
-        """Subprocess environment from an allowlist (``ENV_ALLOWLIST``, ``LC_*``) plus workspace-local temp
-        dirs. No credentials: the API key reaches the CLI via ``apiKeyHelper``."""
+        """Subprocess environment from an allowlist (``ENV_ALLOWLIST``, ``LC_*``) plus ``TMPDIR`` (the short
+        ``self.tmpdir``) and a workspace-local ``MPLCONFIGDIR``. No credentials: the API key reaches the CLI via
+        ``apiKeyHelper``. Pure: ``complete`` creates and checks the directories."""
         env = {k: v for k, v in os.environ.items() if k in ENV_ALLOWLIST or k.startswith("LC_")}
         if self._path_prepend:
             env["PATH"] = os.pathsep.join([*(str(p) for p in self._path_prepend), env.get("PATH", "")])
-        scratch = self.workspace.resolve() / ".maf"
-        env["TMPDIR"] = str(scratch / "tmp")
-        env["MPLCONFIGDIR"] = str(scratch / "mpl")
+        env["TMPDIR"] = str(self.tmpdir)
+        env["MPLCONFIGDIR"] = str(self.workspace.resolve() / ".maf" / "mpl")
         env.update(self._extra_env)
         return env
 
@@ -322,21 +543,29 @@ class ClaudeCodeProvider:
         """Run the CLI in ``self.workspace`` and parse the JSON.
 
         - ``request.max_budget_usd`` must be set (``metered_call`` does it); else ``ValueError``.
-        - ``is_error`` or a non-zero exit raises ``ProviderError(cost_usd=total_cost_usd)``.
-          ``subtype == "error_max_budget_usd"`` is ``retryable=False``.
+        - ``is_error`` or a non-zero exit raises ``ProviderError(cost_usd=total_cost_usd, retryable=False)``;
+          ``subtype == "error_max_budget_usd"`` raises its subclass ``ClaudeCodeBudgetExhausted``.
         - ``cost_usd`` = ``total_cost_usd`` (authoritative; not re-priced from tokens).
         - ``text`` = ``result``; ``parsed`` = ``structured_output`` when a schema was given.
         - A timeout, a crash without a JSON result, or a runner failure charges ``worst_case_cost``
           (budget plus one turn), since the real spend is unknown.
+        - A sandbox start-up failure (``sandbox_failure`` on the result text, stderr and the strings in
+          ``structured_output``) raises ``SandboxUnavailable`` carrying ``total_cost_usd`` (the worst case when
+          there is no JSON result). It is checked first, so it never surfaces as a plain failure or as a
+          ``StructuredOutputError`` (which the fix pass tolerates).
+        - Before spawning: ``TMPDIR`` longer than ``max_tmpdir_bytes()`` raises ``ProviderError`` at cost 0, and so
+          does an unusable one (a symlink, another user's) when a fresh random name is unusable too.
         """
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise ProviderError("ANTHROPIC_API_KEY is not set (required for Claude Code API billing)", provider=PROVIDER)
-        env = self.build_env()
-        for directory in (self.workspace, Path(env["TMPDIR"]), Path(env["MPLCONFIGDIR"])):
-            directory.mkdir(parents=True, exist_ok=True)
-
+        check_tmpdir(self.tmpdir)
         unknown_spend = self.worst_case_cost(request)  # charged whenever the CLI's own cost report is missing
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self._prepare_tmpdir()  # may switch to a fresh name, so the env and argv are built after it
+        env = self.build_env()
+        Path(env["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+
         key_file = self._write_key_file(api_key)
         try:
             argv = self.build_argv(request, api_key_helper=f"cat {shlex.quote(str(key_file))}")
@@ -355,6 +584,7 @@ class ClaudeCodeProvider:
         try:
             out = self.parse_output(proc.stdout)
         except ProviderError as exc:
+            self._check_sandbox(unknown_spend, proc.stderr, proc.stdout)
             detail = _tail(proc.stderr) or str(exc)
             raise ProviderError(
                 f"Claude Code exited {proc.returncode} without a result: {detail}",
@@ -363,9 +593,11 @@ class ClaudeCodeProvider:
             ) from exc
 
         cost = max(0.0, out.total_cost_usd)
+        self._check_sandbox(cost, out.result, proc.stderr, *_strings(out.structured_output))
         if out.is_error or proc.returncode != 0 or out.subtype not in ("", "success"):
             detail = out.result or _tail(proc.stderr) or "no detail"
-            raise ProviderError(
+            error = ClaudeCodeBudgetExhausted if out.subtype == "error_max_budget_usd" else ProviderError
+            raise error(
                 f"Claude Code failed (exit {proc.returncode}, subtype={out.subtype or 'unknown'}): {_tail(detail)}",
                 provider=PROVIDER,
                 cost_usd=cost,
@@ -397,6 +629,90 @@ class ClaudeCodeProvider:
             session_id=out.session_id,
             raw=out.model_dump(mode="json"),
         )
+
+    def _check_sandbox(self, cost_usd: float, *texts: str) -> None:
+        """``SandboxUnavailable(cost_usd)`` when ``texts`` show a sandbox start-up failure."""
+        line = sandbox_failure(*texts)
+        if line is None:
+            return
+        self.sandbox_verified = False
+        raise SandboxUnavailable(
+            f"Claude Code's Bash sandbox is unavailable ({line}); stopping instead of paying for sessions whose "
+            f"commands all fail. Check bubblewrap and TMPDIR {self.tmpdir}",
+            provider=PROVIDER,
+            cost_usd=cost_usd,
+        )
+
+    def preflight(
+        self,
+        model: str,
+        budget_usd: float | None = None,
+        *,
+        call: Callable[[CompletionRequest], CompletionResult] | None = None,
+    ) -> CompletionResult:
+        """Prove sandboxed Bash works before a run pays for real work.
+
+        Writes ``PREFLIGHT_BYTES`` random bytes to ``<workspace>/PREFLIGHT_FILE`` and asks Claude Code (effort low,
+        ``budget_usd``, by default ``preflight_budget_usd(model)``) to run exactly ``PREFLIGHT_COMMAND``: copy the file
+        into ``$TMPDIR``, hash the copy, and ``tee`` the digest into ``<workspace>/PREFLIGHT_OUTPUT``. The digest must
+        match ``hashlib`` both in the answer (``PREFLIGHT_SCHEMA``) and in that file (checked by Python), so a sandbox
+        that starts but cannot write ``TMPDIR`` or the workspace fails too. A wrong or missing digest raises
+        ``SandboxUnavailable``; its ``cost_usd`` is the preflight's spend, already recorded by a metered ``call``.
+        Both files are always deleted.
+
+        ``call`` performs the request: stages pass a metered ``StageContext.call``; the default is
+        ``self.complete`` (unmetered). Running out of the preflight's own cap (``ClaudeCodeBudgetExhausted``) raises a
+        plain ``ProviderError`` that says so; other ``ProviderError``s (budget, missing key) propagate unchanged.
+        Sets ``sandbox_verified`` on success."""
+        self.sandbox_verified = False
+        budget = preflight_budget_usd(model) if budget_usd is None else budget_usd
+        probe, output = self.workspace / PREFLIGHT_FILE, self.workspace / PREFLIGHT_OUTPUT
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        for path in (probe, output):
+            path.unlink(missing_ok=True)  # sessions can write here: never use a symlink one left behind
+        data = os.urandom(PREFLIGHT_BYTES)
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        expected = hashlib.sha256(data).hexdigest()
+        try:
+            result = (call or self.complete)(preflight_request(model, budget))
+            written = written_digest(output)
+        except StructuredOutputError as exc:
+            raise SandboxUnavailable(
+                f"Claude Code sandbox preflight returned no digest: {exc}", provider=PROVIDER, cost_usd=exc.cost_usd
+            ) from exc
+        except ClaudeCodeBudgetExhausted as exc:
+            raise ProviderError(
+                f"Claude Code sandbox preflight ran out of its budget on {model} before answering; this is not a "
+                "sandbox failure: raise claude_code_preflight_budget_usd (unset, it scales with the model's price) "
+                f"or the run budget ({exc})",
+                provider=PROVIDER,
+                cost_usd=exc.cost_usd,
+            ) from exc
+        finally:
+            for path in (probe, output):
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
+        digest = reported_digest(result.parsed)
+        if digest != expected:
+            answer = " ".join(str((result.parsed or {}).get("digest", result.text)).split())[:300]
+            raise SandboxUnavailable(
+                f"Claude Code sandbox preflight failed: `{PREFLIGHT_COMMAND}` should print {expected}, "
+                f"the session reported {answer or 'nothing'!r}",
+                provider=PROVIDER,
+                cost_usd=result.cost_usd,
+            )
+        if written != expected:
+            raise SandboxUnavailable(
+                f"Claude Code sandbox preflight failed: the session reported the right digest but {PREFLIGHT_OUTPUT} "
+                "does not hold it, so sandboxed commands cannot write the workspace (or the command was not run as "
+                "given); check sandbox.filesystem.allowWrite",
+                provider=PROVIDER,
+                cost_usd=result.cost_usd,
+            )
+        self.sandbox_verified = True
+        return result
 
     def _write_key_file(self, api_key: str) -> Path:
         """A fresh 0600 file holding ``api_key`` in ``secrets_dir`` (0700), for the CLI's ``apiKeyHelper``."""
@@ -456,20 +772,46 @@ def _last_json_value(stdout: str) -> Any:
     return None
 
 
+def _strings(value: Any) -> list[str]:
+    """Every string inside a JSON value (structured output), depth first."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
 def _tail(text: str) -> str:
     text = text.strip()
     return text if len(text) <= STDERR_TAIL_CHARS else "..." + text[-STDERR_TAIL_CHARS:]
 
 
 __all__ = [
+    "CLI_CHILD_TMPDIR_MAX_BYTES",
     "DISALLOWED_TOOLS",
+    "PREFLIGHT_COMMAND",
+    "PREFLIGHT_FILE",
+    "PREFLIGHT_OUTPUT",
+    "SANDBOX_FAILURE_PATTERNS",
     "SENSITIVE_READ_PATHS",
     "check_scoped_tools",
+    "check_tmpdir",
+    "ClaudeCodeBudgetExhausted",
     "ClaudeCodeOutput",
     "ClaudeCodeProvider",
     "ClaudeCodeTimeout",
     "CompletedProcess",
+    "ensure_private_dir",
+    "max_tmpdir_bytes",
+    "preflight_budget_usd",
+    "preflight_request",
+    "reported_digest",
     "Runner",
+    "sandbox_failure",
     "sandbox_settings",
+    "scratch_tmpdir",
     "subprocess_runner",
+    "written_digest",
 ]

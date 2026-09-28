@@ -6,6 +6,9 @@ Division of labor: **agents write only the body** (the H2 sections). Python buil
 frontmatter (``from``/``to``/``model``/``cost_usd`` are facts Python knows, not model output).
 Validation therefore checks (a) frontmatter shape, (b) required H2 sections present, in
 order, non-empty, and (c) kind-specific line grammars (Issues, Responses, Adjudication, Verdict).
+The item grammars are lenient about layout only: blank lines between items and indented continuation
+lines (sub-bullets, wrapped text) are folded into the preceding item, whose text may start on them. But every
+top-level line must start a well-formed item, and so must an indented line that looks like one.
 
 Untrusted content (web pages, uploaded documents) appears in handoffs only as quoted data
 (``quote_untrusted``): the ingestion stage wraps every section of its note, grounding citations
@@ -16,6 +19,7 @@ are data, never instructions.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -75,12 +79,14 @@ NONE_MARKER = "None."
 
 COST_DECIMALS = 4
 
-# Line grammars (one item per line, bullets). IDs are ``<PREFIX>-<n>``: GPT, GEM, CLA.
-ISSUE_RE = re.compile(r"^- \[(?P<severity>critical|major|minor)\] (?P<id>(?:GPT|GEM|CLA)-\d+): (?P<text>.+)$")
+# Line grammars (one top-level bullet per item; see ``_grammar_items`` for continuation lines).
+# IDs are ``<PREFIX>-<n>``: GPT, GEM, CLA. ``text`` may be empty on a (stripped) bullet line whose item text
+# is on its continuation lines; ``_grammar_items`` requires it to be non-empty after folding.
+ISSUE_RE = re.compile(r"^- \[(?P<severity>critical|major|minor)\] (?P<id>(?:GPT|GEM|CLA)-\d+):(?P<text>(?: .*)?)$")
 """``## Issues`` in critique notes, e.g. ``- [critical] GPT-3: free() of a foreign block corrupts the bitmap``."""
-RESPONSE_RE = re.compile(r"^- (?P<id>(?:GPT|GEM|CLA)-\d+) \[(?P<stance>accept|reject|partial)\]: (?P<text>.+)$")
+RESPONSE_RE = re.compile(r"^- (?P<id>(?:GPT|GEM|CLA)-\d+) \[(?P<stance>accept|reject|partial)\]:(?P<text>(?: .*)?)$")
 """``## Responses`` in the rebuttal note (Claude, as author of the execution)."""
-RULING_RE = re.compile(r"^- (?P<id>(?:GPT|GEM|CLA)-\d+) \[(?P<ruling>fix|wontfix)\]: (?P<text>.+)$")
+RULING_RE = re.compile(r"^- (?P<id>(?:GPT|GEM|CLA)-\d+) \[(?P<ruling>fix|wontfix)\]:(?P<text>(?: .*)?)$")
 """``## Rulings`` in adjudication (ChatGPT) for every issue whose response was ``reject`` or ``partial``."""
 VERDICT_RE = re.compile(r"^(?P<verdict>PASS|LOOP)$")
 """``## Verdict`` first non-empty line in crosscheck. Computed by Python, not a model."""
@@ -347,10 +353,86 @@ _GRAMMARS: dict[tuple[HandoffKind, str], tuple[re.Pattern[str], str]] = {
 }
 _VERDICT_SECTION = (HandoffKind.CROSSCHECK, "Verdict")
 _DUP_RE = re.compile(r"^(?P<base>.+) \((?P<n>\d+)\)$")
+_CONTINUATION_RE = re.compile(r"^(?: {2,}|\t)")
+"""An indented line (2+ spaces or a tab): continuation of the preceding item, sub-bullets included."""
+_ID = r"(?:GPT|GEM|CLA)-\d+\b"
+_ITEM_LIKE: dict[tuple[HandoffKind, str], re.Pattern[str]] = {
+    (HandoffKind.CRITIQUE, "Issues"): re.compile(rf"^[-*+]\s+(?:\[[^\]]*\]\s*{_ID}|{_ID}\s*[:\[])", re.IGNORECASE),
+    (HandoffKind.REBUTTAL, "Responses"): re.compile(
+        rf"^[-*+]\s+{_ID}\s*(?:[:\[]|(?:accept|reject|partial)\b)", re.IGNORECASE
+    ),
+    (HandoffKind.ADJUDICATION, "Rulings"): re.compile(rf"^[-*+]\s+{_ID}\s*(?:[:\[]|(?:fix|wontfix)\b)", re.IGNORECASE),
+}
+"""A (stripped) bullet shaped like an item that does not match the grammar: a ``[tag]`` before an id, or an id
+followed by ``:``, ``[`` or a stance/ruling word (``- [high] GPT-2: ...``, ``- GEM-2 reject: ...``). Indented, it is
+an error rather than a continuation: folded, it would silently drop an issue or turn a rejection into the default."""
 
 
 def _clip(line: str, limit: int = 80) -> str:
     return line if len(line) <= limit else line[: limit - 3] + "..."
+
+
+@dataclass(frozen=True)
+class _Item:
+    """One grammar item: the match of its bullet line, and its text with continuation lines folded in."""
+
+    match: re.Match[str]
+    text: str
+
+
+def _grammar_items(kind: HandoffKind, name: str, text: str) -> tuple[list[_Item], list[str]]:
+    """Split a grammar section into items, returning ``(items, errors)``.
+
+    A line matching the item pattern (at any indentation, so a nested item is still its own item) starts
+    an item. Blank lines are skipped, and an indented line (``_CONTINUATION_RE``) is folded into the
+    preceding item's text, joined with single spaces; the item's text may start there (``- GPT-1 [accept]:``
+    followed by indented sub-bullets). Errors: any other top-level line, a top-level bullet that does not
+    match included; an indented line that looks like an item (``_ITEM_LIKE``) but does not match; an
+    indented first line; and an item whose text is still empty after folding. A malformed item must never
+    vanish into its neighbour. Indented lines after an erroneous line are not reported again.
+    """
+    pattern, shape = _GRAMMARS[(kind, name)]
+    item_like = _ITEM_LIKE[(kind, name)]
+    items: list[tuple[int, re.Match[str], list[str]]] = []
+    errors: list[str] = []
+    ids: set[str] = set()
+    current: list[str] | None = None  # continuation lines of the item being read; None after an error line
+    for lineno, line in enumerate(text.split("\n"), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = pattern.match(stripped)
+        if match:
+            if match["id"] in ids:
+                errors.append(f"'## {name}' line {lineno}: duplicate id {match['id']}")
+            ids.add(match["id"])
+            items.append((lineno, match, []))
+            current = items[-1][2]
+            continue
+        indented = _CONTINUATION_RE.match(line) is not None
+        if indented and not item_like.match(stripped):
+            if current is not None:
+                current.append(stripped)
+            elif not items and not errors:
+                errors.append(f"'## {name}' line {lineno}: {_clip(line)!r} is indented, but the section must start "
+                              f"with an item `{shape}`")
+            continue
+        if indented:
+            hint = " (an indented line that starts like an item must be a well-formed item; reword a mere note)"
+        elif stripped.startswith(("- ", "* ", "+ ")):
+            hint = ""
+        else:
+            hint = " (continuation lines must be indented by two spaces)"
+        errors.append(f"'## {name}' line {lineno}: {_clip(line)!r} does not match `{shape}`{hint}")
+        current = None
+    folded = []
+    for lineno, match, extra in items:
+        item_text = " ".join(part for part in (match["text"].strip(), *extra) if part)
+        if not item_text:
+            errors.append(f"'## {name}' line {lineno}: item {match['id']} has no text after the colon or on "
+                          "indented lines below it")
+        folded.append(_Item(match, item_text))
+    return folded, errors
 
 
 def _grammar_errors(kind: HandoffKind, name: str, text: str) -> list[str]:
@@ -359,22 +441,9 @@ def _grammar_errors(kind: HandoffKind, name: str, text: str) -> list[str]:
         if not VERDICT_RE.match(first):
             return [f"'## Verdict' must start with a line that is exactly PASS or LOOP, got {first!r}"]
         return []
-    grammar = _GRAMMARS.get((kind, name))
-    if grammar is None or text == NONE_MARKER:
+    if (kind, name) not in _GRAMMARS or text == NONE_MARKER:
         return []
-    pattern, shape = grammar
-    errors: list[str] = []
-    ids: set[str] = set()
-    for lineno, line in enumerate(text.split("\n"), start=1):
-        match = pattern.match(line)
-        if not match:
-            what = "blank line" if not line.strip() else repr(_clip(line))
-            errors.append(f"'## {name}' line {lineno}: {what} does not match `{shape}`")
-            continue
-        if match["id"] in ids:
-            errors.append(f"'## {name}' line {lineno}: duplicate id {match['id']}")
-        ids.add(match["id"])
-    return errors
+    return _grammar_items(kind, name, text)[1]
 
 
 def validate_body(body: str, kind: HandoffKind) -> list[str]:
@@ -384,7 +453,9 @@ def validate_body(body: str, kind: HandoffKind) -> list[str]:
     (or exactly ``None.`` when allowed by ``EMPTY_OK``); kind grammars:
     CRITIQUE ``## Issues`` lines match ``ISSUE_RE``; REBUTTAL ``## Responses`` match ``RESPONSE_RE``;
     ADJUDICATION ``## Rulings`` match ``RULING_RE``; CROSSCHECK ``## Verdict`` matches ``VERDICT_RE``.
-    Non-bullet lines (blank or prose) inside grammar sections are errors, so the grammar is strict.
+    In the item grammars, blank lines and indented continuation lines belong to the preceding item;
+    any other top-level line that is not a well-formed item is an error, and so is an indented line that
+    looks like a malformed item (see ``_grammar_items``).
     ``None.`` is accepted only in the sections listed in ``EMPTY_OK``.
     """
     _, _, sections = split_sections(body)
@@ -573,12 +644,15 @@ def format_spec(kind: HandoffKind) -> str:
         example = _GRAMMAR_EXAMPLES[kind][1]
         lines += [
             "",
-            f"### `## {name}` line grammar (strict)",
+            f"### `## {name}` line grammar",
             "",
-            f"Every line of `## {name}` must be a single bullet of the form `{shape}`, or the section must be "
-            f"exactly `{NONE_MARKER}`. No blank lines, prose, sub-bullets or wrapped lines inside it; each id "
-            "appears at most once. IDs are the critic's prefix (`GPT` for ChatGPT, `GEM` for Gemini, `CLA` for "
-            "Claude) plus a number.",
+            f"Every item of `## {name}` starts with a top-level bullet of the form `{shape}`, or the section must "
+            f"be exactly `{NONE_MARKER}`. Keep each item on its one bullet line where you can; extra detail may "
+            "follow on continuation lines indented by two spaces (indented sub-bullets are fine) and is folded into "
+            "that item. Every line that is not indented must start a new item: no prose, headings or other bullets "
+            "at the top level. An indented bullet that starts with an id or a `[...]` tag must be a well-formed item "
+            "itself. Each id appears at most once. IDs are the critic's prefix (`GPT` for ChatGPT, `GEM` "
+            "for Gemini, `CLA` for Claude) plus a number.",
             "",
             f"Example: `{example}`",
         ]
@@ -611,38 +685,40 @@ def repair_prompt(kind: HandoffKind, bad_body: str, errors: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Line-grammar parsers
 
-def _parse_lines(section_text: str, kind: HandoffKind, name: str) -> list[re.Match[str]]:
+def _parse_items(section_text: str, kind: HandoffKind, name: str) -> list[_Item]:
     text = section_text.strip()
     if text == NONE_MARKER or not text:
         return []
-    errors = _grammar_errors(kind, name, text)
+    items, errors = _grammar_items(kind, name, text)
     if errors:
         raise HandoffInvalid(kind, errors)
-    pattern = _GRAMMARS[(kind, name)][0]
-    return [m for m in (pattern.match(line) for line in text.split("\n")) if m is not None]
+    return items
 
 
 def parse_issues(section_text: str, raised_by: AgentName) -> list[Issue]:
-    """Parse ``## Issues`` (``None.`` means no issues). Raises ``HandoffInvalid`` on bad lines."""
+    """Parse ``## Issues`` (``None.`` means no issues). Continuation lines are folded into ``text``.
+    Raises ``HandoffInvalid`` on bad lines."""
     return [
-        Issue(id=m["id"], severity=m["severity"], text=m["text"].strip(), raised_by=raised_by)  # type: ignore[arg-type]
-        for m in _parse_lines(section_text, HandoffKind.CRITIQUE, "Issues")
+        Issue(id=i.match["id"], severity=i.match["severity"], text=i.text, raised_by=raised_by)  # type: ignore[arg-type]
+        for i in _parse_items(section_text, HandoffKind.CRITIQUE, "Issues")
     ]
 
 
 def parse_responses(section_text: str) -> list[Response]:
-    """Parse ``## Responses`` of a rebuttal (``None.`` means none). Raises ``HandoffInvalid`` on bad lines."""
+    """Parse ``## Responses`` of a rebuttal (``None.`` means none). Continuation lines are folded into ``text``.
+    Raises ``HandoffInvalid`` on bad lines."""
     return [
-        Response(id=m["id"], stance=m["stance"], text=m["text"].strip())  # type: ignore[arg-type]
-        for m in _parse_lines(section_text, HandoffKind.REBUTTAL, "Responses")
+        Response(id=i.match["id"], stance=i.match["stance"], text=i.text)  # type: ignore[arg-type]
+        for i in _parse_items(section_text, HandoffKind.REBUTTAL, "Responses")
     ]
 
 
 def parse_rulings(section_text: str) -> list[Ruling]:
-    """Parse ``## Rulings`` of an adjudication (``None.`` means none). Raises ``HandoffInvalid`` on bad lines."""
+    """Parse ``## Rulings`` of an adjudication (``None.`` means none). Continuation lines are folded into ``text``.
+    Raises ``HandoffInvalid`` on bad lines."""
     return [
-        Ruling(id=m["id"], ruling=m["ruling"], text=m["text"].strip())  # type: ignore[arg-type]
-        for m in _parse_lines(section_text, HandoffKind.ADJUDICATION, "Rulings")
+        Ruling(id=i.match["id"], ruling=i.match["ruling"], text=i.text)  # type: ignore[arg-type]
+        for i in _parse_items(section_text, HandoffKind.ADJUDICATION, "Rulings")
     ]
 
 

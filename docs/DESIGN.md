@@ -90,6 +90,16 @@ the web is kept as quoted data inside handoffs, never as instructions.
 
 - Claude Code runs with its cwd set to `workspaces/<run_id>/`, with an allowed
   list of tools (edit, build, test, QEMU) and no writes outside the workspace.
+  The one exception is a private 0700 `TMPDIR` (`/tmp/maf-<random>`). It lives
+  outside the workspace because the sandbox creates Unix sockets under
+  `TMPDIR`, and long workspace paths overflow the 108-byte socket path limit.
+  That overflow was the incident of 2026-09-28.
+- Before the first code-mode Claude Code call, every run does a **sandbox
+  preflight**: a nonce-hash check that proves sandboxed Bash can run and can
+  write to `TMPDIR`. If the sandbox fails, the run stops immediately as
+  `failed`.
+- If a run reaches the cross-check loop cap with unresolved critical issues, it
+  ends as `completed_with_issues` (CLI exit code 2), never as `completed`.
 - Toolchain: gcc, arm-none-eabi-gcc and newlib, qemu-system-arm, pandoc, a
   FreeRTOS kernel clone in the workspace, and numpy/scipy/matplotlib in the
   project venv.

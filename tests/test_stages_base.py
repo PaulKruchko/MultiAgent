@@ -6,18 +6,20 @@ import: a real ``Vault`` in a temp dir, a real in-memory ``Ledger``, and the con
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from conftest import FakeProviders
+from conftest import FakeProvider, FakeProviders
 from maf import handoff as hf
 from maf.config import Settings
 from maf.handoff import Handoff, HandoffInvalid, HandoffKind, HandoffMeta
 from maf.ledger import BudgetExceeded, Ledger
-from maf.providers import Attachment, CompletionRequest, ProviderError
+from maf.providers import Attachment, CompletionRequest, CompletionResult, ProviderError
+from maf.providers.claude_code import PREFLIGHT_FILE, PREFLIGHT_OUTPUT, ClaudeCodeProvider
 from maf.stages import base
 from maf.stages.base import (
     StageContext,
@@ -123,6 +125,36 @@ def stage_env(settings: Settings, fake_providers: FakeProviders, fixed_now: date
 
 def prompt_of(request: CompletionRequest) -> str:
     return request.messages[-1].content
+
+
+@dataclass
+class SandboxedFake(FakeProvider):
+    """A ``claude_code`` fake carrying the real ``ClaudeCodeProvider.preflight`` (random probe file in ``workspace``,
+    metered ``call``, digest checks, ``sandbox_verified``), so ``ensure_sandbox`` runs against it. The preflight
+    request (``schema_name="preflight"``) is answered like any other reply and costs ``preflight_cost``;
+    ``probe_digest()`` is what a working sandbox's ``sha256sum`` would report. With ``sandbox_writes`` the call also
+    leaves the digest in ``PREFLIGHT_OUTPUT``, as the preflight command's ``tee`` does in a working sandbox."""
+
+    workspace: Path = field(default_factory=Path)
+    sandbox_verified: bool = False
+    sandbox_writes: bool = True
+    preflight_cost: float = 0.04
+    preflight = ClaudeCodeProvider.preflight
+
+    def complete(self, request: CompletionRequest) -> CompletionResult:
+        if request.schema_name == "preflight" and self.sandbox_writes:
+            (self.workspace / PREFLIGHT_OUTPUT).write_text(f"{self.probe_digest()}  maf-preflight\n")
+        result = super().complete(request)
+        if request.schema_name != "preflight":
+            return result
+        return result.model_copy(update={"cost_usd": self.preflight_cost})
+
+    def probe_digest(self) -> str:
+        return hashlib.sha256((self.workspace / PREFLIGHT_FILE).read_bytes()).hexdigest()
+
+    @property
+    def preflights(self) -> int:
+        return sum(1 for request in self.calls if request.schema_name == "preflight")
 
 
 # ---------------------------------------------------------------------- StageContext

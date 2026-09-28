@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from maf.handoff import HandoffInvalid, HandoffKind, HandoffMeta, build_handoff
+from maf.handoff import HandoffInvalid, HandoffKind, HandoffMeta, build_handoff, dump_frontmatter
 from maf.types import RunStatus
 from maf.vault import (
     RunIndex,
@@ -16,6 +16,7 @@ from maf.vault import (
     atomic_copy,
     atomic_write_text,
     embed,
+    latest_crosscheck,
     note_name,
     render_run_body,
     slugify,
@@ -259,7 +260,7 @@ def test_index_round_trip_with_all_fields(vault: Vault) -> None:
     vault.create_run(index, [])
     assert vault.read_index(RUN_ID) == index
     index.updated = index.updated + timedelta(minutes=5)
-    index.status = RunStatus.COMPLETED
+    index.status = RunStatus.COMPLETED_WITH_ISSUES  # unresolved_critical=1: plain completed would be normalized
     vault.write_index(index)
     assert vault.read_index(RUN_ID) == index
 
@@ -427,6 +428,64 @@ def test_render_run_body(vault: Vault) -> None:
     assert f"## Workspace\n\n`{vault.workspaces_root / RUN_ID}`" in body
     assert "- `inputs/spec.pdf`" in body
 
+
+def test_render_run_body_completed_with_issues_callout(vault: Vault) -> None:
+    index = make_index(
+        vault,
+        status=RunStatus.COMPLETED_WITH_ISSUES,
+        stage="final",
+        round=3,
+        unresolved_critical=20,
+        handoffs=["03-execution", "04-crosscheck", "03-execution-r2", "04-crosscheck-r2", "04a-critique-gemini-r3",
+                  "04-crosscheck-r3", "05-final"],
+    )
+    body = render_run_body(index)
+    status = body.split("## Status\n\n", 1)[1]
+    callout, rest = status.split("\n\n", 1)
+    assert callout.splitlines()[0] == "> [!warning] Completed with 20 unresolved critical issue(s)"
+    assert "[[04-crosscheck-r3]]" in callout and "[[05-final]]" in callout
+    assert all(line.startswith("> ") for line in callout.splitlines())
+    assert rest.startswith("- Status: **completed_with_issues**\n")
+    assert "- Unresolved critical issues: 20" in rest
+
+
+@pytest.mark.parametrize("status", [s for s in RunStatus if s != RunStatus.COMPLETED_WITH_ISSUES])
+def test_render_run_body_no_callout_for_other_statuses(vault: Vault, status: RunStatus) -> None:
+    unresolved = 0 if status == RunStatus.COMPLETED else 2  # completed with open criticals reads as with_issues
+    body = render_run_body(make_index(vault, status=status, unresolved_critical=unresolved, handoffs=["04-crosscheck"]))
+    assert "[!warning]" not in body
+    assert body.split("## Status\n\n", 1)[1].startswith("- Status: ")
+
+
+def test_latest_crosscheck(vault: Vault) -> None:
+    assert latest_crosscheck(make_index(vault)) is None
+    names = ["04-crosscheck", "04a-critique-chatgpt-r2", "04-crosscheck-r2", "05-final"]
+    assert latest_crosscheck(make_index(vault, handoffs=names)) == "04-crosscheck-r2"
+    assert latest_crosscheck(make_index(vault, handoffs=["04-crosscheck", "04-crosscheck-extra"])) == "04-crosscheck"
+
+
+def test_run_md_frontmatter_round_trips_completed_with_issues(vault: Vault) -> None:
+    index = make_index(vault, status=RunStatus.COMPLETED_WITH_ISSUES, unresolved_critical=9)
+    vault.create_run(index, [])
+    text = vault.paths(RUN_ID).run_md.read_text()
+    assert "\nstatus: completed_with_issues\n" in text
+    assert vault.read_index(RUN_ID).status == RunStatus.COMPLETED_WITH_ISSUES
+
+
+
+def test_legacy_completed_run_with_open_criticals_reads_as_completed_with_issues(vault: Vault) -> None:
+    """The 2026-09-28 demo runs finished before completed_with_issues existed: their run.md says ``completed`` with
+    open criticals. Reading normalizes it, so every reader (list, status, MCP, resume --extra-round) sees the truth."""
+    vault.create_run(make_index(vault, status=RunStatus.COMPLETED, stage="final", round=3), [])
+    run_md = vault.paths(RUN_ID).run_md
+    data = make_index(vault, stage="final", round=3).model_dump(mode="json") | {
+        "status": "completed", "unresolved_critical": 9
+    }
+    run_md.write_text(dump_frontmatter(data) + "\n# legacy\n", encoding="utf-8")
+    assert vault.read_index(RUN_ID).status == RunStatus.COMPLETED_WITH_ISSUES
+    assert [r.status for r in vault.list_runs()] == [RunStatus.COMPLETED_WITH_ISSUES]
+    assert "\nstatus: completed\n" in run_md.read_text(encoding="utf-8")  # reading never rewrites run.md
+    assert make_index(vault, status=RunStatus.COMPLETED, unresolved_critical=0).status == RunStatus.COMPLETED
 
 def test_render_run_body_empty_run(vault: Vault) -> None:
     body = render_run_body(make_index(vault, workspace="/tmp/odd`path"))

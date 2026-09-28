@@ -2,11 +2,14 @@
 
 The script answers by request content (which handoff kind the prompt asks for), so the tests exercise the
 whole flow: ingestion -> strategy -> execution -> crosscheck (LOOP) -> execution r2 -> crosscheck r2 (PASS)
--> final. No network, no subprocess, zero cost.
+-> final. Variants cover the loop cap (``completed_with_issues``), non-retryable provider errors (fail fast) and
+the Claude Code sandbox preflight (``SandboxedFake``: the real ``ClaudeCodeProvider.preflight`` over a fake transport).
+No network, no subprocess, zero cost.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -14,12 +17,16 @@ from pathlib import Path
 import frontmatter
 import pytest
 from conftest import FakeProviders
+from test_stages_base import SandboxedFake
 
+from maf import cli
 from maf.config import Settings
 from maf.handoff import HandoffKind, validate_handoff
 from maf.ledger import Ledger
-from maf.pipeline import Pipeline
-from maf.providers import CompletionRequest
+from maf.pipeline import Pipeline, ProvidersFactory
+from maf.providers import CompletionRequest, ProviderError, Providers
+from maf.providers.claude_code import PREFLIGHT_FILE
+from maf.stages.final import ISSUES_TAG
 from maf.types import RunStatus
 
 BRIEF = "Design a portable O(1) small-memory allocator."
@@ -35,8 +42,26 @@ TRIAGE = {
 CLEAN_CRITIQUE = "## Summary\n\nNo problems found.\n\n## Issues\n\nNone.\n"
 
 
+SANDBOX_ERROR = "Sandbox is required but failed to initialize: Failed to create bridge sockets after 5 attempts"
+THESIS_REBUTTAL = (
+    "## Summary\n\nAnswered.\n\n## Responses\n\n"
+    "- GPT-1 [accept]: will fix the stress test\n"
+    "  - Ref 20 gets ISBN 978-0-12-409210-6\n"
+    "  - Ref 21 gets DOI 10.1088/0029-5515/39/12/301\n"
+    "\n"
+    "- GEM-1 [reject]: name is standard\n"
+)
+
+
 class Crash(BaseException):
     """Stands in for the process dying mid-stage (not caught by the pipeline's ``except Exception``)."""
+
+
+class SandboxDown(ProviderError):
+    """Stands in for ``maf.providers.base.SandboxUnavailable``: an infrastructure failure, never retryable."""
+
+    def __init__(self, message: str = SANDBOX_ERROR, *, cost_usd: float = 0.0) -> None:
+        super().__init__(message, provider="claude_code", cost_usd=cost_usd, retryable=False)
 
 
 def _kind_of(request: CompletionRequest) -> str:
@@ -59,12 +84,19 @@ class Script:
 
     Round 1: ChatGPT raises a critical issue the fixer cannot fix (LOOP); round 2: every critic is clean (PASS).
     ``broken`` maps a kind to how many leading replies for it are invalid bodies. ``crash_at`` names a
-    ``(kind, n)`` whose n-th request raises ``Crash``.
+    ``(kind, n)`` whose n-th request raises ``Crash``. ``errors`` maps a kind to an exception its next request
+    raises (once). ``stubborn`` keeps the critical issue coming every round (the loop cap is reached);
+    ``rebuttal`` replaces the default rebuttal body. ``sandbox_down`` makes the sandbox preflight report the CLI's
+    sandbox error instead of the probe file's digest.
     """
 
     bodies: dict[str, str]
     broken: dict[str, int] = field(default_factory=dict)
     crash_at: tuple[str, int] | None = None
+    errors: dict[str, BaseException] = field(default_factory=dict)
+    stubborn: bool = False
+    sandbox_down: bool = False
+    rebuttal: str = "## Summary\n\nAnswered.\n\n## Responses\n\n- GPT-1 [accept]: will fix\n- GEM-1 [reject]: name is standard\n"
     workspace: Path | None = None
     requests: list[tuple[str, str, bool]] = field(default_factory=list)  # (agent role, kind, is_repair)
     executions: int = 0
@@ -83,6 +115,8 @@ class Script:
         self.requests.append((role, kind, _is_repair(request)))
         if self.crash_at == (kind, self.count(kind)):
             raise Crash(f"simulated crash during {kind} #{self.count(kind)}")
+        if kind in self.errors:
+            raise self.errors.pop(kind)
         if self.broken.get(kind, 0) >= self.count(kind):
             return BROKEN_BODY
         return self.answer(role, kind)
@@ -90,18 +124,23 @@ class Script:
     def answer(self, role: str, kind: str) -> str | dict[str, object]:
         if kind == "triage":
             return TRIAGE
+        if kind == "preflight":
+            assert self.workspace is not None
+            probe = (self.workspace / PREFLIGHT_FILE).read_bytes()
+            return {"digest": SANDBOX_ERROR if self.sandbox_down else hashlib.sha256(probe).hexdigest()}
         if kind == "execution":
             self.executions += 1
             self.build()
             return self.bodies["execution"]
         if kind == "critique":
-            if self.executions == 1 and role == "chatgpt":
+            first = self.executions == 1 or self.stubborn
+            if first and role == "chatgpt":
                 return "## Summary\n\nOne blocker.\n\n## Issues\n\n- [critical] GPT-1: stress test double-frees\n"
-            if self.executions == 1 and role == "gemini":
+            if first and role == "gemini":
                 return "## Summary\n\nStyle only.\n\n## Issues\n\n- [minor] GEM-1: rename tlsf_map\n"
             return CLEAN_CRITIQUE
         if kind == "rebuttal":
-            return "## Summary\n\nAnswered.\n\n## Responses\n\n- GPT-1 [accept]: will fix\n- GEM-1 [reject]: name is standard\n"
+            return self.rebuttal
         if kind == "adjudication":
             return "## Summary\n\nRuled.\n\n## Rulings\n\n- GEM-1 [wontfix]: the name follows the paper\n"
         if kind == "fix_report":
@@ -117,13 +156,32 @@ class Script:
         (self.workspace / "test" / "posix_test.log").write_text("42 passed\n", encoding="utf-8")
 
 
-def _pipeline(settings: Settings, fakes: FakeProviders) -> Pipeline:
+def _pipeline(settings: Settings, fakes: FakeProviders, factory: ProvidersFactory | None = None) -> Pipeline:
     ticks = iter(range(100_000))
     return Pipeline(
         settings,
-        providers_factory=fakes.factory(),
+        providers_factory=factory or fakes.factory(),
         clock=lambda: datetime(2026, 9, 28, 12, 0) + timedelta(seconds=next(ticks)),
     )
+
+
+def _sandboxed_pipeline(settings: Settings, fakes: FakeProviders, script: Script) -> tuple[Pipeline, SandboxedFake]:
+    """A pipeline whose claude_code fake runs the real sandbox preflight. Like ``build_providers``, the factory binds
+    Claude Code to the run's workspace and hands every ``_advance`` (one process's pass) an unverified sandbox."""
+    code = SandboxedFake(name="claude_code", agent="claude", cost_per_call=0.50, worst_case_usd=2.0)
+    fakes.claude_code = code
+    script.install(fakes)
+
+    def factory(_settings: Settings, workspace: Path) -> Providers:
+        code.workspace = script.workspace = workspace
+        code.sandbox_verified = False
+        return fakes.as_providers()
+
+    return _pipeline(settings, fakes, factory), code
+
+
+def _code_kinds(script: Script) -> list[str]:
+    return [kind for role, kind, _ in script.requests if role == "claude_code"]
 
 
 def _start(settings: Settings, fakes: FakeProviders, script: Script, **create_kw: object) -> tuple[Pipeline, str]:
@@ -343,3 +401,302 @@ def test_second_invalid_body_stops_the_run(
     assert resumed.status == RunStatus.COMPLETED, resumed.error
     assert script.count("triage") == 1
     assert resumed.handoffs == EXPECTED_HANDOFFS
+
+
+# --------------------------------------------------------------------------- loop cap and fail-fast infra errors
+
+
+def test_loop_cap_ends_completed_with_issues(
+    settings: Settings, fake_providers: FakeProviders, sample_bodies: dict[str, str]
+) -> None:
+    """GPT-1 stays unfixed in every round: final still runs, but the run says completed_with_issues everywhere.
+    The rebuttal uses indented sub-bullets (the thesis-run shape) and needs no repair."""
+    script = Script(sample_bodies, stubborn=True, rebuttal=THESIS_REBUTTAL)
+    pipeline, run_id = _start(settings, fake_providers, script)
+
+    index = pipeline.run(run_id)
+
+    assert index.status == RunStatus.COMPLETED_WITH_ISSUES, index.error
+    assert (index.stage, index.round, index.unresolved_critical, index.error) == ("final", 3, 1, None)
+    assert script.count("execution") == 3 and script.count("final") == 1
+    assert not any(repair for _, _, repair in script.requests)  # sub-bullets under responses parse as-is
+    vault = pipeline.vault
+    for name in index.handoffs:
+        assert validate_handoff(vault.read_handoff(run_id, name)) == [], name
+
+    last = vault.read_handoff(run_id, "04-crosscheck-r3")
+    assert last.section("Verdict") == "LOOP" and last.meta.to == "final"
+    assert "Loop cap reached" in last.section("Summary")
+    assert "GPT-1: stress test double-frees" in last.section("Unresolved Critical")
+
+    final = vault.read_handoff(run_id, "05-final")
+    assert final.section("Summary").startswith("> [!warning] Run status: completed_with_issues")
+    assert "[[04-crosscheck-r3]]" in final.section("Summary")
+    assert "- [critical] GPT-1: stress test double-frees" in final.section("Limitations")
+    assert ISSUES_TAG in final.meta.tags
+    final_prompt = next(r for r in fake_providers.claude.calls if "## Output format: final handoff" in r.messages[-1].content)
+    assert "ends with status `completed_with_issues`" in final_prompt.messages[-1].content
+
+    post = frontmatter.load(vault.paths(run_id).run_md)
+    assert (post["status"], post["unresolved_critical"]) == ("completed_with_issues", 1)
+    status_block = post.content.split("## Status\n\n", 1)[1]
+    assert status_block.startswith("> [!warning] Completed with 1 unresolved critical issue(s)")
+    assert "[[04-crosscheck-r3]]" in status_block.split("\n\n", 1)[0]
+    ledger = _assert_ledger_mirrored(pipeline, run_id)
+    assert len(ledger.entries) == _total_calls(fake_providers)
+
+
+def test_resume_cli_on_loop_capped_run_exits_2_and_refuses_without_extra_round(
+    settings: Settings,
+    fake_providers: FakeProviders,
+    sample_bodies: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = Script(sample_bodies, stubborn=True)
+    pipeline, run_id = _start(settings, fake_providers, script)
+    monkeypatch.setattr(cli, "make_pipeline", lambda _settings: pipeline)
+    argv = ["--vault", str(settings.vault_path), "--workspaces", str(settings.workspaces_path), "resume", run_id]
+
+    assert cli.main(argv) == 2  # runs the pending run to the loop cap
+    captured = capsys.readouterr()
+    assert captured.out.strip().splitlines()[-1] == str(pipeline.vault.paths(run_id).note("05-final"))
+    last = captured.err.strip().splitlines()[-1]
+    assert last.startswith("completed with issues: 1 unresolved critical issue(s)")
+    assert str(pipeline.vault.paths(run_id).note("04-crosscheck-r3")) in last
+
+    calls = _total_calls(fake_providers)
+    assert cli.main(argv) == 2  # terminal: refused, nothing spent
+    assert "nothing to resume" in capsys.readouterr().err
+    assert _total_calls(fake_providers) == calls
+
+    script.stubborn = False  # the extra pass comes back clean
+    assert cli.main([*argv, "--extra-round"]) == 0
+    index = pipeline.status(run_id)
+    assert (index.status, index.round, index.unresolved_critical) == (RunStatus.COMPLETED, 4, 0)
+    assert index.handoffs[-2:] == ["04-crosscheck-r4", "05-final"]
+    r4_prompt = fake_providers.claude_code.calls[-1].messages[-1].content
+    assert "GPT-1" in r4_prompt  # the extra execution pass saw the round-3 unresolved issue
+    assert "[!warning]" not in pipeline.vault.read_handoff(run_id, "05-final").section("Summary")
+
+
+def test_non_retryable_provider_error_in_execution_fails_fast(
+    settings: Settings,
+    fake_providers: FakeProviders,
+    sample_bodies: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A broken Claude Code sandbox in execution round 1 ends the run as FAILED at once: no critiques, no
+    loop-back, the error in run.md and on the CLI, and the partial spend recorded."""
+    script = Script(sample_bodies, errors={"execution": SandboxDown(cost_usd=0.37)})
+    pipeline, run_id = _start(settings, fake_providers, script)
+    monkeypatch.setattr(cli, "make_pipeline", lambda _settings: pipeline)
+    argv = ["--vault", str(settings.vault_path), "--workspaces", str(settings.workspaces_path), "resume", run_id]
+
+    assert cli.main(argv) == cli.EXIT_FAILED == 1
+
+    index = pipeline.status(run_id)
+    assert index.status == RunStatus.FAILED
+    assert (index.stage, index.round) == ("execution", 1)
+    assert index.error == f"execution: SandboxDown: {SANDBOX_ERROR}"
+    assert len(fake_providers.claude_code.calls) == 1  # never retried
+    assert script.count("critique") == 0 and script.count("fix_report") == 0
+    assert index.handoffs == ["01a-routing", "01-ingestion", "02-strategy"]
+    assert "crosscheck" not in index.completed_stages
+    # Spend: the failed call's partial cost is in the ledger and mirrored into run.md.
+    ledger = _assert_ledger_mirrored(pipeline, run_id)
+    failed_entry = ledger.entries[-1]
+    assert (failed_entry.provider, failed_entry.cost_usd) == ("claude_code", pytest.approx(0.37))
+    assert failed_entry.error == f"SandboxDown: {SANDBOX_ERROR}"
+    assert index.spend_by_provider["claude_code"] == pytest.approx(0.37)
+    post = frontmatter.load(pipeline.vault.paths(run_id).run_md)
+    assert post["status"] == "failed" and post["error"] == index.error
+    assert f"- Error: execution: SandboxDown: {SANDBOX_ERROR}" in post.content
+    last = capsys.readouterr().err.strip().splitlines()[-1]
+    assert last == f"failed: execution: SandboxDown: {SANDBOX_ERROR} (spent ${index.spent_usd:.4f} of $25.00)"
+
+    # Once the environment is fixed, resume continues from execution round 1 without repeating earlier stages.
+    assert cli.main(argv) == 0
+    resumed = pipeline.status(run_id)
+    assert resumed.status == RunStatus.COMPLETED, resumed.error
+    assert resumed.handoffs == EXPECTED_HANDOFFS
+    assert script.count("triage") == 1 and script.count("strategy") == 1
+    assert _assert_ledger_mirrored(pipeline, run_id).spent_usd > index.spent_usd
+
+
+def test_non_retryable_provider_error_in_fix_pass_never_loops_back(
+    settings: Settings, fake_providers: FakeProviders, sample_bodies: dict[str, str]
+) -> None:
+    script = Script(sample_bodies, errors={"fix_report": SandboxDown(cost_usd=0.05)})
+    pipeline, run_id = _start(settings, fake_providers, script)
+
+    index = pipeline.run(run_id)
+
+    assert index.status == RunStatus.FAILED
+    assert (index.stage, index.round) == ("crosscheck", 1)
+    assert index.error == f"crosscheck: SandboxDown: {SANDBOX_ERROR}"
+    assert script.count("execution") == 1 and script.count("fix_report") == 1
+    assert "03-execution-r2" not in index.handoffs and "04-crosscheck" not in index.handoffs
+    assert index.unresolved_critical == 0
+    ledger = _assert_ledger_mirrored(pipeline, run_id)
+    assert len(ledger.entries) == _total_calls(fake_providers)  # the critiques and the failed fix pass were billed
+    assert ledger.entries[-1].error == f"SandboxDown: {SANDBOX_ERROR}"
+
+
+# --------------------------------------------------------------------------- Claude Code sandbox preflight
+
+
+def test_code_run_preflights_the_sandbox_exactly_once(
+    settings: Settings, fake_providers: FakeProviders, sample_bodies: dict[str, str]
+) -> None:
+    """Happy path with one loop: one preflight before the first Claude Code session; the fix pass and execution
+    round 2 reuse the verified sandbox. The preflight is metered (execution/preflight) but belongs to no note."""
+    script = Script(sample_bodies)
+    pipeline, code = _sandboxed_pipeline(settings, fake_providers, script)
+    run_id = pipeline.create(BRIEF).run_id
+
+    index = pipeline.run(run_id)
+
+    assert index.status == RunStatus.COMPLETED, index.error
+    assert index.handoffs == EXPECTED_HANDOFFS
+    assert _code_kinds(script) == ["preflight", "execution", "fix_report", "execution"]
+    assert code.preflights == 1 and code.sandbox_verified is True
+    assert not (pipeline.vault.paths(run_id).workspace / PREFLIGHT_FILE).exists()
+    ledger = _assert_ledger_mirrored(pipeline, run_id)
+    assert len(ledger.entries) == _total_calls(fake_providers)
+    assert [(e.stage, e.purpose, e.cost_usd) for e in ledger.entries if e.provider == "claude_code"] == [
+        ("execution", "preflight", 0.04),
+        ("execution", "execution", 0.50),
+        ("crosscheck", "fixes", 0.50),
+        ("execution", "execution", 0.50),
+    ]
+    note_costs = sum(pipeline.vault.read_handoff(run_id, name).meta.cost_usd for name in index.handoffs)
+    assert note_costs == pytest.approx(ledger.spent_usd - 0.04)
+
+
+def test_failed_sandbox_preflight_fails_the_run_at_execution_round_1(
+    settings: Settings,
+    fake_providers: FakeProviders,
+    sample_bodies: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The 2026-09-28 incident: the sandbox cannot start. The preflight catches it, so the run is FAILED before any
+    execution session, critique or loop is paid for; only the cheap preflight is spent (and recorded)."""
+    script = Script(sample_bodies, sandbox_down=True)
+    pipeline, code = _sandboxed_pipeline(settings, fake_providers, script)
+    run_id = pipeline.create(BRIEF).run_id
+    workspace = pipeline.vault.paths(run_id).workspace
+    monkeypatch.setattr(cli, "make_pipeline", lambda _settings: pipeline)
+    argv = ["--vault", str(settings.vault_path), "--workspaces", str(settings.workspaces_path), "resume", run_id]
+
+    assert cli.main(argv) == cli.EXIT_FAILED
+
+    index = pipeline.status(run_id)
+    assert index.status == RunStatus.FAILED
+    assert (index.stage, index.round, index.mode) == ("execution", 1, "code")
+    assert index.error is not None
+    assert index.error.startswith("execution: SandboxUnavailable: Claude Code sandbox preflight failed")
+    assert SANDBOX_ERROR in index.error
+    assert _code_kinds(script) == ["preflight"]  # no execution session, no retry
+    assert script.count("critique") == 0 and script.count("fix_report") == 0
+    assert index.handoffs == ["01a-routing", "01-ingestion", "02-strategy"]
+    assert "execution" not in index.completed_stages and "crosscheck" not in index.completed_stages
+    assert not (workspace / PREFLIGHT_FILE).exists()
+    assert not (workspace / ".maf" / "execution-r1.md").exists()  # stopped before the prompt was even written
+    # Spend: ingestion and strategy ($0.03) plus the preflight, metered as a normal execution/preflight entry.
+    ledger = _assert_ledger_mirrored(pipeline, run_id)
+    assert len(ledger.entries) == _total_calls(fake_providers)
+    preflight = ledger.entries[-1]
+    assert (preflight.stage, preflight.purpose, preflight.provider, preflight.error) == (
+        "execution", "preflight", "claude_code", "",
+    )
+    assert index.spent_usd == pytest.approx(0.03 + 0.04)
+    assert index.spend_by_provider["claude_code"] == pytest.approx(0.04)
+    post = frontmatter.load(pipeline.vault.paths(run_id).run_md)
+    assert post["status"] == "failed" and post["error"] == index.error
+    last = capsys.readouterr().err.strip().splitlines()[-1]
+    assert last.startswith("failed: execution: SandboxUnavailable: Claude Code sandbox preflight failed")
+    assert last.endswith("(spent $0.0700 of $25.00)")
+
+    # Once the sandbox works, a new process checks it again and the run completes from execution round 1.
+    script.sandbox_down = False
+    assert cli.main(argv) == cli.EXIT_OK
+    resumed = pipeline.status(run_id)
+    assert resumed.status == RunStatus.COMPLETED, resumed.error
+    assert resumed.handoffs == EXPECTED_HANDOFFS
+    assert script.count("triage") == 1 and script.count("strategy") == 1
+    assert code.preflights == 2
+    assert _code_kinds(script) == ["preflight", "preflight", "execution", "fix_report", "execution"]
+    assert len(_assert_ledger_mirrored(pipeline, run_id).entries) == _total_calls(fake_providers)
+
+
+def test_cli_run_to_the_loop_cap_exits_2_as_completed_with_issues(
+    settings: Settings,
+    fake_providers: FakeProviders,
+    sample_bodies: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``maf run`` in code mode where GPT-1 is never fixed: three execution passes and three fix passes on one
+    verified sandbox, then final, status completed_with_issues and exit code 2."""
+    script = Script(sample_bodies, stubborn=True)
+    pipeline, code = _sandboxed_pipeline(settings, fake_providers, script)
+    monkeypatch.setattr(cli, "make_pipeline", lambda _settings: pipeline)
+    base = ["--vault", str(settings.vault_path), "--workspaces", str(settings.workspaces_path)]
+
+    assert cli.main([*base, "run", BRIEF]) == cli.EXIT_WITH_ISSUES == 2
+
+    out, err = capsys.readouterr()
+    run_id = out.splitlines()[0]
+    index = pipeline.status(run_id)
+    assert index.status == RunStatus.COMPLETED_WITH_ISSUES, index.error
+    assert (index.stage, index.round, index.unresolved_critical, index.error) == ("final", 3, 1, None)
+    assert index.handoffs[-2:] == ["04-crosscheck-r3", "05-final"]
+    assert _code_kinds(script) == ["preflight"] + ["execution", "fix_report"] * 3
+    paths = pipeline.vault.paths(run_id)
+    assert out.strip().splitlines()[-1] == str(paths.note("05-final"))
+    last = err.strip().splitlines()[-1]
+    assert last.startswith("completed with issues: 1 unresolved critical issue(s) after the cross-check loop cap")
+    assert str(paths.note("04-crosscheck-r3")) in last and f"maf resume {run_id} --extra-round" in last
+    assert frontmatter.load(paths.run_md)["status"] == "completed_with_issues"
+    ledger = _assert_ledger_mirrored(pipeline, run_id)
+    assert len(ledger.entries) == _total_calls(fake_providers)
+
+    assert cli.main([*base, "status", run_id]) == cli.EXIT_OK
+    assert "unresolved critical: 1" in capsys.readouterr().out
+
+
+def test_process_resumed_into_crosscheck_verifies_the_sandbox_before_the_critiques(
+    settings: Settings, fake_providers: FakeProviders, sample_bodies: dict[str, str]
+) -> None:
+    """A budget stop at crosscheck, then ``resume``: the new process has not seen execution's preflight, so the
+    crosscheck stage runs its own (ledger stage crosscheck) before paying for critiques; round 2 reuses it."""
+    script = Script(sample_bodies)
+    pipeline, code = _sandboxed_pipeline(settings, fake_providers, script)
+    # $0.03 ingestion + strategy, $0.04 preflight, $0.50 execution; the three $0.05 critique reservations cannot fit.
+    run_id = pipeline.create(BRIEF, budget_usd=0.64).run_id
+
+    stopped = pipeline.run(run_id)
+    assert stopped.status == RunStatus.BUDGET_EXCEEDED and (stopped.stage, stopped.round) == ("crosscheck", 1)
+    assert _code_kinds(script) == ["preflight", "execution"]
+    before_resume = len(script.requests)
+
+    resumed = pipeline.resume(run_id, budget_usd=5.0)
+
+    assert resumed.status == RunStatus.COMPLETED, resumed.error
+    assert resumed.handoffs == EXPECTED_HANDOFFS
+    assert _code_kinds(script) == ["preflight", "execution", "preflight", "fix_report", "execution"]
+    first_after_resume = [(role, kind) for role, kind, _ in script.requests[before_resume : before_resume + 2]]
+    assert first_after_resume[0] == ("claude_code", "preflight")  # verified before any critique of the resumed pass
+    assert first_after_resume[1][1] == "critique"
+    ledger = _assert_ledger_mirrored(pipeline, run_id)
+    assert len(ledger.entries) == _total_calls(fake_providers)
+    assert [(e.stage, e.purpose) for e in ledger.entries if e.provider == "claude_code"] == [
+        ("execution", "preflight"),
+        ("execution", "execution"),
+        ("crosscheck", "preflight"),
+        ("crosscheck", "fixes"),
+        ("execution", "execution"),
+    ]

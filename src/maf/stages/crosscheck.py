@@ -3,6 +3,10 @@
 Owner: stages.
 
 Round r (= ``ctx.index.round``):
+0. **Sandbox** (code/mixed): ``maf.stages.execution.ensure_sandbox`` before anything is paid for. A no-op when
+   execution already verified the sandbox in this process; a process resumed straight into crosscheck runs the
+   preflight here (ledger stage ``crosscheck``), so a broken sandbox stops the run before the critiques and
+   rebuttal are paid for, not at the fix pass.
 1. **Critiques**, run concurrently (thread pool, 3 workers): ChatGPT, Gemini, Claude (Messages) each write
    ``04a-critique-<agent>[-rN]`` (kind CRITIQUE) against ``03-execution[-rN]`` + ``02-strategy``
    ``## Acceptance Criteria``. Issue IDs use the critic's prefix (GPT/GEM/CLA).
@@ -20,7 +24,11 @@ Round r (= ``ctx.index.round``):
    (kind CROSSCHECK, ``from: maf``).
 
 ``loop_back = verdict == "LOOP"``; ``index_updates = {"unresolved_critical": n}``. The pipeline decides
-whether a loop is still permitted.
+whether a loop is still permitted. When ``round > max_crosscheck_loops`` a ``LOOP`` cannot loop any more: the
+note's Summary says the run goes to final and ends ``completed_with_issues``, and its ``to`` is ``final``.
+
+The debate notes' line grammars accept indented continuation lines (``maf.handoff``); the parsed item texts
+arrive here with the continuation folded in, so every item stays one line in the notes Python assembles.
 
 Artifact contents are gathered for every mode (the prose document is the ``document.md`` artifact).
 When no critic raises an issue, the rebuttal is skipped too (a ``None.`` note from ``maf``).
@@ -59,7 +67,13 @@ from maf.stages.base import (
     role_system,
     write_workspace_file,
 )
-from maf.stages.execution import PROSE_DOCUMENT, parse_artifact_paths, require_mode, resolve_in_workspace
+from maf.stages.execution import (
+    PROSE_DOCUMENT,
+    ensure_sandbox,
+    parse_artifact_paths,
+    require_mode,
+    resolve_in_workspace,
+)
 from maf.types import AgentName, ExecutionMode, StageName
 
 log = logging.getLogger(__name__)
@@ -152,6 +166,8 @@ class CrosscheckBackend:
 
     def run_stage(self, ctx: StageContext) -> StageOutput:
         mode = require_mode(ctx)
+        if mode != "prose":
+            ensure_sandbox(ctx)  # the code-mode fix pass is a Claude Code session
         rnd = ctx.round
         strategy_name = _vault.note_name(HandoffKind.STRATEGY)
         exec_name = _vault.note_name(HandoffKind.EXECUTION, rnd)
@@ -184,9 +200,18 @@ class CrosscheckBackend:
         not_fixed = {n.id: n.reason for n in report.not_fixed}
         unresolved = unresolved_critical(to_fix, fixed, list(not_fixed))
         verdict = "LOOP" if unresolved else "PASS"
+        capped = bool(unresolved) and rnd > ctx.settings.max_crosscheck_loops
 
+        cap_note = (
+            f"Loop cap reached (max {ctx.settings.max_crosscheck_loops} loop(s)): the run goes to final and ends "
+            f"`completed_with_issues` with {len(unresolved)} critical issue(s) unresolved."
+            if capped
+            else ""
+        )
         sections = {
-            "Summary": _summary(rnd, issues, responses, to_fix, fixed, not_fixed, unresolved, verdict, report.summary),
+            "Summary": _summary(
+                rnd, issues, responses, to_fix, fixed, not_fixed, unresolved, verdict, report.summary, cap_note
+            ),
             "Issues": "\n".join(_issue_line(i) for i in issues) or hf.NONE_MARKER,
             "Rulings": "\n".join(f"- {r.id} [{r.ruling}]: {r.text}" for r in rulings) or hf.NONE_MARKER,
             "Applied Fixes": _applied_fixes(to_fix, fixed, not_fixed),
@@ -197,7 +222,7 @@ class CrosscheckBackend:
             ctx,
             HandoffKind.CROSSCHECK,
             sections,
-            to="execution" if unresolved else "final",
+            to="execution" if unresolved and not capped else "final",
             inputs=consumed + [n.name for n in notes],
             model=fix_result.model if fix_result else "none",
             cost_usd=fix_result.cost_usd if fix_result else 0.0,
@@ -573,6 +598,7 @@ def _summary(
     unresolved: list[Issue],
     verdict: str,
     fixer_summary: str,
+    cap_note: str = "",
 ) -> str:
     counts = {s: sum(1 for i in issues if i.severity == s) for s in ("critical", "major", "minor")}
     ids = {i.id for i in issues}
@@ -583,6 +609,8 @@ def _summary(
         f"{counts['minor']} minor), {disputed} disputed, {len(to_fix)} to fix, {confirmed} confirmed fixed, "
         f"{len(unresolved)} critical unresolved. Verdict: {verdict}."
     )
+    if cap_note:
+        text += f"\n\n{cap_note}"
     if fixer_summary.strip():
         text += f"\n\nFixer's summary: {neutralize_headings(one_line(fixer_summary, 1500))}"
     return text

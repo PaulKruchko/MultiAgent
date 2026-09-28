@@ -108,8 +108,44 @@ def _provider(replies: list[Any], files: FakeFiles | None = None) -> tuple[Gemin
 # --- build_config / build_contents --------------------------------------------------------------
 
 
+NO_AFC = {"automatic_function_calling": {"disable": True}}
+
+
 def test_build_config_minimal() -> None:
-    assert GeminiProvider.build_config(_req()) == {"max_output_tokens": 32_000}
+    assert GeminiProvider.build_config(_req()) == {"max_output_tokens": 32_000, **NO_AFC}
+
+
+@pytest.mark.parametrize("schema_in_prompt", [False, True])
+def test_build_config_disables_automatic_function_calling(schema_in_prompt: bool) -> None:
+    from google.genai import _extra_utils
+
+    req = _req(json_schema=SCHEMA, web_search=True)
+    sdk = types.GenerateContentConfig(**GeminiProvider.build_config(req, schema_in_prompt=schema_in_prompt))
+    assert sdk.automatic_function_calling == types.AutomaticFunctionCallingConfig(disable=True)
+    assert _extra_utils.should_disable_afc(sdk) is True
+
+
+def test_generate_content_logs_no_afc_warning(caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Through the real SDK ``Models.generate_content`` (only the HTTP layer is stubbed): one request, no warning."""
+    from google import genai
+    from google.genai import models
+
+    monkeypatch.setattr(models.Models, "_logged_afc_warning", False)
+    client = genai.Client(api_key="not-a-real-key")
+    sent: list[Any] = []
+
+    def fake_generate(*, model: str, contents: Any, config: Any) -> types.GenerateContentResponse:
+        sent.append(config)
+        return _response("gemini_json")
+
+    monkeypatch.setattr(client.models, "_generate_content", fake_generate)
+    provider = GeminiProvider(client, today=lambda: ON)
+    with caplog.at_level("INFO", logger="google_genai"):
+        result = provider.complete(_req(json_schema=SCHEMA))
+    assert result.parsed is not None
+    assert len(sent) == 1
+    assert not [r for r in caplog.records if "automatic function calling" in r.getMessage().lower()]
+    assert not [r for r in caplog.records if "AFC" in r.getMessage()]
 
 
 def test_build_config_full_is_accepted_by_sdk() -> None:
@@ -122,6 +158,7 @@ def test_build_config_full_is_accepted_by_sdk() -> None:
         "response_json_schema": SCHEMA,
         "tools": [{"google_search": {}}],
         "thinking_config": {"thinking_level": "HIGH"},
+        **NO_AFC,
     }
     sdk = types.GenerateContentConfig(**config)
     assert sdk.tools is not None and isinstance(sdk.tools[0], types.Tool) and sdk.tools[0].google_search is not None

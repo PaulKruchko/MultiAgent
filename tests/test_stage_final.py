@@ -107,13 +107,15 @@ def test_final_copies_deliverables_and_enforces_links(ready: StageEnv) -> None:
     assert provenance.count("[[02-strategy]]") == 1
     assert "- [[03-execution-r2]]" in provenance and "- [[04-crosscheck-r2]]" in provenance
     assert note.section("Limitations") == "None."  # unresolved_critical == 0
+    assert "[!warning]" not in note.section("Summary")
+    assert final_mod.ISSUES_TAG not in note.meta.tags
 
     prompt = prompt_of(ready.fakes.claude.calls[0])
     assert f"- [[{prefix}/document|document]]" in prompt
     assert '<note name="03-execution-r2">' in prompt and '<note name="04-crosscheck-r2">' in prompt
     assert "## Acceptance Criteria" in prompt and "## Risks" not in prompt
     assert ready.index.brief in prompt
-    assert "Unresolved critical issues" not in prompt
+    assert "Unresolved critical issues" not in prompt and "completed_with_issues" not in prompt
     assert prompt.count(hf.format_spec(HandoffKind.FINAL)) == 1
 
 
@@ -124,6 +126,30 @@ def test_unresolved_critical_issues_reach_limitations(ready: StageEnv) -> None:
     limitations = note.section("Limitations")
     assert limitations.startswith("Critical issues left unresolved by the cross-check (added by maf):")
     assert limitations.endswith(UNRESOLVED)
+
+
+def test_completed_with_issues_status_is_stated_in_prompt_and_note(ready: StageEnv) -> None:
+    ready.fakes.claude.script(FINAL_BODY.format(run=RUN_ID))
+    note = FinalBackend().run_stage(ready.ctx("final", round=2, unresolved_critical=1)).notes[0].handoff
+
+    prompt = prompt_of(ready.fakes.claude.calls[0])
+    assert "## Unresolved critical issues (run status: completed_with_issues)" in prompt
+    assert "ends with status `completed_with_issues`, not `completed`" in prompt and "[[04-crosscheck-r2]]" in prompt
+    summary = note.section("Summary")
+    assert summary.startswith(
+        "> [!warning] Run status: completed_with_issues\n"
+        "> 1 critical issue(s) remain unresolved after the cross-check loop cap (see [[04-crosscheck-r2]])"
+    )
+    assert summary.endswith("The thesis is complete.")
+    assert note.meta.tags == ["maf", "maf/final", final_mod.ISSUES_TAG]
+    assert hf.validate_handoff(note) == []
+
+
+def test_mark_completed_with_issues_is_idempotent(ready: StageEnv) -> None:
+    ready.fakes.claude.script(FINAL_BODY.format(run=RUN_ID))
+    note = FinalBackend().run_stage(ready.ctx("final", round=2, unresolved_critical=2)).notes[0].handoff
+    again = final_mod.mark_completed_with_issues(note, 2, "04-crosscheck-r2")
+    assert again.sections == note.sections and again.meta.tags == note.meta.tags
 
 
 def test_limitations_already_listing_the_issue_are_left_alone(ready: StageEnv) -> None:

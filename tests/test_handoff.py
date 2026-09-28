@@ -175,10 +175,19 @@ def test_none_marker_rejected_outside_empty_ok(kind: HandoffKind, name: str) -> 
         (HandoffKind.CRITIQUE, "Issues", "- [blocker] GPT-1: x"),
         (HandoffKind.CRITIQUE, "Issues", "- [major] XYZ-1: x"),
         (HandoffKind.CRITIQUE, "Issues", "* [major] GPT-1: x"),
-        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n\n- [minor] GPT-2: y"),
         (HandoffKind.CRITIQUE, "Issues", "Some prose first.\n- [minor] GPT-2: y"),
-        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n  continued"),
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\nunindented wrap"),
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n - one-space indent is not a continuation"),
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n- [blocker] GPT-2: malformed item is never folded"),
+        (HandoffKind.CRITIQUE, "Issues", "- [critical] GPT-1: A\n  - [high] GPT-2: a nested near-miss is not folded"),
+        (HandoffKind.CRITIQUE, "Issues", "- [critical] GPT-1: A\n    - GPT-2: nested, severity missing"),
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1:\n\n- [minor] GPT-2: y"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]: ok\n  - GEM-2 reject: would count as accepted"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]: ok\n\t* GEM-2 [maybe]: nested, bad stance"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]: "),
+        (HandoffKind.ADJUDICATION, "Rulings", "- GPT-1 [fix]: a\n  - GPT-2 wontfix: b"),
         (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [maybe]: x"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]: x\n\nClosing remark."),
         (HandoffKind.REBUTTAL, "Responses", "- GPT-1: accept"),
         (HandoffKind.ADJUDICATION, "Rulings", "- GPT-1 [accept]: x"),
         (HandoffKind.CROSSCHECK, "Verdict", "pass"),
@@ -191,9 +200,50 @@ def test_grammar_violations(kind: HandoffKind, section: str, text: str) -> None:
     assert all(section in e for e in errors)
 
 
-def test_grammar_blank_line_error_mentions_line() -> None:
-    errors = validate_body(body_of(HandoffKind.CRITIQUE, Issues="- [major] GPT-1: x\n\n- [minor] GPT-2: y"), HandoffKind.CRITIQUE)
-    assert errors == ["'## Issues' line 2: blank line does not match `- [critical|major|minor] <GPT|GEM|CLA>-<n>: <text>`"]
+def test_grammar_error_mentions_line_and_continuation_hint() -> None:
+    errors = validate_body(body_of(HandoffKind.CRITIQUE, Issues="- [major] GPT-1: x\n\nwrapped"), HandoffKind.CRITIQUE)
+    assert errors == [
+        "'## Issues' line 3: 'wrapped' does not match `- [critical|major|minor] <GPT|GEM|CLA>-<n>: <text>` "
+        "(continuation lines must be indented by two spaces)"
+    ]
+    errors = validate_body(body_of(HandoffKind.CRITIQUE, Issues="- [major] GPT-1: x\n- GPT-2: y"), HandoffKind.CRITIQUE)
+    assert errors == ["'## Issues' line 2: '- GPT-2: y' does not match `- [critical|major|minor] <GPT|GEM|CLA>-<n>: <text>`"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "section", "text"),
+    [
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n\n- [minor] GPT-2: y"),
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n  continued\n\tand tab-indented"),
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n\n  continued after a blank line\n- [minor] GPT-2: y"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]: refs fixed\n  - Ref 20 gets ISBN 978-0\n  - Ref 21 gets a DOI"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]: \n  - Ref 20 gets an ISBN\n  - Ref 21 gets a DOI"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]:\n  text only on the next line"),
+        (HandoffKind.REBUTTAL, "Responses", "- GPT-1 [accept]: fixed\n  - GEM-3 raised the same point\n  - see GPT-2"),
+        (HandoffKind.CRITIQUE, "Issues", "- [major] GPT-1: x\n  - covers GEM-2 too\n  - [see Eq. 4] the bound"),
+        (HandoffKind.ADJUDICATION, "Rulings", "- GPT-1 [fix]: required\n    ```c\n    assert(p);\n    ```"),
+    ],
+)
+def test_grammar_accepts_blank_lines_and_indented_continuations(kind: HandoffKind, section: str, text: str) -> None:
+    assert validate_body(body_of(kind, **{section: text}), kind) == []
+
+
+def test_grammar_error_hints_fit_the_line() -> None:
+    """The indentation hint is only for unindented prose; lines under a bad item are covered by its error."""
+    shape = "`- <ID> [accept|reject|partial]: <text>`"
+    errors = validate_body(
+        body_of(HandoffKind.REBUTTAL, Responses="- GPT-1 [maybe]: x\n  - sub a\n  - sub b"), HandoffKind.REBUTTAL
+    )
+    assert errors == [f"'## Responses' line 1: '- GPT-1 [maybe]: x' does not match {shape}"]
+    errors = validate_body(
+        body_of(HandoffKind.REBUTTAL, Responses="- GPT-1 [accept]: ok\n  - GEM-2 reject: no"), HandoffKind.REBUTTAL
+    )
+    assert errors == [
+        f"'## Responses' line 2: '  - GEM-2 reject: no' does not match {shape} (an indented line that starts like an "
+        "item must be a well-formed item; reword a mere note)"
+    ]
+    errors = validate_body(body_of(HandoffKind.REBUTTAL, Responses="- GPT-1 [accept]:"), HandoffKind.REBUTTAL)
+    assert errors == ["'## Responses' line 1: item GPT-1 has no text after the colon or on indented lines below it"]
 
 
 def test_grammar_duplicate_ids() -> None:
@@ -401,6 +451,66 @@ def test_parse_issues_bad_line() -> None:
     assert "line 2" in info.value.errors[0]
 
 
+def test_parse_issues_folds_continuations_and_keeps_nested_items() -> None:
+    text = (
+        "- [critical] GPT-1: free() corrupts the bitmap\n"
+        "  when the block is foreign:\n"
+        "  - reproduced by stress_test.c\n"
+        "\n"
+        "  - [minor] GPT-2: a nested item is still its own item\n"
+        "- [major] GPT-3: last"
+    )
+    issues = parse_issues(text, "chatgpt")
+    assert [(i.id, i.severity, i.text) for i in issues] == [
+        ("GPT-1", "critical", "free() corrupts the bitmap when the block is foreign: - reproduced by stress_test.c"),
+        ("GPT-2", "minor", "a nested item is still its own item"),
+        ("GPT-3", "major", "last"),
+    ]
+
+
+def test_parse_issues_never_folds_a_nested_near_miss_item() -> None:
+    """Folded, ``[high] GPT-2`` would vanish into GPT-1's text: a critical issue lost without a repair."""
+    with pytest.raises(HandoffInvalid) as info:
+        parse_issues("- [critical] GPT-1: A\n  - [high] GPT-2: B is critical too", "chatgpt")
+    assert len(info.value.errors) == 1 and "line 2" in info.value.errors[0]
+    assert "'  - [high] GPT-2: B is critical too' does not match" in info.value.errors[0]
+
+
+def test_parse_responses_header_only_item_takes_its_text_from_sub_bullets() -> None:
+    """``- GPT-1 [accept]:`` (maybe with a trailing space) and the details as indented sub-bullets: no repair."""
+    responses = parse_responses("- GPT-1 [accept]: \n  - Ref 20 gets an ISBN\n  - Ref 21 gets a DOI\n- GEM-2 [reject]: no")
+    assert [(r.id, r.stance, r.text) for r in responses] == [
+        ("GPT-1", "accept", "- Ref 20 gets an ISBN - Ref 21 gets a DOI"),
+        ("GEM-2", "reject", "no"),
+    ]
+    (ruling,) = parse_rulings("- GPT-1 [fix]:\n\tthe brief requires it")
+    assert ruling.text == "the brief requires it"
+
+
+def test_parse_responses_thesis_rebuttal_with_indented_sub_bullets(sample_bodies: dict[str, str]) -> None:
+    """The exact shape that cost the thesis run a paid repair: indented '- ' sub-bullets under responses."""
+    body = sample_bodies["rebuttal-continuations"]
+    assert validate_body(body, HandoffKind.REBUTTAL) == []
+    handoff = build_handoff(body, make_meta(HandoffKind.REBUTTAL))
+    responses = parse_responses(handoff.section("Responses"))
+    assert [(r.id, r.stance) for r in responses] == [("GPT-1", "accept"), ("GEM-2", "partial"), ("CLA-1", "reject")]
+    assert responses[0].text == (
+        "the bibliography now gives stable identifiers for every book and paper: "
+        "- Ref 20 gets ISBN 978-0-12-409210-6 (Wesson, Tokamaks, 4th ed.) "
+        "- Ref 21 gets DOI 10.1088/0029-5515/39/12/301 (ITER Physics Basis)"
+    )
+    assert responses[1].text.endswith("with its validity range stated. - Section 3.2 lists the applicability limits.")
+    assert all("\n" not in r.text for r in responses)
+
+
+def test_parse_rulings_folds_continuations_and_rejects_duplicates() -> None:
+    (ruling,) = parse_rulings("- GPT-1 [wontfix]: out of scope\n\t(see the brief)")
+    assert (ruling.id, ruling.ruling, ruling.text) == ("GPT-1", "wontfix", "out of scope (see the brief)")
+    with pytest.raises(HandoffInvalid) as info:
+        parse_rulings("- GPT-1 [fix]: a\n  - GPT-1 [wontfix]: b")
+    assert info.value.errors == ["'## Rulings' line 2: duplicate id GPT-1"]
+
+
 def test_parse_responses_and_rulings(sample_bodies: dict[str, str]) -> None:
     _, _, reb = split_sections(sample_bodies["rebuttal"])
     responses = parse_responses(reb["Responses"])
@@ -435,6 +545,7 @@ def test_format_spec_grammars() -> None:
     assert "[fix|wontfix]" in format_spec(HandoffKind.ADJUDICATION)
     assert "PASS" in format_spec(HandoffKind.CROSSCHECK)
     assert "line grammar" not in format_spec(HandoffKind.STRATEGY)
+    assert "indented by two spaces" in format_spec(HandoffKind.REBUTTAL)
 
 
 def test_repair_prompt_contents() -> None:

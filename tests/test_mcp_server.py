@@ -22,7 +22,8 @@ from maf.vault import note_name
 
 
 class Backend:
-    """Stage backend producing no notes; ``final`` writes 05-final and one deliverable; can block or raise."""
+    """Stage backend producing no notes; ``final`` writes 05-final and one deliverable; can block or raise.
+    ``unresolved`` > 0 makes ``crosscheck`` report that many unresolved critical issues and loop back."""
 
     def __init__(self, name: StageName, final_body: str) -> None:
         self.name = name
@@ -30,6 +31,7 @@ class Backend:
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
         self.error: Exception | None = None
+        self.unresolved = 0
 
     def run_stage(self, ctx: StageContext) -> StageOutput:
         self.entered.set()
@@ -37,6 +39,8 @@ class Backend:
             assert self.gate.wait(10)
         if self.error is not None:
             raise self.error
+        if self.name == "crosscheck":
+            return StageOutput(notes=[], index_updates={"unresolved_critical": self.unresolved}, loop_back=self.unresolved > 0)
         if self.name != "final":
             return StageOutput(notes=[])
         artifact = ctx.paths.workspace / "alloc.c"
@@ -119,7 +123,10 @@ def test_start_run_returns_immediately_then_completes(env: Env, tmp_path: Path) 
     status = _ok(env.tool("get_run_status", run_id=run_id))
     assert status["status"] == "running" and status["stage"] == "ingestion"
     assert (status["budget_usd"], status["round"], status["error"]) == (9.0, 1, None)
-    assert set(status) == {"run_id", "status", "stage", "round", "spent_usd", "budget_usd", "spend_by_agent", "error", "handoffs"}
+    assert set(status) == {
+        "run_id", "status", "stage", "round", "spent_usd", "budget_usd", "spend_by_agent", "unresolved_critical", "error",
+        "handoffs",
+    }
     pending = _ok(env.tool("get_run_result", run_id=run_id))
     assert pending["final_markdown"] is None and pending["deliverables"] == []
 
@@ -135,7 +142,7 @@ def test_start_run_returns_immediately_then_completes(env: Env, tmp_path: Path) 
     status = _ok(env.tool("get_run_status", run_id=run_id))
     assert status["status"] == "completed" and status["handoffs"] == ["05-final"]
     result = _ok(env.tool("get_run_result", run_id=run_id))
-    assert result["status"] == "completed"
+    assert (result["status"], result["unresolved_critical"]) == ("completed", 0)
     assert result["final_markdown"].startswith("## Summary")
     assert "## Limitations" in result["final_markdown"]
     assert result["vault_path"] == str(env.pipeline.vault.paths(run_id).root)
@@ -153,6 +160,42 @@ def test_runs_execute_sequentially_on_one_worker(env: Env) -> None:
     gate.set()
     assert env.manager.wait(second, timeout=10).status == RunStatus.COMPLETED  # type: ignore[union-attr]
     assert env.pipeline.status(first).status == RunStatus.COMPLETED
+
+
+def test_completed_with_issues_is_reported_by_every_read_tool(env: Env) -> None:
+    env.backends["crosscheck"].unresolved = 4
+    run_id = _ok(env.tool("start_run", brief="x"))["run_id"]
+    assert env.manager.wait(run_id, timeout=10).status == RunStatus.COMPLETED_WITH_ISSUES  # type: ignore[union-attr]
+
+    status = _ok(env.tool("get_run_status", run_id=run_id))
+    assert (status["status"], status["unresolved_critical"], status["round"], status["error"]) == (
+        "completed_with_issues", 4, 3, None
+    )
+    result = _ok(env.tool("get_run_result", run_id=run_id))
+    assert (result["status"], result["unresolved_critical"]) == ("completed_with_issues", 4)
+    assert result["final_markdown"].startswith("## Summary")  # the report is still delivered
+    (row,) = _ok(env.tool("list_runs"))["result"]
+    assert row["status"] == "completed_with_issues"
+
+
+
+def test_legacy_completed_run_with_open_criticals_is_reported_with_issues(env: Env) -> None:
+    """run.md from before completed_with_issues existed: ``status: completed`` with open criticals."""
+    run_id = _ok(env.tool("start_run", brief="x"))["run_id"]
+    assert env.manager.wait(run_id, timeout=10).status == RunStatus.COMPLETED  # type: ignore[union-attr]
+    run_md = env.pipeline.vault.paths(run_id).run_md
+    text = run_md.read_text(encoding="utf-8")
+    run_md.write_text(text.replace("\nunresolved_critical: 0\n", "\nunresolved_critical: 20\n"), encoding="utf-8")
+
+    status = _ok(env.tool("get_run_status", run_id=run_id))
+    assert (status["status"], status["unresolved_critical"]) == ("completed_with_issues", 20)
+    result = _ok(env.tool("get_run_result", run_id=run_id))
+    assert (result["status"], result["unresolved_critical"]) == ("completed_with_issues", 20)
+    (row,) = _ok(env.tool("list_runs"))["result"]
+    assert row["status"] == "completed_with_issues"
+
+def test_server_instructions_explain_completed_with_issues() -> None:
+    assert "completed_with_issues" in mcp_server.SERVER_INSTRUCTIONS
 
 
 def test_failed_run_reports_error(env: Env) -> None:

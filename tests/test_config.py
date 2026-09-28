@@ -278,6 +278,8 @@ def test_unknown_override_rejected(tmp_path: Path) -> None:
         ("budget_usd: -1\n", "invalid settings"),
         ("tier: ultra\n", "invalid settings"),
         ("stage_model_overrides:\n  nosuchstage:\n    chatgpt: x\n", "invalid settings"),
+        ("claude_code_tmp_base: tmp\n", "must be an absolute path"),
+        ("claude_code_preflight_budget_usd: 0\n", "invalid settings"),
     ],
 )
 def test_bad_config_raises_value_error(tmp_path: Path, text: str, match: str) -> None:
@@ -285,6 +287,22 @@ def test_bad_config_raises_value_error(tmp_path: Path, text: str, match: str) ->
     cfg.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match=match):
         load_settings(cfg)
+
+
+def test_claude_code_sandbox_defaults() -> None:
+    s = Settings()
+    assert s.claude_code_tmp_base == Path("/tmp")
+    assert s.claude_code_preflight_budget_usd is None  # scaled with the model's price by the provider
+
+
+def test_claude_code_tmp_base_from_yaml_expands_user(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", "/h")
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("claude_code_tmp_base: ~/t\nclaude_code_preflight_budget_usd: 0.4\n", encoding="utf-8")
+    s = load_settings(cfg)
+    assert s.claude_code_tmp_base == Path("/h/t")
+    assert s.claude_code_preflight_budget_usd == 0.4
+    assert load_settings(cfg, claude_code_tmp_base="/var/tmp").claude_code_tmp_base == Path("/var/tmp")
 
 
 def test_config_path_is_directory_raises(tmp_path: Path) -> None:
