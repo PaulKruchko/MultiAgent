@@ -15,6 +15,13 @@ SDK facts, verified by introspecting google-genai 2.25.0:
 - Search grounding: ``tools=[types.Tool(google_search=types.GoogleSearch())]``. Sources are in
   ``response.candidates[0].grounding_metadata.grounding_chunks[i].web.{uri,title}`` and
   queries in ``.web_search_queries`` (one billable query each).
+- URL context: ``types.Tool(url_context=types.UrlContext())`` (an empty model; the request converter sends
+  ``urlContext`` in both Gemini API and Vertex modes). Retrievals are reported in
+  ``response.candidates[0].url_context_metadata.url_metadata[i].{retrieved_url, url_retrieval_status}``, status one of
+  ``URL_RETRIEVAL_STATUS_{UNSPECIFIED,SUCCESS,ERROR,PAYWALL,UNSAFE}``. Fetched content is billed as tool-use
+  prompt tokens, so it is already in the usage mapping below. The SDK cannot tell whether a model supports the
+  tool, and that cannot be checked offline for gemini-3.8-flash: a 400 naming the URL context tool drops it for
+  that model (search stays), like the schema fallback below.
 - Files: ``client.files.upload(file=path, config=types.UploadFileConfig(mime_type=...))``
   returns ``types.File`` (``name``, ``uri``, ``mime_type``, ``state``). Poll ``client.files.get(name=)``
   until ``state`` is ACTIVE (video/PDF processing), then pass the File (or
@@ -25,9 +32,9 @@ SDK facts, verified by introspecting google-genai 2.25.0:
 - ``client.models.count_tokens`` is free but a network call. ``worst_case_cost`` uses the local estimate.
 - ``client.interactions`` exists (stateful API). Not used: Python owns state.
 
-If the model rejects ``google_search`` combined with ``response_json_schema`` (a 400 naming both), the
-adapter drops the schema, asks for JSON in the prompt, and validates locally (``StructuredOutputError`` on
-failure).
+If the model rejects a tool (``google_search``, ``url_context``) combined with ``response_json_schema`` (a 400
+naming both), the adapter drops the schema, asks for JSON in the prompt, and validates locally
+(``StructuredOutputError`` on failure).
 """
 
 from __future__ import annotations
@@ -79,6 +86,13 @@ REFUSAL_FINISH_REASONS = frozenset(
 )
 FILE_POLL_INTERVAL_S = 2.0
 
+URL_CONTEXT_TOKEN_ALLOWANCE = 20 * 30_000
+"""Worst-case input tokens assumed for pages the URL context tool fetches (20 pages of 30k tokens). An allowance,
+not a documented limit: larger fetches are billed anyway and recorded as an overrun by the ledger."""
+
+URL_RETRIEVED = "URL_RETRIEVAL_STATUS_SUCCESS"
+"""``UrlRetrievalStatus`` of a page the URL context tool actually read."""
+
 UploadedFile = tuple[str, str]
 """``(file_uri, mime_type)`` of an ACTIVE Files API upload."""
 
@@ -107,6 +121,7 @@ class GeminiProvider:
         self._sleep = sleep
         self._lock = threading.Lock()
         self._schema_with_search_rejected: set[str] = set()
+        self._url_context_rejected: set[str] = set()
 
     def complete(self, request: CompletionRequest) -> CompletionResult:
         """Upload attachments, call ``generate_content``, collect citations, delete uploads."""
@@ -124,9 +139,10 @@ class GeminiProvider:
         return self.to_result(response, request, on=on)
 
     def worst_case_cost(self, request: CompletionRequest, on: date | None = None) -> float:
+        fetched = URL_CONTEXT_TOKEN_ALLOWANCE if uses_url_context(request) else 0
         return token_worst_case(
             request.model,
-            estimate_request_tokens(request),
+            estimate_request_tokens(request) + fetched,
             request.max_output_tokens,
             search_queries=request.max_search_queries if request.web_search else 0,
             on=on or self._today(),
@@ -153,6 +169,8 @@ class GeminiProvider:
             config["system_instruction"] = system
         if request.web_search:
             config["tools"] = [{"google_search": {}}]
+            if request.url_context:
+                config["tools"].append({"url_context": {}})
         if request.effort is not None:
             config["thinking_config"] = {"thinking_level": THINKING_LEVELS[request.effort]}
         return config
@@ -214,39 +232,40 @@ class GeminiProvider:
             provider=PROVIDER,
             stop_reason=finish,
             response_id=get_field(response, "response_id", ""),
-            citations=citations_from_grounding(grounding),
+            citations=_merge_citations(
+                citations_from_grounding(grounding),
+                citations_from_url_context(get_field(candidate, "url_context_metadata")),
+            ),
             raw=_dump(response),
         )
 
     def _generate(self, client: Any, request: CompletionRequest, files: Sequence[UploadedFile]) -> Any:
-        """Call ``generate_content``; if schema plus search is rejected, retry once with the schema in the prompt.
-        A 400 is not billed, so the retry does not double-spend."""
+        """Call ``generate_content``. A 400 rejecting the URL context tool drops that tool (search stays); a 400
+        rejecting the schema combined with a tool moves the schema into the prompt. Each fallback happens at most
+        once per call and is remembered per model. A 400 is not billed, so the retries do not double-spend."""
         from google.genai import types
 
         contents = self.build_contents(request, files)
         worst = self.worst_case_cost(request)
-        combined = request.web_search and request.json_schema is not None
         with self._lock:
-            in_prompt = combined and request.model in self._schema_with_search_rejected
-        try:
-            return client.models.generate_content(
-                model=request.model,
-                contents=contents,
-                config=types.GenerateContentConfig(**self.build_config(request, schema_in_prompt=in_prompt)),
-            )
-        except Exception as exc:
-            if not (combined and not in_prompt and is_schema_with_search_rejection(exc)):
-                raise _wrap_error(exc, worst_case_usd=worst) from exc
-        with self._lock:
-            self._schema_with_search_rejected.add(request.model)
-        try:
-            return client.models.generate_content(
-                model=request.model,
-                contents=contents,
-                config=types.GenerateContentConfig(**self.build_config(request, schema_in_prompt=True)),
-            )
-        except Exception as exc:
-            raise _wrap_error(exc, worst_case_usd=worst) from exc
+            if uses_url_context(request) and request.model in self._url_context_rejected:
+                request = request.model_copy(update={"url_context": False})
+            in_prompt = _schema_with_tools(request) and request.model in self._schema_with_search_rejected
+        while True:
+            config = types.GenerateContentConfig(**self.build_config(request, schema_in_prompt=in_prompt))
+            try:
+                return client.models.generate_content(model=request.model, contents=contents, config=config)
+            except Exception as exc:
+                if uses_url_context(request) and is_url_context_rejection(exc):
+                    with self._lock:
+                        self._url_context_rejected.add(request.model)
+                    request = request.model_copy(update={"url_context": False})
+                elif _schema_with_tools(request) and not in_prompt and is_schema_with_search_rejection(exc):
+                    with self._lock:
+                        self._schema_with_search_rejected.add(request.model)
+                    in_prompt = True
+                else:
+                    raise _wrap_error(exc, worst_case_usd=worst) from exc
 
     def _upload(self, client: Any, attachment: Attachment, uploaded: list[Any]) -> UploadedFile:
         mime = attachment_mime_type(attachment)
@@ -310,6 +329,32 @@ def citations_from_grounding(grounding: Any) -> tuple[Citation, ...]:
     return tuple(seen.values())
 
 
+def citations_from_url_context(metadata: Any) -> tuple[Citation, ...]:
+    """Pages the URL context tool retrieved successfully (failed, paywalled and unsafe ones are left out)."""
+    seen: dict[str, Citation] = {}
+    for entry in get_field(metadata, "url_metadata", []):
+        uri = get_field(entry, "retrieved_url", "")
+        if uri and uri not in seen and _enum_name(get_field(entry, "url_retrieval_status")) == URL_RETRIEVED:
+            seen[uri] = Citation(title="", uri=uri)
+    return tuple(seen.values())
+
+
+def _merge_citations(*groups: tuple[Citation, ...]) -> tuple[Citation, ...]:
+    merged: dict[str, Citation] = {}
+    for citation in (c for group in groups for c in group):
+        merged.setdefault(citation.uri, citation)
+    return tuple(merged.values())
+
+
+def uses_url_context(request: CompletionRequest) -> bool:
+    """URL context is honored only together with search (see ``CompletionRequest.url_context``)."""
+    return request.url_context and request.web_search
+
+
+def _schema_with_tools(request: CompletionRequest) -> bool:
+    return request.web_search and request.json_schema is not None
+
+
 def schema_instruction(schema: dict[str, Any]) -> str:
     return (
         "Respond with a single JSON object and nothing else (no prose, no code fence). "
@@ -323,8 +368,9 @@ def _enum_name(value: Any) -> str:
     return str(getattr(value, "value", value))
 
 
+_URL_CONTEXT_TERMS = ("url_context", "url context", "urlcontext")
 _SCHEMA_TERMS = ("response_json_schema", "response_schema", "response_mime_type", "mime type", "json", "controlled generation")
-_TOOL_TERMS = ("tool", "google_search", "search", "grounding")
+_TOOL_TERMS = ("tool", "google_search", "search", "grounding", *_URL_CONTEXT_TERMS)
 
 
 def is_schema_with_search_rejection(exc: Exception) -> bool:
@@ -334,6 +380,14 @@ def is_schema_with_search_rejection(exc: Exception) -> bool:
         return False
     message = (getattr(exc, "message", None) or str(exc)).lower()
     return any(t in message for t in _SCHEMA_TERMS) and any(t in message for t in _TOOL_TERMS)
+
+
+def is_url_context_rejection(exc: Exception) -> bool:
+    """A 400 whose message names the URL context tool: the model (or the API mode) does not support it."""
+    if _status(exc) != 400:
+        return False
+    message = (getattr(exc, "message", None) or str(exc)).lower()
+    return any(t in message for t in _URL_CONTEXT_TERMS)
 
 
 def _status(exc: Exception) -> int | None:

@@ -16,14 +16,17 @@ Tools (every tool returns in well under ChatGPT's 1-minute limit):
   ``files`` are absolute paths that must resolve inside ``settings.mcp_inbox``; ``budget_usd`` may not exceed
   ``settings.mcp_budget_ceiling_usd``. ``review`` is always False from MCP (no gate UI).
 - ``get_run_status(run_id) -> {"run_id", "status", "stage", "round", "spent_usd", "budget_usd",
-  "spend_by_agent", "unresolved_critical", "error", "handoffs"}``: read-only.
-- ``get_run_result(run_id) -> {"run_id", "status", "unresolved_critical", "final_markdown" | None,
-  "deliverables": [paths], "vault_path"}``. ``final_markdown`` is the 05-final.md body (for ``completed`` and
-  ``completed_with_issues`` runs), truncated to ``RESULT_MAX_CHARS`` with a marker.
+  "spend_by_agent", "unresolved_critical", "criteria_unmet", "unmet_criteria", "error", "handoffs"}``: read-only.
+- ``get_run_result(run_id) -> {"run_id", "status", "unresolved_critical", "criteria_unmet", "unmet_criteria",
+  "final_markdown" | None, "deliverables": [paths], "deliverables_total", "vault_path"}``. ``final_markdown`` is the
+  05-final.md body (for ``completed`` and ``completed_with_issues`` runs), truncated to ``RESULT_MAX_CHARS`` with a
+  marker; ``deliverables`` lists at most ``DELIVERABLES_MAX_LISTED`` of the ``deliverables_total`` files.
 - ``list_runs(limit: int = 20) -> [{"run_id", "status", "stage", "spent_usd", "created"}]``: read-only.
 
-``status`` is a ``RunStatus`` value. ``completed_with_issues`` means final ran only because the cross-check loop
-cap was hit, with ``unresolved_critical`` critical issues still open (the final report lists them).
+``status`` is a ``RunStatus`` value. ``completed_with_issues`` means final ran but the result is not verified: the
+cross-check loop cap was hit with ``unresolved_critical`` critical issues still open, and/or ``criteria_unmet``
+acceptance criteria (maf's own checks included: ``clean-room``, ``source-audit``, ``lint``) are not met, one line
+each in ``unmet_criteria``. The final report lists both.
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ from maf.vault import RunIndex, note_name
 log = logging.getLogger(__name__)
 
 RESULT_MAX_CHARS = 60_000
+DELIVERABLES_MAX_LISTED = 200
+"""A code run exports its whole workspace tree; ``get_run_result`` lists this many paths and the total count."""
 LIST_MAX_LIMIT = 200
 MCP_PATH = "/mcp"
 
@@ -55,8 +60,11 @@ SERVER_INSTRUCTIONS = (
     "across ChatGPT, Gemini and Claude, writing every handoff to an Obsidian vault. start_run returns a "
     "run_id immediately and the run continues in the background, often for many minutes; poll "
     "get_run_status, then call get_run_result once the status is 'completed' or 'completed_with_issues'. "
-    "'completed_with_issues' means the cross-check loop cap was reached with unresolved critical issues "
-    "(count in unresolved_critical): tell the user the result is not verified and point to its Limitations. "
+    "'completed_with_issues' means the result is not verified: the cross-check loop cap was reached with "
+    "unresolved critical issues (count in unresolved_critical), and/or acceptance criteria were not met "
+    "(count in criteria_unmet, one line each in unmet_criteria; 'clean-room' means the exported deliverables did "
+    "not rebuild from scratch, 'source-audit' that a reference was not verified on the web, 'lint' that the "
+    "deliverables link pipeline notes). Tell the user so and point to the final report's Acceptance and Limitations. "
     "'failed' and 'budget_exceeded' carry the reason in error."
 )
 
@@ -145,6 +153,8 @@ def _status_payload(index: RunIndex) -> dict[str, Any]:
         "budget_usd": index.budget_usd,
         "spend_by_agent": {agent: round(usd, 4) for agent, usd in index.spend_by_agent.items()},
         "unresolved_critical": index.unresolved_critical,
+        "criteria_unmet": index.criteria_unmet,
+        "unmet_criteria": list(index.unmet_criteria),
         "error": index.error,
         "handoffs": list(index.handoffs),
     }
@@ -175,8 +185,11 @@ def _result_payload(manager: RunManager, index: RunIndex) -> dict[str, Any]:
         "run_id": index.run_id,
         "status": index.status.value,
         "unresolved_critical": index.unresolved_critical,
+        "criteria_unmet": index.criteria_unmet,
+        "unmet_criteria": list(index.unmet_criteria),
         "final_markdown": final_markdown,
-        "deliverables": deliverables,
+        "deliverables": deliverables[:DELIVERABLES_MAX_LISTED],
+        "deliverables_total": len(deliverables),
         "vault_path": str(paths.root),
     }
 
@@ -239,7 +252,7 @@ def build_server(manager: RunManager) -> Any:
     @server.tool(annotations=read_only)
     def get_run_result(run_id: str) -> dict[str, Any]:
         """The final report (05-final body, once completed or completed_with_issues), the unresolved critical
-        count, deliverable paths and the vault folder of a run."""
+        count, the unmet acceptance criteria, deliverable paths and the vault folder of a run."""
         return _result_payload(manager, _read_index(manager, run_id))
 
     @server.tool(annotations=read_only)

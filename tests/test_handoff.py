@@ -9,10 +9,12 @@ import pytest
 from maf.handoff import (
     EMPTY_OK,
     REQUIRED_SECTIONS,
+    SOURCES_GRAMMAR,
     Handoff,
     HandoffInvalid,
     HandoffKind,
     HandoffMeta,
+    Issue,
     build_handoff,
     dump_frontmatter,
     format_spec,
@@ -21,10 +23,12 @@ from maf.handoff import (
     parse_issues,
     parse_responses,
     parse_rulings,
+    parse_sources,
     quote_untrusted,
     render_body,
     render_handoff,
     repair_prompt,
+    source_errors,
     split_sections,
     validate_body,
     validate_handoff,
@@ -523,6 +527,108 @@ def test_parse_responses_and_rulings(sample_bodies: dict[str, str]) -> None:
         parse_rulings("- GPT-1 [maybe]: x")
 
 
+def test_responses_and_rulings_accept_python_raised_ids_but_critiques_do_not() -> None:
+    responses = parse_responses("- SRC-1 [reject]: the DOI resolves\n- LINT-2 [accept]: table fixed\n- GPT-1 [accept]: ok")
+    assert [(r.id, r.stance) for r in responses] == [("SRC-1", "reject"), ("LINT-2", "accept"), ("GPT-1", "accept")]
+    assert [r.id for r in parse_rulings("- SRC-1 [fix]: the audit found no such paper\n- LINT-2 [wontfix]: fine")] == [
+        "SRC-1", "LINT-2",
+    ]
+    assert validate_body(body_of(HandoffKind.CRITIQUE, Issues="- [critical] SRC-1: critics use their own prefix"),
+                         HandoffKind.CRITIQUE)
+    assert validate_body(body_of(HandoffKind.REBUTTAL, Responses="- XYZ-1 [accept]: unknown prefix"), HandoffKind.REBUTTAL)
+    # A malformed nested SRC/LINT item is an error, never folded into its neighbour.
+    errors = validate_body(
+        body_of(HandoffKind.REBUTTAL, Responses="- GPT-1 [accept]: ok\n  - SRC-2 reject: no"), HandoffKind.REBUTTAL
+    )
+    assert errors and "SRC-2 reject" in errors[0]
+
+
+def test_issue_may_be_raised_by_maf() -> None:
+    issue = Issue(id="LINT-1", severity="major", text="`doc.md` line 3: meta-commentary", raised_by="maf")
+    assert issue.raised_by == "maf"
+    with pytest.raises(ValueError):
+        Issue(id="X-1", severity="major", text="x", raised_by="someone")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# ingestion sources
+
+GOOD_SOURCE = (
+    "- [S1] TLSF: a New Dynamic Memory Allocator\n"
+    "  - Authors: M. Masmano; I. Ripoll\n"
+    "  - Venue: Proc. ECRTS (2004): pp. 79-86\n"
+    "  - Year: 2004\n"
+    "  - DOI: https://doi.org/10.1109/EMRTS.2004.1311009\n"
+    "  - Excerpt (Section 3, Eq. (2), p. 81): \"the first level is a power of two\"\n"
+)
+
+
+def test_parse_sources_fixture_and_normalization(sample_bodies: dict[str, str]) -> None:
+    _, _, sections = split_sections(sample_bodies["ingestion"])
+    (fixture,) = parse_sources(sections["Sources"])
+    assert (fixture.id, fixture.year, fixture.doi) == ("S1", "2004", "10.1109/EMRTS.2004.1311009")
+
+    second = (
+        "\n- [S2] ITER Research Plan\n\t* authors: ITER Organization\n  - Venue: ITER technical report ITR-18-003\n"
+        "  - Year: n.d.\n  - URL: <https://www.iter.org/doc/www/content/com/Lists/ITER%20Technical%20Reports/Attachments/9>\n"
+        "  - File: inputs/irp.pdf\n  - Excerpt (Table 2.1): \u201cQ = 10 at 500 MW\u201d\n  - Excerpt (p. 12): \"a (nested): quote\"\n"
+    )
+    first, other = parse_sources(GOOD_SOURCE + second)
+    assert first.doi == "10.1109/EMRTS.2004.1311009"  # resolver prefix stripped
+    assert first.venue == "Proc. ECRTS (2004): pp. 79-86"  # parentheses and a colon in a value are fine
+    assert [(e.locator, e.quote) for e in first.excerpts] == [("Section 3, Eq. (2), p. 81", "the first level is a power of two")]
+    assert other.authors == "ITER Organization" and other.year == "n.d." and other.file == "inputs/irp.pdf"
+    assert other.url.startswith("https://www.iter.org/") and not other.url.endswith(">")
+    assert [e.quote for e in other.excerpts] == ["Q = 10 at 500 MW", "a (nested): quote"]
+    assert parse_sources("None.") == [] and source_errors("None.") == []
+    assert source_errors("") and "None." in source_errors("")[0]
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        ("- Masmano et al. (2004), TLSF", "does not start an entry `- [S<n>] <title>`"),
+        (GOOD_SOURCE + "Some prose after the list.", "line 7: 'Some prose after the list.' does not start an entry"),
+        (GOOD_SOURCE.replace("  - Year: 2004\n", ""), "entry S1 (line 1): missing Year"),
+        (GOOD_SOURCE.replace("  - Year: 2004\n", "  - Year: circa 2004\n"), "Year must be a four-digit year or n.d."),
+        (GOOD_SOURCE.replace("  - DOI: https://doi.org/10.1109/EMRTS.2004.1311009\n", ""), "at least one of DOI, URL or File"),
+        (GOOD_SOURCE.replace("https://doi.org/10.1109", "EMRTS"), "DOI must look like 10.xxxx/"),
+        (GOOD_SOURCE + "  - URL: www.example.org\n", "URL must be an http(s) URL"),
+        (GOOD_SOURCE.replace("Excerpt (Section 3, Eq. (2), p. 81)", "Excerpt"), "an Excerpt needs a locator"),
+        (GOOD_SOURCE.replace('"the first level is a power of two"', "the first level is a power of two"),
+         "must be a verbatim quote in double quotes"),
+        (GOOD_SOURCE.replace("  - Excerpt (Section 3, Eq. (2), p. 81): \"the first level is a power of two\"\n", ""),
+         "at least one Excerpt"),
+        (GOOD_SOURCE + "  - Year: 2005\n", "Year appears more than once"),
+        (GOOD_SOURCE + "  - Year (p. 1): 2004\n", "only Excerpt takes a (locator)"),
+        (GOOD_SOURCE + "  - Publisher: IEEE\n", "is not a field line"),
+        (GOOD_SOURCE + "  continued quote text\n", "is not a field line"),
+        (GOOD_SOURCE + GOOD_SOURCE, "duplicate id S1"),
+        (GOOD_SOURCE.replace("  - Authors: M. Masmano; I. Ripoll\n", "  - Authors:\n"), "Authors is empty"),
+    ],
+)
+def test_source_grammar_errors(text: str, fragment: str) -> None:
+    errors = source_errors(text)
+    assert any(fragment in e for e in errors), errors
+    with pytest.raises(HandoffInvalid) as info:
+        parse_sources(text)
+    assert info.value.kind == HandoffKind.INGESTION
+
+
+def test_source_grammar_skips_lines_under_a_bad_entry_and_allows_blank_lines() -> None:
+    assert source_errors(GOOD_SOURCE + "\n\n" + GOOD_SOURCE.replace("[S1]", "[S2]")) == []
+    errors = source_errors("- bad entry\n  - Authors: x\n  - Venue: y\n" + GOOD_SOURCE)
+    assert errors == ["'## Sources' line 1: '- bad entry' does not start an entry `- [S<n>] <title>`"]
+
+
+def test_sources_grammar_is_stage_enforced_not_validate_body() -> None:
+    """``validate_body`` keeps accepting loose Sources (hand-edited and older notes stay readable)."""
+    body = body_of(HandoffKind.INGESTION, Sources="- a site I read")
+    assert validate_body(body, HandoffKind.INGESTION) == []
+    assert source_errors("- a site I read")
+    assert validate_body(body_of(HandoffKind.INGESTION, Sources="None."), HandoffKind.INGESTION) == []
+
+
 # ---------------------------------------------------------------------------
 # prompts and quoting
 
@@ -544,8 +650,47 @@ def test_format_spec_grammars() -> None:
     assert "[accept|reject|partial]" in format_spec(HandoffKind.REBUTTAL)
     assert "[fix|wontfix]" in format_spec(HandoffKind.ADJUDICATION)
     assert "PASS" in format_spec(HandoffKind.CROSSCHECK)
-    assert "line grammar" not in format_spec(HandoffKind.STRATEGY)
+    assert "line grammar" not in format_spec(HandoffKind.ROUTING)
     assert "indented by two spaces" in format_spec(HandoffKind.REBUTTAL)
+    for kind in (HandoffKind.REBUTTAL, HandoffKind.ADJUDICATION):
+        assert "`SRC`" in format_spec(kind) and "`LINT`" in format_spec(kind)
+    assert "`SRC`" not in format_spec(HandoffKind.CRITIQUE)
+
+
+def test_strategy_format_spec_and_repair_carry_the_acceptance_criteria_grammar() -> None:
+    from maf.handoff import ACCEPTANCE_CRITERIA_GRAMMAR, CRITERION_RE, repair_prompt
+
+    spec = format_spec(HandoffKind.STRATEGY)
+    assert ACCEPTANCE_CRITERIA_GRAMMAR in spec and "`- AC-<n> [hard]: <criterion>`" in spec
+    assert "`- AC-<n> [hard|soft]: <criterion>` bullet each" in spec  # the section hint names it too
+    assert ACCEPTANCE_CRITERIA_GRAMMAR in repair_prompt(HandoffKind.STRATEGY, "## Summary\n\nx", ["missing"])
+    example = ACCEPTANCE_CRITERIA_GRAMMAR.rsplit("Example: `", 1)[1].rstrip("`")
+    assert CRITERION_RE.match(example)
+    assert ACCEPTANCE_CRITERIA_GRAMMAR not in format_spec(HandoffKind.INGESTION)
+
+
+def test_acceptance_criteria_parser_is_shared_with_the_strategy_stage(sample_bodies: dict[str, str]) -> None:
+    from maf import handoff as hf
+    from maf.stages import strategy
+
+    assert strategy.parse_acceptance_criteria is hf.parse_acceptance_criteria
+    assert strategy.Criterion is hf.Criterion and strategy.CRITERIA_SECTION == hf.ACCEPTANCE_CRITERIA
+    note = build_handoff(sample_bodies["strategy"], make_meta(HandoffKind.STRATEGY))
+    assert [c.line for c in hf.parse_acceptance_criteria(note)] == [
+        "- AC-1 [hard]: All tests pass on POSIX, FreeRTOS and QEMU.",
+        "- AC-2 [hard]: `.text` < 2048 bytes on Cortex-M3 at `-Os`.",
+    ]
+    no_section = note.model_copy(update={"sections": {k: v for k, v in note.sections.items() if k != "Acceptance Criteria"}})
+    assert hf.parse_acceptance_criteria(no_section) == []
+
+
+def test_ingestion_format_spec_and_repair_carry_the_sources_grammar() -> None:
+    spec = format_spec(HandoffKind.INGESTION)
+    assert SOURCES_GRAMMAR in spec
+    assert '- Excerpt (<locator: section, page, table, figure or equation>): "<verbatim quote>"' in spec
+    assert "cites them as\n`[S1]`" in spec or "`[S1]`" in spec
+    assert SOURCES_GRAMMAR not in format_spec(HandoffKind.STRATEGY)
+    assert SOURCES_GRAMMAR in repair_prompt(HandoffKind.INGESTION, "## Summary\n\nx", ["bad"])
 
 
 def test_repair_prompt_contents() -> None:

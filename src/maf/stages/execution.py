@@ -17,26 +17,41 @@ Mode (``ctx.index.mode``):
   ``workspace/document.md`` and replaces it in ``## Artifacts`` with the bullet ``- `document.md` - <title>``,
   so the note stays small.
 
+Both modes get ``DELIVERABLE_RULES`` in the prompt (cite only the ingestion's verified sources, never pipeline notes,
+no meta-commentary, numbers from the data, clean Markdown); code/mixed guidance adds ``EXPORT_RULES`` (what the export
+ships and how the clean room rebuilds it). After the call, ``maf.lint.lint_deliverables`` runs over the deliverable
+tree (the workspace minus ``export_excludes(settings)``, as the export and the cross-check see it). Critical and major
+findings are listed in an extra ``## Lint`` section (``LINT_SECTION``) appended to the note, and all findings are
+logged; a linter failure is logged and noted there in one line (``safe_lint``), never raised. The stage only reports them: the cross-check raises its own ``LINT`` issues from a fresh lint
+and leaves this section out of what critics and final read (``without_lint``), so each finding is counted once.
+
 Consumes ``01-ingestion``, ``02-strategy`` (possibly user-edited), and on round > 1 the previous
-``04-crosscheck[-rN]`` ``## Unresolved Critical`` + ``## Rulings``. Produces ``03-execution[-rN]``.
+``04-crosscheck[-rN]`` ``## Unresolved Critical`` + ``## Rulings``. On an extra round after final
+(``RunIndex.unmet_criteria`` is set) it also gets the unmet criteria and 05-final's ``## Acceptance`` and
+``## Clean-room Reproduction``. Produces ``03-execution[-rN]``.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 from pathlib import Path
 
 from maf import handoff as hf
+from maf import lint as _lint
 from maf import vault as _vault
 from maf.handoff import Handoff, HandoffKind
+from maf.lint import LintIssue
 from maf.prompts import render_prompt
 from maf.stages.base import (
     WORKSPACE_META_DIR,
     NoteOut,
     StageContext,
     StageOutput,
+    escape_note_tags,
+    export_excludes,
     generate_handoff,
     render_inputs,
     review_block,
@@ -45,6 +60,8 @@ from maf.stages.base import (
     write_workspace_file,
 )
 from maf.types import ExecutionMode, StageName
+
+log = logging.getLogger(__name__)
 
 PREFLIGHT_PURPOSE = "preflight"
 """Ledger ``purpose`` of the Claude Code sandbox preflight."""
@@ -57,19 +74,79 @@ PROSE_DOCUMENT = "document.md"
 
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"})
 
+EXPORT_RULES = (
+    "The whole workspace tree is exported as the deliverables, except `.maf/`, `.claude/`, `inputs/`, "
+    "`FreeRTOS-Kernel/`, version control, caches and build output (every `build/` directory, object files and "
+    "libraries such as `*.o`, `*.a`, `*.so`, `*.elf`, `a.out`, CMake state), and a fresh copy of it is rebuilt with the "
+    "README's reproduction command, with every generated file (results, logs, figures, binaries) treated as out of "
+    "date. So every file the build, the tests or the documents need must be in the tree outside those paths, "
+    "including files you add while fixing, and no command or document may use this workspace's absolute path."
+)
+"""How the code/mixed export and the clean room treat the workspace (``maf.vault.DEFAULT_EXPORT_EXCLUDES``,
+``maf.stages.final.prepare_cleanroom``): in the execution guidance and the cross-check's fix instructions."""
+
+_REPRODUCIBLE = (
+    "Write a `README.md` that documents one reproduction command (such as `make all`) which rebuilds everything and "
+    "reruns every test and result from a clean copy of the deliverables. " + EXPORT_RULES + " Run every test suite "
+    "and negative control at least 3 times, save each run's output to a log you list, and make negative controls "
+    "deterministic (fixed seeds, forced triggers), so that no run passes by luck."
+)
+
 MODE_GUIDANCE: dict[ExecutionMode, str] = {
     "code": (
         "The deliverable is software. Keep sources, build files, tests and test logs in the workspace, "
-        "and save the output of every test run you rely on to a log file you list in `## Artifacts`."
+        "and save the output of every test run you rely on to a log file you list in `## Artifacts`. "
+        + _REPRODUCIBLE
     ),
     "mixed": (
         "The deliverable is a document backed by code, simulations or plots that you actually run. "
         f"Write the document as `{PROSE_DOCUMENT}` in the workspace root (Obsidian Markdown, math as "
         "`$...$`/`$$...$$`). Save every plot as a PNG with a unique, descriptive file name under `plots/` and "
         "embed it in the document as `![[file-name.png]]`. List the document, the simulation code and every "
-        "plot in `## Artifacts`."
+        "plot in `## Artifacts`. " + _REPRODUCIBLE + " For modelling or controller work, add sensitivity and "
+        "model-mismatch studies (for example 5-10 % error in the plant model, and the modelling choices a result "
+        "depends on), and state which conclusions survive them."
     ),
 }
+
+DELIVERABLE_RULES = """## Rules for the deliverables
+
+The deliverables are read on their own, outside this pipeline. After you finish, Python lints every Markdown file in
+the workspace for the problems below, and the cross-check audits every reference on the web.
+
+- Sources: the ingestion report's `## Sources` lists the verified sources as `[S<n>]` entries with bibliographic
+  data and `Excerpt` lines. Cite only those works, by their bibliographic record (authors, title, venue, year, DOI or
+  URL) in the deliverable's own reference list, never by `[S<n>]` or a wikilink. Attribute a fact, value or formula
+  to a work only if its `Excerpt` lines show the work contains it; present anything else as your own derivation or
+  an assumption, and name the claims without a verified source in your report (the execution note's
+  `## Known Limitations`, or a fix report's `summary`).
+- Never cite, link or name the pipeline's notes in a deliverable (`[[01-ingestion]]`, `[[02-strategy]]`,
+  `[[03-execution]]`, `[[04-crosscheck]]`, "the ingestion report", source ids such as `[S1]`, any `runs/...` path),
+  and never give an AI model as a source: they are not sources and are not shipped. The source audit rates a cited
+  internal note or a work it cannot find as a critical issue, and an attribution the work does not support as a
+  major one.
+- Write every deliverable as a finished work, with no remarks about revisions, reviews, critiques, cross-checks, fix
+  rounds or acceptance criteria ("the previous revision", "as proposed in review"). Put what changed in your report
+  instead (`## Implementation Notes`, or a fix report's `summary`).
+- Every number in prose and tables must come from the data: generate interpretive text from the results, or assert
+  each quoted number against them in a test, and make sure the prose agrees with what the data shows. Never
+  hardcode a result in a template, and make a renderer fail on a missing or null value instead of printing `n/a`,
+  `None` or `nan`.
+- Markdown: no unfilled placeholders (double-brace fields, TODO, TBD, XXX); balanced `$` and `$$`; in a table row
+  write `\\lvert x \\rvert` or `\\mid` instead of `|` inside math, because every `|` splits the cell; every embed
+  and relative link resolves inside the deliverables."""
+"""Prompt block of rules for everything Claude ships: both execution prompts and the cross-check's fix pass
+(``{{deliverable_rules}}``)."""
+
+LINT_SECTION = "Lint"
+"""Extra H2 appended to the execution note when the deliverables have critical or major lint findings."""
+
+MAX_LINT_ITEMS = 40
+"""Findings listed in ``## Lint``; the rest are counted."""
+
+FINAL_VERDICT_SECTIONS: tuple[str, ...] = ("Acceptance", "Clean-room Reproduction")
+"""The 05-final sections an extra round's execution reads (``maf.stages.final.ACCEPTANCE_SECTION`` and
+``CLEANROOM_SECTION``; final imports this module, so the titles are repeated here)."""
 
 _ARTIFACT_BULLET = re.compile(r"^\s*[-*+]\s+`(?P<path>[^`\n]+)`")
 _H3 = re.compile(r"^###\s+(?P<title>\S.*?)\s*#*\s*$")
@@ -88,11 +165,18 @@ class ExecutionBackend:
             previous = _vault.note_name(HandoffKind.CROSSCHECK, ctx.round - 1)
             consumed.append(previous)
             fix_context = render_fix_context(previous, ctx.read(previous))
+            if ctx.index.unmet_criteria:  # an extra round after final: its verdicts are still in the index
+                final_name = _vault.note_name(HandoffKind.FINAL)
+                final = ctx.read(final_name) if ctx.vault.has_note(ctx.run_id, final_name) else None
+                if final is not None:
+                    consumed.append(final_name)
+                fix_context += "\n\n" + render_unmet_criteria(ctx.index.unmet_criteria, final_name, final)
         inputs = render_inputs(notes)
         if mode == "prose":
             handoff = self._run_prose(ctx, consumed, inputs, fix_context)
         else:
             handoff = self._run_code(ctx, mode, consumed, inputs, fix_context)
+        handoff = with_lint(handoff, *safe_lint(ctx))
         return StageOutput(notes=[NoteOut(_vault.note_name(HandoffKind.EXECUTION, ctx.round), handoff)])
 
     def _run_code(
@@ -104,6 +188,7 @@ class ExecutionBackend:
             "execution_code",
             round=str(ctx.round),
             mode_guidance=MODE_GUIDANCE[mode],
+            deliverable_rules=DELIVERABLE_RULES,
             toolchain=freertos_note(kernel),
             inputs=inputs,
             fix_context=fix_context,
@@ -135,6 +220,7 @@ class ExecutionBackend:
         prompt = render_prompt(
             "execution_prose",
             round=str(ctx.round),
+            deliverable_rules=DELIVERABLE_RULES,
             inputs=inputs,
             fix_context=fix_context,
             review_note=review_block(ctx.review_note),
@@ -176,6 +262,55 @@ def ensure_sandbox(ctx: StageContext) -> None:
     )
 
 
+def lint_workspace(ctx: StageContext) -> list[LintIssue]:
+    """``maf.lint.lint_deliverables`` over the deliverable tree: the workspace minus ``export_excludes(settings)``, the
+    same tree the export ships and the cross-check lints."""
+    return _lint.lint_deliverables(ctx.paths.workspace, export_excludes(ctx.settings))
+
+
+def safe_lint(ctx: StageContext) -> tuple[list[LintIssue], str]:
+    """``(lint_workspace(ctx), "")``, or ``([], "<error>")`` when the linter itself fails: logged, never raised, so a
+    linter bug cannot discard the paid execution pass (and make every resume pay for it again)."""
+    try:
+        return lint_workspace(ctx), ""
+    except Exception as exc:  # noqa: BLE001 - any linter bug
+        log.exception("execution: maf lint failed on %s", ctx.paths.workspace)
+        return [], f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+
+
+def without_lint(note: Handoff) -> tuple[str, ...]:
+    """Section titles of an execution note except ``## Lint``, for ``render_inputs``: later stages see the cross-check's
+    fresh lint instead of this pass's (possibly stale) findings, so each finding reaches them once."""
+    return tuple(title for title in note.sections if title != LINT_SECTION)
+
+
+def with_lint(handoff: Handoff, issues: list[LintIssue], error: str = "") -> Handoff:
+    """Log every finding and list the critical and major ones in a ``## Lint`` section (at most ``MAX_LINT_ITEMS``).
+    Without such findings the note is returned unchanged. ``error`` (the linter failed, ``safe_lint``) becomes a
+    one-line ``## Lint`` instead."""
+    if error:
+        text = f"maf lint failed after this pass ({error}); the cross-check lints again."
+        return with_sections(handoff, {LINT_SECTION: text})
+    found = _lint.blocking(issues)
+    if issues:
+        log.warning(
+            "execution: lint found %d critical/major and %d minor issue(s) in the workspace deliverables",
+            len(found), len(issues) - len(found),
+        )
+        for issue in issues:
+            log.info("lint: %s", issue)
+    if not found:
+        return handoff
+    lines = [f"- {issue}" for issue in found[:MAX_LINT_ITEMS]]
+    if len(found) > MAX_LINT_ITEMS:
+        lines.append(f"- ... and {len(found) - MAX_LINT_ITEMS} more")
+    intro = (
+        "maf lint found these critical and major problems in the workspace's Markdown after this pass. The "
+        "cross-check lints again and raises what remains as `LINT` issues (critics are not shown this list)."
+    )
+    return with_sections(handoff, {LINT_SECTION: intro + "\n\n" + "\n".join(lines)})
+
+
 def provision_freertos(source: Path | None, workspace: Path) -> str | None:
     """Copy the local FreeRTOS-Kernel clone to ``workspace/FREERTOS_DIR`` (Claude Code has no network).
 
@@ -210,13 +345,30 @@ def require_mode(ctx: StageContext) -> ExecutionMode:
 
 
 def render_fix_context(name: str, crosscheck: Handoff) -> str:
-    """Prompt block carrying the previous cross-check's unresolved critical issues and rulings."""
+    """Prompt block carrying the previous cross-check's unresolved critical issues and rulings, and its source audit
+    (the auditor's evidence and corrections for SRC issues, quoted) when there is one."""
     return (
         f"## Fix context from the previous cross-check ([[{name}]])\n\n"
-        "The previous pass left the critical issues below unresolved. Resolving them is the first priority "
-        "of this pass; the rulings show what the adjudicator required.\n\n"
-        + render_inputs({name: crosscheck}, {name: ("Unresolved Critical", "Rulings")})
+        "Resolving the critical issues the previous pass left unresolved (below; `None.` means there are none) is "
+        "the first priority of this pass; the rulings show what the adjudicator required, and the source audit (when "
+        "shown) gives the evidence behind each SRC issue.\n\n"
+        + render_inputs({name: crosscheck}, {name: ("Unresolved Critical", "Rulings", "Source Audit")})
     )
+
+
+def render_unmet_criteria(unmet: list[str], name: str, final: Handoff | None) -> str:
+    """Prompt block for an extra round (``maf resume --extra-round``): the acceptance criteria the last final report
+    found not met (``RunIndex.unmet_criteria``), with its verdicts and clean-room record when the note is on disk."""
+    text = (
+        f"## Acceptance criteria not met at the last final report ([[{name}]])\n\n"
+        "The run ended `completed_with_issues` because these criteria were not met. Meeting them is the other first "
+        "priority of this pass: the final report judges every criterion again afterwards, and `clean-room` means a "
+        "fresh copy of the exported deliverables did not reproduce with the README's command.\n\n"
+        + "\n".join(f"- {escape_note_tags(line)}" for line in unmet)
+    )
+    if final is not None:
+        text += "\n\n" + render_inputs({name: final}, {name: FINAL_VERDICT_SECTIONS})
+    return text
 
 
 def parse_artifact_paths(artifacts_section: str) -> list[str]:

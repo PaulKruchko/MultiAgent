@@ -1,0 +1,82 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "Checking each reference against its DOI record...",
+            "thought": true
+          },
+          {
+            "text": "{\"references\": [{\"document\": \"document.md\", \"reference\": \"[1] M. Shimada et al., Nucl. Fusion 47 (2007) S1\", \"verdict\": \"verified\", \"claims_checked\": [\"IPB98(y,2) scaling exponents\"], \"finding\": \"https://doi.org/10.1088/0029-5515/47/6/S01 is Progress in the ITER Physics Basis, Chapter 1; Table 5 gives the exponents.\", \"correction\": \"\"}, {\"document\": \"document.md\", \"reference\": \"[2] [[01-ingestion]]\", \"verdict\": \"internal_note\", \"claims_checked\": [\"Q = 10 at 500 MW\"], \"finding\": \"A wikilink to a pipeline note, not a publication.\", \"correction\": \"Cite the ITER Research Plan (ITR-18-003) instead.\"}], \"unaudited\": 0, \"summary\": \"One of two references is an internal note.\"}"
+          }
+        ],
+        "role": "model"
+      },
+      "finish_reason": "STOP",
+      "grounding_metadata": {
+        "grounding_chunks": [
+          {
+            "web": {
+              "title": "Nuclear Fusion",
+              "uri": "https://doi.org/10.1088/0029-5515/47/6/S01"
+            }
+          },
+          {
+            "web": {
+              "title": "iter.org",
+              "uri": "https://www.iter.org/mach"
+            }
+          }
+        ],
+        "grounding_supports": [
+          {
+            "grounding_chunk_indices": [
+              0
+            ],
+            "segment": {
+              "start_index": 0,
+              "end_index": 40,
+              "text": "Progress in the ITER Physics Basis"
+            }
+          }
+        ],
+        "web_search_queries": [
+          "Shimada 2007 Nuclear Fusion 47 S1",
+          "ITER Q=10 500 MW research plan"
+        ]
+      },
+      "index": 0,
+      "url_context_metadata": {
+        "url_metadata": [
+          {
+            "retrieved_url": "https://doi.org/10.1088/0029-5515/47/6/S01",
+            "url_retrieval_status": "URL_RETRIEVAL_STATUS_SUCCESS"
+          },
+          {
+            "retrieved_url": "https://www.iter.org/doc/irp.pdf",
+            "url_retrieval_status": "URL_RETRIEVAL_STATUS_SUCCESS"
+          },
+          {
+            "retrieved_url": "https://publisher.example/paywalled",
+            "url_retrieval_status": "URL_RETRIEVAL_STATUS_PAYWALL"
+          },
+          {
+            "retrieved_url": "https://gone.example/404",
+            "url_retrieval_status": "URL_RETRIEVAL_STATUS_ERROR"
+          }
+        ]
+      }
+    }
+  ],
+  "model_version": "gemini-3.8-flash",
+  "response_id": "SrcAud1tR3sp",
+  "usage_metadata": {
+    "cached_content_token_count": 0,
+    "candidates_token_count": 2500,
+    "prompt_token_count": 40000,
+    "thoughts_token_count": 1500,
+    "tool_use_prompt_token_count": 60000,
+    "total_token_count": 104000
+  }
+}

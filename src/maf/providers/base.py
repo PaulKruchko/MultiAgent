@@ -62,6 +62,10 @@ class CompletionRequest(BaseModel):
     """Gemini: enable the Google Search grounding tool. Others: ignored."""
     max_search_queries: int = 20
     """Worst-case billable search queries assumed by ``worst_case_cost`` when ``web_search``."""
+    url_context: bool = False
+    """Gemini: also enable the URL context tool, so the model can read the pages and PDFs it found or was given
+    (to quote them and to check bibliographic records). Honored only together with ``web_search``: a request
+    without search, such as a format repair, never fetches pages. Others: ignored."""
     attachments: tuple[Attachment, ...] = ()
     max_budget_usd: float | None = None
     """Claude Code only: the ``--max-budget-usd`` value. ``metered_call`` sets and clamps it."""

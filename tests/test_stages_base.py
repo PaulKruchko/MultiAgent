@@ -265,11 +265,11 @@ def test_repair_once_then_success_sums_costs(stage_env: StageEnv, sample_bodies:
     generated = generate(
         stage_env.ctx("ingestion"), "gemini", HandoffKind.INGESTION,
         system="SYS", prompt="p", to="strategy", inputs=[],
-        web_search=True, attachments=(attachment,), max_search_queries=7,
+        web_search=True, url_context=True, attachments=(attachment,), max_search_queries=7,
     )
     first, repair = stage_env.fakes.gemini.calls
-    assert first.web_search and first.attachments
-    assert not repair.web_search and repair.attachments == ()
+    assert first.web_search and first.url_context and first.attachments
+    assert not repair.web_search and not repair.url_context and repair.attachments == ()
     assert repair.system == "SYS"
     assert "did not pass validation" in prompt_of(repair)
     assert bad in prompt_of(repair)
@@ -393,16 +393,28 @@ def test_default_backends_drive_a_full_run_with_one_loop(
         clean,  # round 2 critique
     )
     fake_providers.gemini.script(sample_bodies["ingestion"], clean, clean)
+    acceptance = "\n## Acceptance\n\n- AC-1 [met]: all suites pass\n- AC-2 [met]: text=1804\n"
     fake_providers.claude.script(
         clean,
         "## Summary\n\nOk.\n\n## Responses\n\n- GPT-1 [accept]: will fix\n",
         clean,
-        sample_bodies["final"],
+        sample_bodies["final"] + acceptance,
     )
+
+    def cleanroom(_request: CompletionRequest) -> dict[str, object]:
+        from maf.stages.final import CLEANROOM_ROOT
+
+        (room,) = (settings.workspaces_path / CLEANROOM_ROOT).iterdir()  # beside the workspace, never inside it
+        assert (room / "src" / "alloc.c").is_file()  # a fresh copy of the exported deliverables
+        (room / "REPRO_LOG").write_text("make all\nok\n")
+        (room / "REPRO_EXIT").write_text("0\n")
+        return {"command": "make all", "exit_code": 0, "missing_paths": [], "log_tail": "ok"}
+
     fake_providers.claude_code.script(
         build,
         {"fixed": [], "not_fixed": [{"id": "GPT-1", "reason": "needs a redesign"}], "summary": "tried"},
         build,
+        cleanroom,
     )
 
     pipeline = Pipeline(settings, providers_factory=fake_providers.factory(), clock=lambda: fixed_now)
@@ -417,4 +429,21 @@ def test_default_backends_drive_a_full_run_with_one_loop(
     assert vault.read_handoff(index.run_id, "04-crosscheck").section("Verdict") == "LOOP"
     assert vault.read_handoff(index.run_id, "04-crosscheck-r2").section("Verdict") == "PASS"
     assert (vault.paths(index.run_id).deliverables / "src" / "alloc.c").is_file()
+    assert (index.criteria_unmet, index.unmet_criteria) == (0, [])
+    assert "- clean-room [met]:" in vault.read_handoff(index.run_id, "05-final").section("Acceptance")
     assert all(not f.replies for f in fake_providers.all())
+
+
+# ---------------------------------------------------------------------- export_excludes
+
+
+def test_export_excludes_re_include_after_the_defaults_but_never_pipeline_state(settings: Settings) -> None:
+    from maf import lint
+    from maf.vault import PROTECTED_EXPORT_EXCLUDES
+
+    assert "!" not in "".join(base.export_excludes(settings))  # no includes: the plain union
+    patterns = base.export_excludes(settings.model_copy(update={"export_include": ("build/*.cmake", "*.md")}))
+    assert patterns[-len(PROTECTED_EXPORT_EXCLUDES) :] == PROTECTED_EXPORT_EXCLUDES
+    assert not lint.excluded("build/toolchain.cmake", patterns) and lint.excluded("build/a.o", patterns)
+    assert lint.excluded(".maf/execution-r1.md", patterns) and lint.excluded("inputs/brief.md", patterns)
+    assert not lint.excluded("tests/build/notes.md", patterns)

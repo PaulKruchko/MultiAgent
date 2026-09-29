@@ -16,8 +16,9 @@ from maf.ledger import metered_call
 from maf.pipeline import ALLOWED_INDEX_UPDATES, REVIEW_NOTE_REL, Pipeline, Step, next_step
 from maf.providers import CompletionRequest, ProviderError
 from maf.stages.base import NoteOut, StageContext, StageOutput
+from maf.stages.final import CLEANROOM_ROOT, REPRO_EXIT, REPRO_LOG, cleanroom_dir
 from maf.types import STAGE_ORDER, AgentName, RunStatus, StageName
-from maf.vault import RunIndex, note_name
+from maf.vault import ExportError, ExportTooLarge, RunIndex, note_name
 
 StageFn = Callable[[StageContext], StageOutput]
 
@@ -71,6 +72,10 @@ def test_next_step_final_with_unresolved_critical_is_completed_with_issues() -> 
     assert next_step(_index(round=3, unresolved_critical=0), "final", _out(), 2) == Step(None, 3, RunStatus.COMPLETED)
 
 
+def test_next_step_final_with_unmet_criteria_is_completed_with_issues() -> None:
+    assert next_step(_index(criteria_unmet=1), "final", _out(), 2) == Step(None, 1, RunStatus.COMPLETED_WITH_ISSUES)
+
+
 def test_completed_with_issues_is_terminal_and_finished() -> None:
     status = RunStatus.COMPLETED_WITH_ISSUES
     assert status.value == "completed_with_issues"
@@ -79,7 +84,9 @@ def test_completed_with_issues_is_terminal_and_finished() -> None:
 
 
 def test_allowed_index_updates() -> None:
-    assert ALLOWED_INDEX_UPDATES == {"mode", "unresolved_critical"}
+    assert ALLOWED_INDEX_UPDATES == {
+        "mode", "unresolved_critical", "criteria_unmet", "unmet_criteria", "exported_at", "export_note"
+    }
 
 
 # --------------------------------------------------------------------------- scripted backends
@@ -365,6 +372,38 @@ def test_extra_round_only_applies_to_completed_with_issues(h: Harness, stopped: 
     with pytest.raises(ValueError, match="completed_with_issues"):
         h.pipeline.resume(run_id, extra_round=True)
     assert h.pipeline.status(run_id) == index  # nothing was written
+
+
+def test_unmet_criteria_from_final_end_completed_with_issues(h: Harness) -> None:
+    default_final = _defaults_for(h)["final"]
+
+    def unmet(ctx: StageContext) -> StageOutput:
+        output = default_final(ctx)
+        output.index_updates = {
+            "criteria_unmet": 1,
+            "unmet_criteria": ["clean-room [unmet]: Clean-room reproduction"],
+            "exported_at": ctx.now,
+            "export_note": "final: 3 file(s), 1.0 kB",
+        }
+        return output
+
+    h["final"].script = [unmet]
+    run_id = h.pipeline.create("x").run_id
+    messages: list[str] = []
+
+    index = h.pipeline.run(run_id, progress=lambda _i, m: messages.append(m))
+
+    assert index.status == RunStatus.COMPLETED_WITH_ISSUES
+    assert (index.unresolved_critical, index.criteria_unmet) == (0, 1)
+    assert index.unmet_criteria == ["clean-room [unmet]: Clean-room reproduction"]
+    assert index.export_note == "final: 3 file(s), 1.0 kB" and index.exported_at is not None
+    assert messages[-1].startswith("final done; run completed with issues: 1 acceptance criterion not met (clean-room)")
+    assert h.pipeline.status(run_id) == index
+
+    # One more pass whose final meets everything clears the fields and completes the run.
+    again = h.pipeline.resume(run_id, extra_round=True)
+    assert again.status == RunStatus.COMPLETED, again.error
+    assert (again.round, again.criteria_unmet, again.unmet_criteria) == (2, 0, [])
 
 
 def test_single_loop_then_pass(h: Harness) -> None:
@@ -706,6 +745,58 @@ def test_second_concurrent_run_of_same_id_is_rejected(h: Harness) -> None:
     assert results and results[0].status == RunStatus.COMPLETED
 
 
+# --------------------------------------------------------------------------- export (maf export)
+
+
+def test_export_rewrites_deliverables_and_notes_it_without_model_calls(h: Harness) -> None:
+    run_id = h.pipeline.run(h.pipeline.create("x").run_id).run_id  # scripted stages: mode code, completed
+    paths = h.pipeline.vault.paths(run_id)
+    (paths.workspace / "src").mkdir()
+    (paths.workspace / "src" / "alloc.c").write_text("int x;\n")
+    (paths.workspace / ".maf").mkdir(exist_ok=True)
+    (paths.workspace / ".maf" / "prompt.md").write_text("p")
+    before = h.pipeline.status(run_id)
+
+    index, export = h.pipeline.export(run_id)
+
+    assert (paths.deliverables / "src" / "alloc.c").read_text() == "int x;\n"
+    assert not (paths.deliverables / ".maf").exists()
+    assert export.files == 1 and export.tree is not None and export.tree.files == ("src/alloc.c",)
+    assert index.export_note == "maf export: 1 file(s), 7 B"
+    assert index.exported_at == index.updated and index.updated > before.updated
+    assert index.model_copy(update={"exported_at": None, "export_note": None, "updated": before.updated}) == before
+    assert h.pipeline.status(run_id) == index
+    assert all(not f.calls for f in h.fakes.all())
+
+
+def test_export_honours_settings_excludes_and_cap(h: Harness) -> None:
+    run_id = h.pipeline.run(h.pipeline.create("x").run_id).run_id
+    workspace = h.pipeline.vault.paths(run_id).workspace
+    (workspace / "a.log").write_text("log")
+    (workspace / "b.c").write_text("c" * 100)
+    h.settings = h.settings.model_copy(update={"export_exclude": ("*.log",), "export_max_mb": 0.001})
+    pipeline = h.make_pipeline()
+    assert pipeline.export(run_id)[1].tree.files == ("b.c",)  # type: ignore[union-attr]
+    h.settings = h.settings.model_copy(update={"export_max_mb": 0.00001})
+    with pytest.raises(ExportTooLarge):
+        h.make_pipeline().export(run_id)
+    assert h.pipeline.status(run_id).export_note == "maf export: 1 file(s), 100 B; excluded: a.log"  # the refused export wrote nothing
+
+
+def test_export_refuses_runs_without_a_mode_and_busy_runs(h: Harness) -> None:
+    fresh = h.pipeline.create("x").run_id
+    with pytest.raises(ExportError, match="no execution mode"):
+        h.pipeline.export(fresh)
+    assert h.pipeline.status(fresh).exported_at is None
+    with pytest.raises(FileNotFoundError):
+        h.pipeline.export("2026-09-28-nope")
+
+    done = h.pipeline.run(h.pipeline.create("y").run_id).run_id
+    with h.make_pipeline()._guard(done):
+        with pytest.raises(RuntimeError, match="already running"):
+            h.pipeline.export(done)
+
+
 def test_notes_are_persisted_before_run_md(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
     order: list[str] = []
     vault = h.pipeline.vault
@@ -779,8 +870,20 @@ def _kind_of(request: CompletionRequest) -> str:
     raise AssertionError(f"cannot tell what this request wants: {prompt[:200]!r}")
 
 
-def _script_real_run(fakes, bodies: dict[str, str], *, unfixed_rounds: int) -> dict[str, list[str]]:  # type: ignore[no-untyped-def]
-    """Script all four fakes by request content. GPT-1 (critical) stays unfixed for ``unfixed_rounds`` rounds."""
+ACCEPTANCE = "## Acceptance\n\n- AC-1 [met]: all suites pass\n- AC-2 [met]: text=1804\n"
+
+
+def _cleanroom(settings: Settings, exit_code: int = 0) -> dict[str, object]:
+    """The clean-room session of the (single) run under ``settings.workspaces_path``."""
+    (workspace,) = [p for p in settings.workspaces_path.iterdir() if p.name != CLEANROOM_ROOT]
+    (cleanroom_dir(workspace) / REPRO_LOG).write_text("make all\n")
+    (cleanroom_dir(workspace) / REPRO_EXIT).write_text(f"{exit_code}\n")
+    return {"command": "make all", "exit_code": exit_code, "missing_paths": [], "log_tail": "ok"}
+
+
+def _script_real_run(fakes, bodies: dict[str, str], *, unfixed_rounds: int, settings: Settings) -> dict[str, list[str]]:  # type: ignore[no-untyped-def]
+    """Script all four fakes by request content. GPT-1 (critical) stays unfixed for ``unfixed_rounds`` rounds; the
+    final note meets both criteria and the clean room rebuilds the export."""
     seen: dict[str, list[str]] = {"chatgpt": [], "gemini": [], "claude": [], "claude_code": []}
     fix_rounds = {"n": 0}
     triage = {
@@ -821,6 +924,8 @@ def _script_real_run(fakes, bodies: dict[str, str], *, unfixed_rounds: int) -> d
                 "## Summary\n\nAnswered.\n\n## Responses\n\n- GPT-1 [accept]: will fix\n"
                 "- GEM-1 [reject]: cosmetic\n- CLA-1 [accept]: will fix\n"
             )
+        if kind == "final":
+            return f"{bodies['final'].rstrip()}\n\n{ACCEPTANCE}"
         return bodies[kind]
 
     def claude_code(req: CompletionRequest) -> str | dict[str, object]:
@@ -831,6 +936,8 @@ def _script_real_run(fakes, bodies: dict[str, str], *, unfixed_rounds: int) -> d
             if fix_rounds["n"] <= unfixed_rounds:
                 return {"fixed": ["CLA-1"], "not_fixed": [{"id": "GPT-1", "reason": "needs redesign"}], "summary": "partial"}
             return {"fixed": ["GPT-1", "CLA-1"], "not_fixed": [], "summary": "all fixed"}
+        if kind == "cleanroom":
+            return _cleanroom(settings)
         return bodies[kind]
 
     fakes.chatgpt.default = chatgpt
@@ -858,7 +965,7 @@ def _seed_workspace(pipeline: Pipeline, run_id: str) -> None:
 
 
 def test_end_to_end_with_real_backends(settings: Settings, fake_providers, sample_bodies: dict[str, str]) -> None:  # type: ignore[no-untyped-def]
-    seen = _script_real_run(fake_providers, sample_bodies, unfixed_rounds=0)
+    seen = _script_real_run(fake_providers, sample_bodies, unfixed_rounds=0, settings=settings)
     pipeline = _real_pipeline(settings, fake_providers)
     run_id = pipeline.create("Portable small-memory allocator").run_id
     _seed_workspace(pipeline, run_id)
@@ -876,7 +983,8 @@ def test_end_to_end_with_real_backends(settings: Settings, fake_providers, sampl
     crosscheck = pipeline.vault.read_handoff(run_id, "04-crosscheck")
     assert crosscheck.section("Verdict").strip() == "PASS"
     assert seen["chatgpt"][:2] == ["triage", "strategy"]
-    assert seen["claude_code"] == ["execution", "fix_report"]
+    assert seen["claude_code"] == ["execution", "fix_report", "cleanroom"]
+    assert (pipeline.vault.paths(run_id).deliverables / "src" / "alloc.c").is_file()
     # Every call went through the ledger and is mirrored into run.md.
     calls = sum(len(f.calls) for f in fake_providers.all())
     assert calls == len(pipeline.ledger_for(index).entries)
@@ -885,7 +993,7 @@ def test_end_to_end_with_real_backends(settings: Settings, fake_providers, sampl
 
 
 def test_end_to_end_crosscheck_loop_with_real_backends(settings: Settings, fake_providers, sample_bodies: dict[str, str]) -> None:  # type: ignore[no-untyped-def]
-    seen = _script_real_run(fake_providers, sample_bodies, unfixed_rounds=1)
+    seen = _script_real_run(fake_providers, sample_bodies, unfixed_rounds=1, settings=settings)
     pipeline = _real_pipeline(settings, fake_providers)
     run_id = pipeline.create("Portable small-memory allocator").run_id
     _seed_workspace(pipeline, run_id)
@@ -896,11 +1004,11 @@ def test_end_to_end_crosscheck_loop_with_real_backends(settings: Settings, fake_
     assert pipeline.vault.read_handoff(run_id, "04-crosscheck").section("Verdict").strip() == "LOOP"
     assert pipeline.vault.read_handoff(run_id, "04-crosscheck-r2").section("Verdict").strip() == "PASS"
     assert "03-execution-r2" in index.handoffs
-    assert seen["claude_code"] == ["execution", "fix_report", "execution", "fix_report"]
+    assert seen["claude_code"] == ["execution", "fix_report", "execution", "fix_report", "cleanroom"]
 
 
 def test_end_to_end_review_gate_with_real_backends(settings: Settings, fake_providers, sample_bodies: dict[str, str]) -> None:  # type: ignore[no-untyped-def]
-    _script_real_run(fake_providers, sample_bodies, unfixed_rounds=0)
+    _script_real_run(fake_providers, sample_bodies, unfixed_rounds=0, settings=settings)
     pipeline = _real_pipeline(settings, fake_providers)
     run_id = pipeline.create("Portable small-memory allocator", review=True).run_id
     _seed_workspace(pipeline, run_id)

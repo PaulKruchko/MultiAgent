@@ -7,8 +7,9 @@ re-running the recorded ``stage`` (stages are idempotent). Transitions (``next_s
 
     ingestion -> strategy -> [review gate if index.review] -> execution -> crosscheck
     crosscheck --loop_back and round <= max_crosscheck_loops--> execution (round += 1)
-    crosscheck --pass, or loops exhausted--> final -> COMPLETED (unresolved_critical == 0)
-                                                   -> COMPLETED_WITH_ISSUES (loops exhausted, unresolved_critical > 0)
+    crosscheck --pass, or loops exhausted--> final -> COMPLETED (unresolved_critical == 0 and criteria_unmet == 0)
+                                                   -> COMPLETED_WITH_ISSUES (unresolved_critical > 0: loops exhausted;
+                                                      or criteria_unmet > 0: acceptance criteria or clean-room not met)
 
 Review gate: after strategy with ``review=True``, the status becomes AWAITING_REVIEW with ``stage="execution"``.
 ``resume(run_id, note=...)`` re-reads 02-strategy.md (the user may have edited it in Obsidian),
@@ -16,6 +17,8 @@ re-validates it (invalid means FAILED with the errors, and the user can fix and 
 and continues.
 
 COMPLETED and COMPLETED_WITH_ISSUES are both terminal: ``run`` and ``resume`` return them unchanged.
+``export(run_id)`` (``maf export``) rewrites ``deliverables/`` from the workspace at any status, under the run lock,
+with no model calls, and records it in run.md (``exported_at``, ``export_note``).
 ``resume(run_id, extra_round=True)`` is the one way to continue a COMPLETED_WITH_ISSUES run: it schedules one
 more execution + crosscheck pass (round + 1, reading the last cross-check's unresolved issues) and then final
 again. The loop cap still applies, so a pass that leaves critical issues open goes straight to final.
@@ -42,7 +45,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -52,7 +55,10 @@ from maf.ledger import BudgetExceeded, Ledger
 from maf.providers import ProviderError, Providers
 from maf.stages.base import StageBackend, StageContext, StageOutput
 from maf.types import STAGE_ORDER, RunStatus, StageName, Tier
-from maf.vault import RunIndex, RunPaths, Vault, atomic_write_text, note_name
+from maf.vault import RunIndex, RunPaths, Vault, atomic_write_text, describe_issues, note_name
+
+if TYPE_CHECKING:
+    from maf.stages.final import Export
 
 log = logging.getLogger(__name__)
 
@@ -64,7 +70,11 @@ Clock = Callable[[], datetime]
 ProgressFn = Callable[[RunIndex, str], None]
 """Optional observer: called with the current index and a one-line human-readable message."""
 
-ALLOWED_INDEX_UPDATES: frozenset[str] = frozenset({"mode", "unresolved_critical"})
+ALLOWED_INDEX_UPDATES: frozenset[str] = frozenset(
+    {"mode", "unresolved_critical", "criteria_unmet", "unmet_criteria", "exported_at", "export_note"}
+)
+"""``StageOutput.index_updates`` keys the pipeline applies: ``mode`` (ingestion), ``unresolved_critical``
+(crosscheck), and the final stage's acceptance and export fields."""
 
 REVIEW_NOTE_REL = Path(".maf") / "review-note.md"
 """Workspace-relative location of the persisted ``resume --note`` text."""
@@ -98,11 +108,12 @@ def next_step(index: RunIndex, finished: StageName, output: StageOutput, max_loo
     - After crosscheck with ``loop_back`` and ``index.round <= max_loops``: ``Step("execution", round+1, RUNNING)``.
     - After crosscheck otherwise: ``Step("final", round, RUNNING)``.
     - After final: ``Step(None, round, COMPLETED)``, or ``COMPLETED_WITH_ISSUES`` when ``index.unresolved_critical > 0``
-      (final was reached only because the loop cap was hit).
+      (final was reached only because the loop cap was hit) or ``index.criteria_unmet > 0`` (acceptance criteria,
+      including the clean-room reproduction, not met).
     - Otherwise the next stage in ``STAGE_ORDER``, RUNNING.
     """
     if finished == "final":
-        status = RunStatus.COMPLETED_WITH_ISSUES if index.unresolved_critical > 0 else RunStatus.COMPLETED
+        status = RunStatus.COMPLETED_WITH_ISSUES if index.has_issues else RunStatus.COMPLETED
         return Step(None, index.round, status)
     if finished == "strategy" and index.review:
         return Step("execution", index.round, RunStatus.AWAITING_REVIEW)
@@ -318,6 +329,24 @@ class Pipeline:
             self.vault.write_index(index)
             return self._advance(index, progress)
 
+    def export(self, run_id: str) -> tuple[RunIndex, Export]:
+        """Rewrite ``deliverables/`` from the run's workspace with the final stage's export
+        (``maf.stages.final.export_run``, excludes ``export_excludes(settings)``, cap ``settings.export_max_bytes``) and
+        record it in run.md (``exported_at``, ``export_note`` ``maf export: ...``). The status is unchanged and no model
+        is called. Raises ``FileNotFoundError`` for an unknown run, ``RuntimeError`` if the run is being advanced,
+        ``maf.vault.ExportError`` (``ExportTooLarge`` included) when the export is refused, leaving run.md as it was."""
+        from maf.stages.final import export_excludes, export_run
+
+        with self._guard(run_id):
+            index = self.vault.read_index(run_id)
+            export = export_run(
+                self.vault, index, excludes=export_excludes(self.settings), max_bytes=self.settings.export_max_bytes
+            )
+            index.exported_at = index.updated = self.clock()
+            index.export_note = f"maf export: {export.describe()}"
+            self.vault.write_index(index)
+            return index, export
+
     def fail_orphans(self, *, grace_s: float = ORPHAN_GRACE_S) -> list[str]:
         """Mark FAILED every run left PENDING or RUNNING by a process that is gone: its run lock is free and
         run.md has not changed for ``grace_s`` seconds. Returns the affected run ids. Never spends money:
@@ -498,7 +527,9 @@ class Pipeline:
         return output
 
     def _persist(self, index: RunIndex, stage: StageName, output: StageOutput, ledger: Ledger) -> RunIndex:
-        """Notes, then handoffs, then allowed index updates, then ledger totals, then run.md."""
+        """Notes, then handoffs, then allowed index updates, then ledger totals, then run.md. The previous pass's
+        ``criteria_unmet``/``unmet_criteria`` stay in the index (an extra round's execution can read them) until final
+        runs again and replaces them."""
         for note in output.notes:
             self.vault.write_handoff(index.run_id, note.name, note.handoff)
 
@@ -506,7 +537,10 @@ class Pipeline:
         for note in output.notes:
             if note.name not in updated.handoffs:
                 updated.handoffs.append(note.name)
-        updated = self._apply_updates(updated, output.index_updates)
+        updates = output.index_updates
+        if stage == "final":  # final judges the criteria afresh: a key it leaves out means nothing is unmet
+            updates = {"criteria_unmet": 0, "unmet_criteria": [], **updates}
+        updated = self._apply_updates(updated, updates)
         self._mirror(updated, ledger)
 
         step = next_step(updated, stage, output, self.settings.max_crosscheck_loops)
@@ -563,10 +597,7 @@ class Pipeline:
         if index.status == RunStatus.COMPLETED:
             return f"{stage} done; run completed ({spend})"
         if index.status == RunStatus.COMPLETED_WITH_ISSUES:
-            return (
-                f"{stage} done; run completed with issues: {index.unresolved_critical} unresolved critical "
-                f"issue(s) after the cross-check loop cap ({spend})"
-            )
+            return f"{stage} done; run completed with issues: {describe_issues(index)} ({spend})"
         if index.status == RunStatus.AWAITING_REVIEW:
             return f"{stage} done; awaiting review of 02-strategy ({spend})"
         return f"{stage} done; next {index.stage} round {index.round} ({spend})"

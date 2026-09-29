@@ -143,7 +143,9 @@ class StageOutput:
 
     notes: list[NoteOut]
     index_updates: dict[str, Any] = field(default_factory=dict)
-    """Allowed keys: ``mode`` (ingestion), ``unresolved_critical`` (crosscheck). Others are rejected by the pipeline."""
+    """Allowed keys (``maf.pipeline.ALLOWED_INDEX_UPDATES``): ``mode`` (ingestion), ``unresolved_critical``
+    (crosscheck), ``criteria_unmet``, ``unmet_criteria``, ``exported_at``, ``export_note`` (final). Others are rejected by
+    the pipeline."""
     loop_back: bool = False
     """Crosscheck only: True means go back to execution (the pipeline enforces ``max_crosscheck_loops``)."""
     deliverables: list[Path] = field(default_factory=list)
@@ -215,8 +217,10 @@ def generate(
         log.warning("%s handoff from %s invalid, repairing: %s", kind, role, exc)
         errors = exc.errors
 
-    # The repair only fixes the format: web search and attachments were used already, so drop them.
-    repair_kw = {k: v for k, v in request_kw.items() if k not in ("web_search", "attachments", "max_search_queries")}
+    # The repair only fixes the format: web search, fetched pages and attachments were used already, so drop them.
+    repair_kw = {
+        k: v for k, v in request_kw.items() if k not in ("web_search", "url_context", "attachments", "max_search_queries")
+    }
     repair = ctx.call(
         role,
         CompletionRequest.simple(
@@ -296,6 +300,19 @@ def _build_checked(
         if errors:
             raise HandoffInvalid(kind, errors)
     return handoff
+
+
+def export_excludes(settings: Settings) -> tuple[str, ...]:
+    """Exclude patterns of the deliverable tree, in ``maf.lint.excluded`` order: ``maf.vault.DEFAULT_EXPORT_EXCLUDES``
+    and ``Settings.export_exclude``, then ``Settings.export_include`` as ``!`` re-includes, then
+    ``maf.vault.PROTECTED_EXPORT_EXCLUDES`` again, so no re-include reaches pipeline state or the user's inputs. It is
+    what a code/mixed export leaves out of ``deliverables/``, and so what the execution and cross-check lint and the
+    source audit skip. Lint and audit see exactly what ships: a link into ``inputs/`` or ``FreeRTOS-Kernel/`` does not
+    resolve in the export, so it is broken."""
+    excludes = dict.fromkeys((*_vault.DEFAULT_EXPORT_EXCLUDES, *settings.export_exclude))
+    if not settings.export_include:
+        return tuple(excludes)
+    return (*excludes, *(f"!{p}" for p in settings.export_include), *_vault.PROTECTED_EXPORT_EXCLUDES)
 
 
 def default_output_tokens(settings: Settings, role: ModelRole) -> int:

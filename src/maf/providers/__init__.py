@@ -44,8 +44,9 @@ def build_providers(settings: Settings, workspace: Path) -> Providers:
     """Construct real adapters (lazy SDK clients, no network at construction).
     ``claude_code`` is bound to ``workspace`` with ``settings.claude_code_tools`` and may not read the vault
     or ``SENSITIVE_READ_PATHS`` (stages copy what it needs into the prompt); the configured
-    Python's ``bin`` directory goes first on its ``PATH`` so ``python`` resolves to the project venv, and its short
-    private ``TMPDIR`` lives under ``settings.claude_code_tmp_base``."""
+    Python's ``bin`` directory goes first on its ``PATH`` so ``python`` resolves to the project venv, its short
+    private ``TMPDIR`` lives under ``settings.claude_code_tmp_base``, and its Bash commands may run up to
+    ``settings.bash_timeout_s``."""
     timeout = settings.provider_timeout_s
     python_bin = settings.python_executable.parent
     return Providers(
@@ -62,6 +63,7 @@ def build_providers(settings: Settings, workspace: Path) -> Providers:
             turn_context_tokens=settings.claude_code_turn_context_tokens,
             turn_output_tokens=settings.claude_code_turn_output_tokens,
             tmp_base=settings.claude_code_tmp_base,
+            bash_timeout_s=settings.bash_timeout_s,
         ),
     )
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from maf.types import AgentName, StageName, Tier, Usage
 
@@ -204,6 +204,29 @@ DEFAULT_CLAUDE_CODE_TOOLS: tuple[str, ...] = (
 scoped to the workspace (``./**`` is relative to Claude Code's cwd); a bare ``Read``/``Edit``/``Write`` rule
 would match every path and is rejected by ``ClaudeCodeProvider``."""
 
+DEFAULT_EXPORT_EXCLUDE: tuple[str, ...] = (
+    ".maf",
+    ".git",
+    "FreeRTOS-Kernel",
+    "__pycache__",
+    "*.pyc",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".DS_Store",
+)
+"""Workspace paths never exported to ``deliverables/``: pipeline metadata, caches, the provisioned FreeRTOS kernel.
+The export always adds ``maf.vault.DEFAULT_EXPORT_EXCLUDES`` (so ``inputs/``, ``.claude/`` and build output are not
+exported either; the clean-room check copies ``inputs/`` and the kernel back in), and lint and the source audit skip
+the same paths (``maf.stages.base.export_excludes``)."""
+
+
+BASH_TIMEOUT_SHARE = 0.75
+"""Default ``Settings.bash_timeout_s`` as a share of ``claude_code_timeout_s``."""
+
 
 class Settings(BaseModel):
     """Fully resolved run-independent configuration."""
@@ -225,6 +248,11 @@ class Settings(BaseModel):
     output_limits: OutputLimits = Field(default_factory=OutputLimits)
     claude_code_tools: tuple[str, ...] = DEFAULT_CLAUDE_CODE_TOOLS
     claude_code_timeout_s: float = 3600.0
+    claude_code_bash_timeout_s: float | None = Field(default=None, gt=0)
+    """Longest timeout of one Bash command in a Claude Code session (``BASH_MAX_TIMEOUT_MS``; the CLI's own cap is 10
+    minutes), so a long simulation, QEMU battery or clean-room reproduction is not killed before it finishes. None
+    means 75 % of ``claude_code_timeout_s`` (``bash_timeout_s``), leaving the session time to read the log and report;
+    a value must stay below ``claude_code_timeout_s``."""
     claude_code_turn_context_tokens: int = Field(default=200_000, gt=0)
     claude_code_turn_output_tokens: int = Field(default=64_000, gt=0)
     """Size of one Claude Code model turn. The CLI checks ``--max-budget-usd`` between turns, so the price of
@@ -245,6 +273,29 @@ class Settings(BaseModel):
     """Local FreeRTOS-Kernel clone, copied into ``<workspace>/FreeRTOS-Kernel`` before code-mode execution
     (Claude Code has no network). None or a missing directory means no kernel is provisioned."""
 
+    export_exclude: tuple[str, ...] = DEFAULT_EXPORT_EXCLUDE
+    """Case-sensitive ``fnmatch`` patterns of workspace paths that are neither exported to ``deliverables/`` nor
+    linted nor audited, on top of ``maf.vault.DEFAULT_EXPORT_EXCLUDES``. A pattern matches any component of the
+    workspace-relative POSIX path or a leading part of it (``maf.lint.excluded``): ``.git`` and ``*.pyc`` match at any
+    depth, ``build/tmp`` only at the workspace root. Empty, absolute and ``!`` patterns are refused (re-including is
+    ``export_include``)."""
+    export_include: tuple[str, ...] = ()
+    """Patterns (same form) of workspace paths to ship although an exclude pattern matches them, such as a hand-written
+    ``build/toolchain.cmake`` (``build/*.cmake``) or ``build/package/*``. Applied after ``export_exclude`` and the
+    defaults, like a gitignore's ``!`` lines, but never to pipeline state, the kernel, ``inputs/`` or version control
+    (``maf.vault.PROTECTED_EXPORT_EXCLUDES``). As in a gitignore, nothing below a directory excluded as a whole
+    (``node_modules``) comes back unless the pattern names a path in it."""
+    export_max_mb: float = Field(default=200.0, gt=0)
+    """Cap on the exported deliverable tree, in MiB (``export_max_bytes``)."""
+    cleanroom_budget_usd: float = Field(default=1.5, gt=0)
+    """``--max-budget-usd`` of the clean-room check, which rebuilds the exported deliverables in a fresh copy with the
+    README's reproduction command."""
+    source_audit: bool = True
+    """Have Gemini (web search) verify the references cited by document deliverables. Strategy then requires a hard
+    acceptance criterion that every reference passes the audit."""
+    source_audit_max_refs: int = Field(default=60, gt=0)
+    """Most references one source audit checks; the rest are reported as unaudited."""
+
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8765
     mcp_inbox: Path | None = Field(default_factory=lambda: Path.home() / "MultiAgent" / "inbox")
@@ -263,6 +314,38 @@ class Settings(BaseModel):
         if not value.is_absolute():
             raise ValueError(f"claude_code_tmp_base must be an absolute path, got {str(value)!r}")
         return value
+
+    @field_validator("export_exclude", "export_include")
+    @classmethod
+    def _relative_patterns(cls, value: tuple[str, ...], info: ValidationInfo) -> tuple[str, ...]:
+        patterns = tuple(p.strip() for p in value)
+        for pattern in patterns:
+            if not pattern or pattern.startswith(("/", "!")):
+                raise ValueError(
+                    f"{info.field_name} patterns must be non-empty, workspace-relative and without '!', got {pattern!r}"
+                )
+        return patterns
+
+    @model_validator(mode="after")
+    def _bash_timeout_below_session_timeout(self) -> Settings:
+        bash = self.claude_code_bash_timeout_s
+        if bash is not None and bash >= self.claude_code_timeout_s:
+            raise ValueError(
+                f"claude_code_bash_timeout_s ({self.claude_code_bash_timeout_s:g}) must be below claude_code_timeout_s "
+                f"({self.claude_code_timeout_s:g}), or the session is killed before its command times out"
+            )
+        return self
+
+    @property
+    def bash_timeout_s(self) -> float:
+        """``claude_code_bash_timeout_s``, or 75 % of ``claude_code_timeout_s`` when unset."""
+        if self.claude_code_bash_timeout_s is not None:
+            return self.claude_code_bash_timeout_s
+        return BASH_TIMEOUT_SHARE * self.claude_code_timeout_s
+
+    @property
+    def export_max_bytes(self) -> int:
+        return int(self.export_max_mb * 1024 * 1024)
 
     @property
     def mcp_budget_ceiling_usd(self) -> float:

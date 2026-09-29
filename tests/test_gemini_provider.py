@@ -22,7 +22,7 @@ from maf.providers.base import (
     StructuredOutputError,
     estimate_request_tokens,
 )
-from maf.providers.gemini_provider import GeminiProvider
+from maf.providers.gemini_provider import URL_CONTEXT_TOKEN_ALLOWANCE, GeminiProvider, citations_from_url_context
 from maf.types import Usage
 
 ON = date(2026, 9, 28)
@@ -398,3 +398,95 @@ def test_worst_case_cost_includes_search_fees_only_with_search() -> None:
     assert provider.worst_case_cost(plain) == pytest.approx(base)
     searching = _req(web_search=True, max_search_queries=10)
     assert provider.worst_case_cost(searching) == pytest.approx(base + 10 * p.search_query_usd)
+
+
+# --- URL context ---------------------------------------------------------------------------------
+
+AUDIT_SCHEMA = {
+    "type": "object",
+    "properties": {"references": {"type": "array"}, "unaudited": {"type": "integer"}, "summary": {"type": "string"}},
+    "required": ["references", "unaudited", "summary"],
+}
+
+
+def _rejection(message: str) -> errors.ClientError:
+    return errors.ClientError(400, {"error": {"code": 400, "message": message, "status": "INVALID_ARGUMENT"}})
+
+
+def test_build_config_url_context_rides_on_search() -> None:
+    config = GeminiProvider.build_config(_req(web_search=True, url_context=True, json_schema=SCHEMA))
+    assert config["tools"] == [{"google_search": {}}, {"url_context": {}}]
+    sdk = types.GenerateContentConfig(**config)
+    assert sdk.tools is not None and sdk.tools[0].google_search is not None
+    assert sdk.tools[1].url_context == types.UrlContext() and sdk.tools[1].google_search is None
+    # Without search (a format repair drops it) no page is ever fetched.
+    assert "tools" not in GeminiProvider.build_config(_req(url_context=True))
+
+
+def test_worst_case_cost_adds_the_url_context_allowance_only_with_search() -> None:
+    provider = GeminiProvider(today=lambda: ON)
+    rate = price_for(MODEL, ON).input_per_mtok
+    searching = provider.worst_case_cost(_req(web_search=True))
+    assert provider.worst_case_cost(_req(web_search=True, url_context=True)) == pytest.approx(
+        searching + URL_CONTEXT_TOKEN_ALLOWANCE * rate / 1e6
+    )
+    assert provider.worst_case_cost(_req(url_context=True)) == pytest.approx(provider.worst_case_cost(_req()))
+
+
+def test_to_result_source_audit_fixture_with_grounding_and_url_context() -> None:
+    req = _req(json_schema=AUDIT_SCHEMA, web_search=True, url_context=True)
+    result = GeminiProvider.to_result(load_provider_fixture("gemini_source_audit"), req, on=ON)
+    assert result.parsed is not None
+    assert [r["verdict"] for r in result.parsed["references"]] == ["verified", "internal_note"]
+    # Fetched pages are billed as tool-use prompt tokens, which count as input.
+    assert result.usage == Usage(
+        input_tokens=40_000 + 60_000, output_tokens=2_500 + 1_500, reasoning_tokens=1_500, search_queries=2
+    )
+    assert result.cost_usd == pytest.approx(_cost(result.usage))
+    # Search sources first; then pages the URL context tool actually read (paywalled and failed ones left out).
+    assert result.citations == (
+        Citation(title="Nuclear Fusion", uri="https://doi.org/10.1088/0029-5515/47/6/S01"),
+        Citation(title="iter.org", uri="https://www.iter.org/mach"),
+        Citation(title="", uri="https://www.iter.org/doc/irp.pdf"),
+    )
+
+
+def test_citations_from_url_context_handles_missing_metadata() -> None:
+    assert citations_from_url_context(None) == ()
+    meta = {"url_metadata": [{"retrieved_url": "https://a.example"}, {"url_retrieval_status": "URL_RETRIEVAL_STATUS_SUCCESS"}]}
+    assert citations_from_url_context(meta) == ()
+
+
+def test_url_context_rejection_drops_the_tool_keeps_search_and_remembers() -> None:
+    provider, client = _provider(
+        [_rejection("Tool url_context is not supported for this model."), _response("gemini_search"), _response("gemini_search")]
+    )
+    req = _req(web_search=True, url_context=True)
+    assert len(provider.complete(req).citations) == 2
+    first, second = (call["config"] for call in client.models.calls)
+    assert [t.url_context is not None for t in first.tools] == [False, True]
+    assert len(second.tools) == 1 and second.tools[0].google_search is not None
+    provider.complete(req)  # later calls skip the tool straight away
+    assert len(client.models.calls) == 3 and len(client.models.calls[2]["config"].tools) == 1
+
+
+def test_url_context_and_schema_rejections_fall_back_one_step_each() -> None:
+    provider, client = _provider(
+        [
+            _rejection("url_context is unsupported in this configuration"),
+            _rejection("Tool use with a response mime type: 'application/json' is unsupported"),
+            _response("gemini_json"),
+        ]
+    )
+    result = provider.complete(_req(json_schema=SCHEMA, web_search=True, url_context=True))
+    assert result.parsed == {"sources": ["a.pdf"], "facts": ["x"]}
+    configs = [call["config"] for call in client.models.calls]
+    assert [len(c.tools) for c in configs] == [2, 1, 1]
+    assert [c.response_json_schema is not None for c in configs] == [True, True, False]
+
+
+def test_url_context_rejection_is_a_plain_error_when_the_tool_was_not_requested() -> None:
+    provider, client = _provider([_rejection("url_context is unsupported")])
+    with pytest.raises(ProviderError, match="400") as info:
+        provider.complete(_req(web_search=True))
+    assert not info.value.retryable and len(client.models.calls) == 1

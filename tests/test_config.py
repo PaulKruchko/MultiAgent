@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from maf.config import (
+    DEFAULT_EXPORT_EXCLUDE,
     PRICE_TABLE,
     TIER_MODELS,
     ModelPrice,
@@ -280,6 +281,15 @@ def test_unknown_override_rejected(tmp_path: Path) -> None:
         ("stage_model_overrides:\n  nosuchstage:\n    chatgpt: x\n", "invalid settings"),
         ("claude_code_tmp_base: tmp\n", "must be an absolute path"),
         ("claude_code_preflight_budget_usd: 0\n", "invalid settings"),
+        ("export_exclude: [\"\"]\n", "workspace-relative"),
+        ("export_exclude: [/etc]\n", "workspace-relative"),
+        ("export_exclude: .git\n", "invalid settings"),
+        ("export_exclude: ['!build/x']\n", "without '!'"),
+        ("export_include: [/abs]\n", "export_include patterns must be"),
+        ("export_max_mb: 0\n", "invalid settings"),
+        ("cleanroom_budget_usd: -1\n", "invalid settings"),
+        ("source_audit_max_refs: 0\n", "invalid settings"),
+        ("claude_code_bash_timeout_s: 3600\n", "must be below claude_code_timeout_s"),
     ],
 )
 def test_bad_config_raises_value_error(tmp_path: Path, text: str, match: str) -> None:
@@ -319,3 +329,36 @@ def test_bad_env_budget_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 def test_invalid_override_raises_value_error(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="budget_usd"):
         load_settings(tmp_path / "none.yaml", budget_usd=0)
+
+
+def test_deliverable_and_verification_defaults() -> None:
+    s = Settings()
+    assert s.export_exclude == DEFAULT_EXPORT_EXCLUDE
+    assert {".maf", ".git", "FreeRTOS-Kernel", "__pycache__", "*.pyc"} <= set(s.export_exclude)
+    assert "inputs" not in s.export_exclude  # a clean-room rebuild may need the user's files
+    assert s.export_max_mb == 200 and s.export_max_bytes == 200 * 1024 * 1024
+    assert s.cleanroom_budget_usd == 1.5
+    assert s.source_audit is True and s.source_audit_max_refs == 60
+
+
+def test_deliverable_settings_from_yaml_and_overrides(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(
+        "export_exclude: [' build ', '*.o']\nexport_max_mb: 0.5\ncleanroom_budget_usd: 3\n"
+        "source_audit: false\nsource_audit_max_refs: 10\n",
+        encoding="utf-8",
+    )
+    s = load_settings(cfg)
+    assert s.export_exclude == ("build", "*.o")
+    assert s.export_max_bytes == 524_288
+    assert (s.cleanroom_budget_usd, s.source_audit, s.source_audit_max_refs) == (3.0, False, 10)
+    overridden = load_settings(cfg, source_audit=True, export_exclude=())
+    assert overridden.source_audit is True and overridden.export_exclude == ()
+    assert load_settings(cfg, export_include=[" build/*.cmake "]).export_include == ("build/*.cmake",)
+    assert Settings().export_include == ()
+
+
+def test_bash_timeout_defaults_to_a_share_of_the_session_timeout() -> None:
+    assert Settings().bash_timeout_s == 2700.0
+    assert Settings(claude_code_timeout_s=1200).bash_timeout_s == 900.0
+    assert Settings(claude_code_bash_timeout_s=1500).bash_timeout_s == 1500.0

@@ -16,8 +16,8 @@ Write `alloc.c`/`alloc.h`, a POSIX test harness, a FreeRTOS POSIX-port demo and 
 
 ## Acceptance Criteria
 
-- All tests pass on POSIX, FreeRTOS and QEMU.
-- `.text` < 2048 bytes on Cortex-M3 at `-Os`.
+- AC-1 [hard]: All tests pass on POSIX, FreeRTOS and QEMU.
+- AC-2 [hard]: `.text` < 2048 bytes on Cortex-M3 at `-Os`.
 
 ## Risks
 

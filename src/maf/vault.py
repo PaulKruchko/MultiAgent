@@ -13,10 +13,14 @@ Layout::
         04b-rebuttal.md  04c-adjudication.md  04-crosscheck.md                  (+ -r2 ...)
         05-final.md
         assets/                      images/plots, embedded with ![[name.png]]
-        deliverables/                final artifacts copied from the workspace
+        deliverables/                final artifacts: the workspace tree (code/mixed) or the listed artifacts (prose)
+        source-audit.json            latest source-audit state per document (cross-check writes, final reads)
+        cleanroom.json               last judged clean-room result and its digest (final)
     <workspaces>/<run_id>/           code trees, sim data, inputs/ (user files); outside the vault
+    <workspaces>/.maf-cleanroom/<run_id>/   the final stage's clean room, beside the workspace
 
-All writes go to a temp file in the same directory, then ``os.replace`` (atomic on POSIX).
+All writes go to a temp file in the same directory, then ``os.replace`` (atomic on POSIX). A workspace export
+(``Vault.export_workspace``) is staged in a dot-folder of the run folder and swapped in as a whole.
 Note names are unique within a run folder, so wikilinks use bare names: ``[[01-ingestion]]``.
 Links to other runs use path form: ``[[runs/<run_id>/05-final|...]]``.
 """
@@ -24,18 +28,23 @@ Links to other runs use path form: ``[[runs/<run_id>/05-final|...]]``.
 from __future__ import annotations
 
 import filecmp
+import fnmatch
 import os
 import re
+import secrets
 import shutil
+import stat
 import tempfile
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from maf import lint as _lint
 from maf.config import check_workspaces_outside_vault
 from maf.handoff import Handoff, HandoffKind, dump_frontmatter, load_frontmatter, parse_handoff, render_handoff
 from maf.types import AgentName, ExecutionMode, ProviderName, RunStatus, StageName, Tier
@@ -63,6 +72,13 @@ class RunIndex(BaseModel):
     spend_by_provider: dict[ProviderName, float] = Field(default_factory=dict)
     unresolved_critical: int = 0
     """Critical issues left unresolved by the latest cross-check; > 0 at final means ``completed_with_issues``."""
+    criteria_unmet: int = Field(default=0, ge=0)
+    """Hard acceptance criteria the final stage found not ``met`` (02-strategy's, plus maf's own gates: the clean-room
+    reproduction of code/mixed runs, the source audit and the deliverable lint); > 0 at final means
+    ``completed_with_issues``. Absent from run.md files written before it
+    existed."""
+    unmet_criteria: list[str] = Field(default_factory=list)
+    """One line per criterion counted in ``criteria_unmet``: ``<id> [partial|unmet]: <criterion>``."""
     created: datetime
     updated: datetime
     workspace: str
@@ -74,15 +90,25 @@ class RunIndex(BaseModel):
     """The raw user request (also rendered as a quoted block in the body)."""
     input_files: list[str] = Field(default_factory=list)
     """Workspace-relative paths of user-supplied files (under ``inputs/``)."""
+    exported_at: datetime | None = None
+    """When ``deliverables/`` was last written (by the final stage or ``maf export``)."""
+    export_note: str | None = None
+    """One line on that export, e.g. ``maf export: 57 file(s), 1.2 MB``."""
     tags: list[str] = Field(default_factory=lambda: ["maf", "maf/run"])
 
     @model_validator(mode="after")
     def _completed_with_open_criticals(self) -> RunIndex:
-        """``completed`` with ``unresolved_critical > 0`` reads as ``completed_with_issues``. The pipeline no longer
-        writes that pair, but runs finished before ``completed_with_issues`` existed still have it in run.md."""
-        if self.status == RunStatus.COMPLETED and self.unresolved_critical > 0:
+        """``completed`` with ``unresolved_critical > 0`` (or ``criteria_unmet > 0``) reads as
+        ``completed_with_issues``. The pipeline never writes that pair, but runs finished before
+        ``completed_with_issues`` existed still have it in run.md."""
+        if self.status == RunStatus.COMPLETED and (self.unresolved_critical > 0 or self.criteria_unmet > 0):
             self.status = RunStatus.COMPLETED_WITH_ISSUES
         return self
+
+    @property
+    def has_issues(self) -> bool:
+        """Final ran (or would end) with open issues: unresolved critical issues or unmet acceptance criteria."""
+        return self.unresolved_critical > 0 or self.criteria_unmet > 0
 
 
 class RunPaths(BaseModel):
@@ -120,6 +146,156 @@ _NOTE_BASE: dict[HandoffKind, str] = {
     HandoffKind.FINAL: "05-final",
 }
 _TREE_IGNORE = frozenset({".git", ".hg", ".svn", "__pycache__", ".maf"})
+
+PROTECTED_EXPORT_EXCLUDES: tuple[str, ...] = (
+    # pipeline and tool state, the provisioned FreeRTOS kernel, the copied user inputs (root inputs/ only), VCS
+    ".maf",
+    ".claude",
+    "FreeRTOS-Kernel",
+    "inputs/*",
+    ".git",
+    ".hg",
+    ".svn",
+)
+"""The part of ``DEFAULT_EXPORT_EXCLUDES`` nothing re-includes: ``maf.stages.base.export_excludes`` repeats these after
+``Settings.export_include``, so pipeline notes, the user's own files and repository state never ship."""
+
+DEFAULT_EXPORT_EXCLUDES: tuple[str, ...] = (
+    *PROTECTED_EXPORT_EXCLUDES,
+    # build output: directories named build at any depth (not a build script), in-source objects, libraries and
+    # executables, CMake state
+    "build/*",
+    "*/build/*",
+    "*.o",
+    "*.obj",
+    "*.a",
+    "*.so",
+    "*.dylib",
+    "*.elf",
+    "a.out",
+    "CMakeFiles",
+    "CMakeCache.txt",
+    # caches and environments
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "*.egg-info",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".tox",
+    "*.pyc",
+    "*.pyo",
+    ".DS_Store",
+    # the clean room's result files (maf.stages.final.REPRO_EXIT, REPRO_LOG): never carried into a fresh room
+    "REPRO_EXIT",
+    "REPRO_LOG",
+)
+"""What ``Vault.export_workspace`` leaves out, with the semantics of ``Settings.export_exclude``
+(``maf.lint.excluded``): a case-sensitive ``fnmatch`` pattern matches any component of the workspace-relative POSIX
+path, or a leading part of it. A pattern containing ``/`` can only match from the root, so ``inputs/*`` is the root
+``inputs/`` folder alone, and ``build/*`` leaves a ``build`` directory's contents out (not a file named ``build``).
+``maf.stages.base.export_excludes`` adds ``Settings.export_exclude``, then re-includes ``Settings.export_include``
+(``!`` patterns, which can bring back anything here except ``PROTECTED_EXPORT_EXCLUDES``), for the export, the lint and
+the source audit alike. Build output outside these patterns (an extensionless binary, ``results/``) still ships; the
+clean room makes it look stale, so the reproduction command regenerates it."""
+
+SANDBOX_PLACEHOLDER_FILES: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "bunfig.toml",
+    "bun.lock",
+    "bun.lockb",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    ".mcp.json",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".gitconfig",
+    ".gitmodules",
+    ".ripgreprc",
+)
+"""Names (``fnmatch``) of the zero-byte files Claude Code's sandbox may leave at the workspace root as mount points
+for paths it protects. An export leaves them out only when they are empty and at the root: a real ``package.json``
+is a deliverable."""
+
+MAX_EXPORT_BYTES = 200 * 1024 * 1024
+"""Size cap of one workspace export (200 MiB, as ``Settings.export_max_mb``). Bigger trees are refused
+(``ExportTooLarge``) before anything is copied."""
+
+MAX_EXPORT_FILES = 20_000
+"""File-count cap of one workspace export."""
+
+MAX_EXCLUDED_SHOWN = 5
+"""``ExportResult.describe`` names this many excluded entries; the rest are counted."""
+
+_EXPORT_STAGING = ".deliverables-"
+"""Prefix of the dot-folders an export stages in (in the run folder, so the swap is a same-filesystem rename)."""
+
+
+class ExportError(ValueError):
+    """A workspace export could not be made; ``deliverables/`` was left as it was."""
+
+
+class ExportTooLarge(ExportError):
+    """The export would exceed its size or file-count cap."""
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    """What ``Vault.export_workspace`` put into ``deliverables/``."""
+
+    deliverables: Path
+    files: tuple[str, ...]
+    """Exported paths, workspace-relative POSIX (the same path under ``deliverables/``), sorted."""
+    total_bytes: int
+    placeholders: tuple[str, ...] = ()
+    """Empty sandbox placeholder files left out (``SANDBOX_PLACEHOLDER_FILES``)."""
+    skipped: tuple[str, ...] = ()
+    """Entries left out for safety, each with the reason: symlinked directories, symlinks that leave the workspace,
+    dangle or point into an excluded path, and anything that is not a regular file."""
+    excluded: tuple[str, ...] = ()
+    """What the exclude patterns left out, apart from ``PROTECTED_EXPORT_EXCLUDES`` (pipeline state, the kernel,
+    ``inputs/``, VCS): each entry is the highest directory with nothing exported below it (``build/``,
+    ``src/__pycache__/``), else the file itself (``prog.o``); sorted. ``Settings.export_include`` brings one back."""
+
+    def excluded_note(self) -> str:
+        """``excluded: build/, prog.o and 2 more`` (at most ``MAX_EXCLUDED_SHOWN`` named, the rest counted);
+        empty when nothing was excluded."""
+        if not self.excluded:
+            return ""
+        more = len(self.excluded) - MAX_EXCLUDED_SHOWN
+        shown = ", ".join(self.excluded[:MAX_EXCLUDED_SHOWN]) + (f" and {more} more" if more > 0 else "")
+        return f"excluded: {shown}"
+
+    def describe(self) -> str:
+        text = f"{len(self.files)} file(s), {format_bytes(self.total_bytes)}"
+        return f"{text}; {self.excluded_note()}" if self.excluded else text
+
+
+def format_bytes(size: int) -> str:
+    """``812 B``, ``3.4 kB``, ``1.2 MB``, ``1.5 GB`` (decimal units)."""
+    value = float(size)
+    for unit in ("B", "kB", "MB"):
+        if value < 1000:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{value:.1f} GB"
+
+
+def export_excluded(rel: str, patterns: Sequence[str]) -> bool:
+    """Whether ``patterns`` exclude the workspace-relative POSIX path ``rel`` (``maf.lint.excluded``; see
+    ``DEFAULT_EXPORT_EXCLUDES``)."""
+    return _lint.excluded(rel, patterns)
 
 
 def slugify(text: str, max_len: int = 48) -> str:
@@ -186,10 +362,14 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _default_mode() -> int:
+def _umask() -> int:
     umask = os.umask(0)
     os.umask(umask)
-    return 0o666 & ~umask
+    return umask
+
+
+def _default_mode() -> int:
+    return 0o666 & ~_umask()
 
 
 def _atomic_replace(dst: Path, fill: Callable[[BinaryIO, Path], None]) -> None:
@@ -364,6 +544,8 @@ class Vault:
         data = index.model_dump(mode="json")
         data["created"] = index.created
         data["updated"] = index.updated
+        if index.exported_at is not None:
+            data["exported_at"] = index.exported_at
         atomic_write_text(paths.run_md, dump_frontmatter(data) + "\n" + render_run_body(index))
 
     def write_handoff(self, run_id: str, name: str, handoff: Handoff) -> Path:
@@ -411,7 +593,8 @@ class Vault:
         ``src`` must resolve inside the run's workspace, else ``ValueError`` (path traversal guard).
 
         Trees skip VCS folders, ``__pycache__`` and ``.maf``; symlinked directories are skipped and
-        symlinked files are copied only if their target is inside the workspace. An existing destination
+        symlinked files are copied only if their target is inside the workspace and not in
+        ``PROTECTED_EXPORT_EXCLUDES``. An existing destination
         is replaced, so re-running a stage is idempotent.
         """
         paths = self.paths(run_id)
@@ -447,6 +630,70 @@ class Vault:
         _fsync_dir(dst.parent)
         return dst
 
+    def export_workspace(
+        self,
+        run_id: str,
+        *,
+        excludes: Sequence[str] | None = None,
+        placeholders: Sequence[str] | None = None,
+        max_bytes: int | None = None,
+        max_files: int | None = None,
+    ) -> ExportResult:
+        """Replace ``deliverables/`` with a copy of the run's workspace tree (code and mixed runs).
+
+        Left out: paths ``excludes`` exclude (default ``DEFAULT_EXPORT_EXCLUDES``; ``ExportResult.excluded`` reports
+        them, pipeline state aside), empty files at the workspace root whose names match ``placeholders`` (default
+        ``SANDBOX_PLACEHOLDER_FILES``), symlinked directories (never followed), file symlinks that leave the workspace,
+        dangle or point into an excluded path (``.maf/``, ``inputs/``: lint and the source audit never read those), and
+        anything that is not a regular file. Any other file symlink inside the workspace is exported as a regular file
+        with its target's content. Empty directories are not recreated.
+
+        Nothing is copied when the tree exceeds ``max_bytes`` (default ``MAX_EXPORT_BYTES``) or ``max_files`` (default
+        ``MAX_EXPORT_FILES``): ``ExportTooLarge`` names the largest top-level entries. The copy is staged in a
+        dot-folder of the run folder, then swapped in by two renames, so ``deliverables/`` is never half-written and
+        nothing from a previous export survives; staging folders left by a crashed export are removed first.
+        ``ExportError`` when the workspace is missing or a file cannot be read; ``FileNotFoundError`` for an unknown
+        run.
+        """
+        paths = self.paths(run_id)
+        if not paths.root.is_dir():
+            raise FileNotFoundError(f"no such run: {run_id}")
+        if not paths.workspace.is_dir():
+            raise ExportError(f"workspace {paths.workspace} does not exist")
+        patterns = DEFAULT_EXPORT_EXCLUDES if excludes is None else tuple(excludes)
+        names = SANDBOX_PLACEHOLDER_FILES if placeholders is None else tuple(placeholders)
+        byte_cap = MAX_EXPORT_BYTES if max_bytes is None else max_bytes
+        file_cap = MAX_EXPORT_FILES if max_files is None else max_files
+
+        plan, left_out, skipped, excluded = _plan_export(paths.workspace.resolve(), patterns, names)
+        total = sum(size for _, _, size in plan)
+        if total > byte_cap or len(plan) > file_cap:
+            raise ExportTooLarge(_too_large_message(run_id, plan, total, byte_cap, file_cap))
+
+        _remove_export_leftovers(paths.root)
+        staging = Path(tempfile.mkdtemp(dir=paths.root, prefix=_EXPORT_STAGING, suffix=".tmp"))
+        try:
+            os.chmod(staging, 0o777 & ~_umask())  # mkdtemp makes it 0700; it becomes deliverables/
+            for rel, source, _ in plan:
+                target = staging / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(source, target)
+                except OSError as exc:
+                    raise ExportError(f"cannot export {rel}: {exc}") from exc
+            _swap_in(staging, paths.deliverables)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return ExportResult(
+            deliverables=paths.deliverables,
+            files=tuple(rel for rel, _, _ in plan),
+            total_bytes=total,
+            placeholders=tuple(left_out),
+            skipped=tuple(skipped),
+            excluded=tuple(excluded),
+        )
+
     @staticmethod
     def _copy_tree(src_dir: Path, dst_dir: Path, workspace: Path) -> None:
         for dirpath, dirnames, filenames in os.walk(src_dir):
@@ -459,8 +706,130 @@ class Vault:
                 real = file.resolve()
                 if not real.is_relative_to(workspace):
                     raise ValueError(f"{file} links outside the workspace")
+                target = real.relative_to(workspace).as_posix()
+                if file.is_symlink() and _lint.excluded(target, PROTECTED_EXPORT_EXCLUDES):
+                    continue  # a link into pipeline state or the user's inputs: never shipped
                 if real.is_file():
                     atomic_copy(real, target_dir / filename)
+
+
+def _plan_export(
+    root: Path, patterns: Sequence[str], placeholders: Sequence[str]
+) -> tuple[list[tuple[str, Path, int]], list[str], list[str], list[str]]:
+    """``(plan, placeholders_left_out, skipped, excluded)`` for ``export_workspace``: ``plan`` holds
+    ``(rel, source, size)`` in walk order (sorted per directory), ``excluded`` is ``ExportResult.excluded``. ``root``
+    is resolved; symlinked directories are never entered."""
+    plan: list[tuple[str, Path, int]] = []
+    left_out: list[str] = []
+    skipped: list[str] = []
+    dropped: list[tuple[str, bool]] = []  # (rel, is_dir) excluded by a pattern that export_include may undo
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        base = here.relative_to(root).as_posix()
+        kept: list[str] = []
+        for name in sorted(dirnames):
+            rel = name if base == "." else f"{base}/{name}"
+            if _lint.excluded_dir(rel, patterns):
+                dropped.append((rel, True))
+                continue
+            if (here / name).is_symlink():
+                skipped.append(f"{rel}/ (symlinked directory)")
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in sorted(filenames):
+            rel = name if base == "." else f"{base}/{name}"
+            if export_excluded(rel, patterns):
+                dropped.append((rel, False))
+                continue
+            source = here / name
+            info = source.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                real = source.resolve()
+                if not real.is_relative_to(root):
+                    skipped.append(f"{rel} (symlink out of the workspace)")
+                    continue
+                target = real.relative_to(root).as_posix()
+                if target != "." and export_excluded(target, patterns):
+                    skipped.append(f"{rel} (symlink into the excluded {target})")
+                    continue
+                try:
+                    info = real.stat()
+                except OSError:
+                    skipped.append(f"{rel} (dangling symlink)")
+                    continue
+                source = real
+            if not stat.S_ISREG(info.st_mode):
+                skipped.append(f"{rel} (not a regular file)")
+                continue
+            if info.st_size == 0 and base == "." and any(fnmatch.fnmatchcase(name, p) for p in placeholders):
+                left_out.append(rel)
+                continue
+            plan.append((rel, source, info.st_size))
+    plan.sort(key=lambda item: item[0])
+    return plan, left_out, skipped, _excluded_entries(dropped, [rel for rel, _, _ in plan])
+
+
+def _excluded_entries(dropped: Sequence[tuple[str, bool]], exported: Sequence[str]) -> list[str]:
+    """``ExportResult.excluded``: each dropped path (``(rel, is_dir)``) outside ``PROTECTED_EXPORT_EXCLUDES``, raised to
+    its highest ancestor directory with nothing exported below it (``dir/``), else kept as the file itself."""
+    busy = {str(parent) for rel in exported for parent in PurePosixPath(rel).parents}
+    entries: set[str] = set()
+    for rel, is_dir in dropped:
+        if _lint.excluded(rel, PROTECTED_EXPORT_EXCLUDES):
+            continue
+        top = rel if is_dir else None
+        for parent in PurePosixPath(rel).parents:
+            if str(parent) == "." or str(parent) in busy:
+                break
+            top = str(parent)
+        entries.add(f"{top}/" if top is not None else rel)
+    return sorted(entries)
+
+
+def _too_large_message(
+    run_id: str, plan: list[tuple[str, Path, int]], total: int, max_bytes: int, max_files: int
+) -> str:
+    by_top: dict[str, int] = {}
+    for rel, _, size in plan:
+        top = rel.split("/", 1)[0] + ("/" if "/" in rel else "")
+        by_top[top] = by_top.get(top, 0) + size
+    largest = sorted(by_top.items(), key=lambda item: (-item[1], item[0]))[:3]
+    return (
+        f"the workspace export of {run_id} would be {format_bytes(total)} in {len(plan)} file(s), over the cap of "
+        f"{format_bytes(max_bytes)} and {max_files} files; largest entries: "
+        + ", ".join(f"{name} ({format_bytes(size)})" for name, size in largest)
+        + ". Remove bulky outputs from the workspace or exclude them (Settings.export_exclude), then export again."
+    )
+
+
+def _remove_export_leftovers(run_root: Path) -> None:
+    for leftover in run_root.glob(f"{_EXPORT_STAGING}*.tmp"):
+        if leftover.is_dir() and not leftover.is_symlink():
+            shutil.rmtree(leftover, ignore_errors=True)
+        else:
+            leftover.unlink(missing_ok=True)
+
+
+def _swap_in(staging: Path, dst: Path) -> None:
+    """Move ``staging`` to ``dst``, replacing whatever ``dst`` was (moved aside first, deleted last). If the second
+    rename fails, the previous ``dst`` is put back."""
+    old: Path | None = None
+    if dst.exists() or dst.is_symlink():
+        old = dst.with_name(f"{_EXPORT_STAGING}old-{secrets.token_hex(4)}.tmp")
+        os.replace(dst, old)
+    try:
+        os.replace(staging, dst)
+    except BaseException:
+        if old is not None and not (dst.exists() or dst.is_symlink()):
+            os.replace(old, dst)
+        raise
+    _fsync_dir(dst.parent)
+    if old is not None:
+        if old.is_dir() and not old.is_symlink():
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            old.unlink(missing_ok=True)
 
 
 def _money(value: float) -> str:
@@ -475,24 +844,53 @@ def latest_crosscheck(index: RunIndex) -> str | None:
     return next((name for name in reversed(index.handoffs) if _CROSSCHECK_NOTE_RE.match(name)), None)
 
 
+def _criteria_count(n: int) -> str:
+    return f"{n} acceptance criteri{'on' if n == 1 else 'a'}"
+
+
+def describe_issues(index: RunIndex) -> str:
+    """One line on what keeps a finished run from ``completed``: ``3 unresolved critical issue(s) after the
+    cross-check loop cap; 2 acceptance criteria not met (AC-2, clean-room)``. Empty when nothing is open."""
+    parts: list[str] = []
+    if index.unresolved_critical > 0:
+        parts.append(f"{index.unresolved_critical} unresolved critical issue(s) after the cross-check loop cap")
+    if index.criteria_unmet > 0:
+        ids = ", ".join(line.split(" ", 1)[0] for line in index.unmet_criteria if line.strip())
+        parts.append(f"{_criteria_count(index.criteria_unmet)} not met" + (f" ({ids})" if ids else ""))
+    return "; ".join(parts)
+
+
 def _issues_callout(index: RunIndex) -> list[str]:
-    """The ``completed_with_issues`` warning that opens ``## Status`` (empty for every other status)."""
+    """The ``completed_with_issues`` warning that opens ``## Status`` (empty for every other status): the unresolved
+    critical count (linking the last cross-check) and the unmet acceptance criteria, one per line."""
     if index.status != RunStatus.COMPLETED_WITH_ISSUES:
         return []
-    crosscheck = latest_crosscheck(index)
-    where = f"; see `## Unresolved Critical` in {wikilink(crosscheck)}" if crosscheck else ""
-    final = _NOTE_BASE[HandoffKind.FINAL]
-    return [
-        f"> [!warning] Completed with {index.unresolved_critical} unresolved critical issue(s)",
-        f"> The cross-check loop cap was reached with {index.unresolved_critical} critical issue(s) still open{where}. "
-        f"{wikilink(final)} lists them under Limitations; do not treat this run's deliverables as verified.",
-        "",
-    ]
+    final = wikilink(_NOTE_BASE[HandoffKind.FINAL])
+    critical, unmet = index.unresolved_critical, index.criteria_unmet
+    if critical > 0 and unmet > 0:
+        title = f"Completed with {critical} unresolved critical issue(s) and {_criteria_count(unmet)} not met"
+    elif unmet > 0:
+        title = f"Completed with {_criteria_count(unmet)} not met"
+    else:
+        title = f"Completed with {critical} unresolved critical issue(s)"
+    lines = [f"> [!warning] {title}"]
+    if critical > 0:
+        crosscheck = latest_crosscheck(index)
+        where = f"; see `## Unresolved Critical` in {wikilink(crosscheck)}" if crosscheck else ""
+        lines.append(
+            f"> The cross-check loop cap was reached with {critical} critical issue(s) still open{where}. "
+            f"{final} lists them under Limitations."
+        )
+    if unmet > 0:
+        lines.append(f"> {_criteria_count(unmet)} not met; see `## Acceptance` in {final}:")
+        lines += [f"> - {' '.join(line.split())}" for line in index.unmet_criteria]
+    lines += ["> Do not treat this run's deliverables as verified.", ""]
+    return lines
 
 
 def render_run_body(index: RunIndex) -> str:
-    """Body of run.md: ``# <run_id>``; ``## Brief`` (quoted); ``## Status`` (opened by a warning callout
-    linking the last cross-check when the status is ``completed_with_issues``); ``## Handoffs``
+    """Body of run.md: ``# <run_id>``; ``## Brief`` (quoted); ``## Status`` (opened by a warning callout when the
+    status is ``completed_with_issues``, see ``_issues_callout``); ``## Handoffs``
     (wikilink bullets); ``## Cost`` (markdown table Agent | USD with a Total row, then Provider | USD);
     ``## Workspace`` (the path as inline code)."""
     brief = "\n".join(f"> {line}" if line.strip() else ">" for line in index.brief.strip().split("\n"))
@@ -505,10 +903,14 @@ def render_run_body(index: RunIndex) -> str:
         f"- Review gate: {'on' if index.review else 'off'}",
         f"- Completed stages: {', '.join(index.completed_stages) or 'none'}",
         f"- Unresolved critical issues: {index.unresolved_critical}",
+        f"- Acceptance criteria not met: {index.criteria_unmet}",
         f"- Budget: ${_money(index.spent_usd)} of ${_money(index.budget_usd)}",
         f"- Created: {index.created.isoformat()}",
         f"- Updated: {index.updated.isoformat()}",
     ]
+    if index.exported_at is not None:
+        note = f" ({' '.join(index.export_note.split())})" if index.export_note else ""
+        status.append(f"- Deliverables exported: {index.exported_at.isoformat()}{note}")
     if index.error:
         error = " ".join(index.error.split())
         status.append(f"- Error: {error}")

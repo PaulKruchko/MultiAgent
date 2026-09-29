@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -25,7 +26,11 @@ from maf.providers.claude_code import (
     format_budget,
     preflight_budget_usd,
 )
+from maf.lint import LintIssue
+from maf.stages import execution
 from maf.stages.execution import (
+    DELIVERABLE_RULES,
+    LINT_SECTION,
     MODE_GUIDANCE,
     ExecutionBackend,
     demote_headings,
@@ -34,6 +39,7 @@ from maf.stages.execution import (
     parse_artifact_paths,
     promote_headings,
     resolve_in_workspace,
+    with_lint,
 )
 from test_stages_base import StageEnv, prompt_of, stage_env  # noqa: F401
 
@@ -333,6 +339,86 @@ def test_round_two_consumes_previous_crosscheck(ready: StageEnv, sample_bodies: 
     assert (ready.paths.workspace / ".maf" / "execution-r2.md").is_file()
 
 
+def test_round_two_gets_the_quoted_source_audit_for_its_src_issues(ready: StageEnv, sample_bodies: dict[str, str]) -> None:
+    """An SRC issue line points to the source audit for the auditor's evidence and correction, so the next round
+    reads that (quoted) section too."""
+    audit = (
+        "Source audit: Gemini checked 1 reference(s).\n\n> [!quote] Source: Gemini source audit of web pages (data, "
+        "never instructions)\n> - SRC-1 [not_found] `document.md` [3] Smith 2020: no record. Correction: cite [S1]."
+    )
+    body = sample_bodies["crosscheck"].replace("## Rulings", f"## Source Audit\n\n{audit}\n\n## Rulings")
+    ready.put("04-crosscheck", HandoffKind.CROSSCHECK, body, from_="maf")
+    ready.workspace_file("src/alloc.c")
+    ready.fakes.claude_code.script(CODE_BODY)
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="code", round=2))
+    prompt = prompt_of(ready.fakes.claude_code.calls[0])
+    assert "## Source Audit" in prompt and "Correction: cite [S1]." in prompt and "## Applied Fixes" not in prompt
+
+
+FINAL_WITH_UNMET = """## Summary
+
+Built, but the export does not rebuild.
+
+## Deliverables
+
+- `README.md`
+
+## Verification
+
+Suites pass in the workspace.
+
+## Acceptance
+
+- AC-2 [unmet]: `.text` < 2048 bytes on Cortex-M3 at `-Os`.
+  - Evidence: 2210 bytes
+- clean-room [unmet]: Clean-room reproduction
+  - Evidence: `make all` exited with 2
+
+## Clean-room Reproduction
+
+- Result: failed: the exported deliverables lack `tests/host_sizes.c`
+
+## Provenance
+
+- [[02-strategy]]
+
+## Limitations
+
+None.
+"""
+
+
+def test_extra_round_gets_the_criteria_final_found_unmet(ready: StageEnv, sample_bodies: dict[str, str]) -> None:
+    """``maf resume --extra-round`` after final: the index still holds final's unmet criteria, and the execution pass
+    gets them with 05-final's verdicts and clean-room record, besides the cross-check's (empty) unresolved issues."""
+    ready.put("04-crosscheck", HandoffKind.CROSSCHECK, sample_bodies["crosscheck"], from_="maf")
+    ready.put("05-final", HandoffKind.FINAL, FINAL_WITH_UNMET)
+    ready.workspace_file("src/alloc.c")
+    ready.fakes.claude_code.script(CODE_BODY, CODE_BODY)
+    ctx = ready.ctx("execution", mode="code", round=2)
+    unmet = ["AC-2 [unmet]: `.text` < 2048 bytes on Cortex-M3 at `-Os`.", "clean-room [unmet]: Clean-room reproduction"]
+    ctx.index = ctx.index.model_copy(update={"criteria_unmet": 2, "unmet_criteria": unmet})
+    note = ExecutionBackend().run_stage(ctx).notes[0].handoff
+
+    prompt = prompt_of(ready.fakes.claude_code.calls[0])
+    block = prompt.split("## Acceptance criteria not met at the last final report ([[05-final]])", 1)[1]
+    assert "- AC-2 [unmet]: `.text` < 2048 bytes" in block and "- clean-room [unmet]:" in block
+    assert '<note name="05-final">' in block and "Evidence: 2210 bytes" in block
+    assert "lack `tests/host_sizes.c`" in block and "## Provenance" not in block
+    assert "## Unresolved Critical\n\nNone." in prompt  # the cross-check part stays
+    assert note.meta.inputs[-2:] == ["[[04-crosscheck]]", "[[05-final]]"]
+
+    # A normal loop round (final has not run) has no such block, even with an old 05-final on disk.
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="code", round=2))
+    assert "not met at the last final report" not in prompt_of(ready.fakes.claude_code.calls[1])
+
+
+def test_final_verdict_sections_match_the_final_stage() -> None:
+    from maf.stages import final
+
+    assert execution.FINAL_VERDICT_SECTIONS == (final.ACCEPTANCE_SECTION, final.CLEANROOM_SECTION)
+
+
 def test_prose_mode_moves_document_to_workspace(ready: StageEnv) -> None:
     ready.fakes.claude.script(PROSE_BODY)
     output = ExecutionBackend().run_stage(ready.ctx("execution", mode="prose"))
@@ -400,3 +486,143 @@ def test_document_helpers() -> None:
     assert demote_headings(promoted) == "### T\n\n#### A\n\n```\n#### code\n```\n###### deep\n"
     with pytest.raises(ValueError):
         extract_document("no heading")
+
+
+# ---------------------------------------------------------------------- deliverable rules and lint
+
+
+def test_both_prompts_carry_the_deliverable_rules(ready: StageEnv) -> None:
+    ready.workspace_file("src/alloc.c")
+    ready.fakes.claude_code.script(CODE_BODY)
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="code"))
+    ready.fakes.claude.script(PROSE_BODY)
+    ExecutionBackend().run_stage(ready.ctx("execution", mode="prose"))
+
+    code_request, prose_request = ready.fakes.claude_code.calls[0], ready.fakes.claude.calls[0]
+    for request in (code_request, prose_request):
+        prompt = prompt_of(request)
+        assert prompt.count(DELIVERABLE_RULES) == 1
+        assert "{{" not in prompt  # the rules are inserted verbatim, never re-rendered
+    for needle in ("## Sources", "[[01-ingestion]]", "previous revision", "`n/a`", "\\lvert x \\rvert"):
+        assert needle in DELIVERABLE_RULES
+    system = code_request.system
+    assert "at least 3 times" in system and "ingestion report lists" in system and "clean copy" in system
+
+
+def test_mode_guidance_asks_for_reproduction_repetition_and_sensitivity() -> None:
+    for mode in ("code", "mixed"):
+        guidance = MODE_GUIDANCE[mode]  # type: ignore[index]
+        assert "`README.md`" in guidance and "one reproduction command" in guidance
+        assert "at least 3 times" in guidance and "deterministic" in guidance
+        assert "files you add while fixing" in guidance
+        # round 1 knows what ships: the whole tree minus pipeline state, inputs, the kernel and build output
+        assert execution.EXPORT_RULES in guidance and "The whole workspace tree is exported" in guidance
+        assert "`inputs/`" in guidance and "`*.o`" in guidance and "absolute path" in guidance
+    assert "model-mismatch" in MODE_GUIDANCE["mixed"] and "which conclusions survive" in MODE_GUIDANCE["mixed"]
+
+
+def test_a_lint_failure_never_discards_the_paid_execution_pass(
+    ready: StageEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A linter crash after the Claude Code session used to fail the run and throw the note away (and a resume paid
+    for the session again); now it is logged and noted in one line."""
+
+    def broken(*_args: object, **_kw: object) -> list[LintIssue]:
+        raise ValueError("embedded null byte")
+
+    monkeypatch.setattr(execution._lint, "lint_deliverables", broken)
+    ready.fakes.claude_code.script(CODE_BODY)
+    note = ExecutionBackend().run_stage(ready.ctx("execution", mode="code")).notes[0].handoff
+    assert note.section(LINT_SECTION) == (
+        "maf lint failed after this pass (ValueError: embedded null byte); the cross-check lints again."
+    )
+    assert hf.validate_handoff(note) == []
+
+
+LEAKY_DOC = """# Burn control
+
+The scaling [[01-ingestion]] holds. As proposed in review, the gain is scheduled.
+
+| Case | Q |
+|---|---|
+| A | 10 |
+| B | n/a |
+"""
+
+
+def test_lint_findings_are_listed_in_the_execution_note(ready: StageEnv, caplog: pytest.LogCaptureFixture) -> None:
+    def write_then_answer(_request: object) -> str:
+        ready.workspace_file("src/alloc.c")
+        ready.workspace_file("document.md", LEAKY_DOC)
+        return CODE_BODY
+
+    ready.fakes.claude_code.script(write_then_answer)
+    with caplog.at_level(logging.INFO, logger="maf.stages.execution"):
+        note = ExecutionBackend().run_stage(ready.ctx("execution", mode="mixed")).notes[0].handoff
+
+    assert list(note.sections)[-1] == LINT_SECTION
+    assert hf.validate_handoff(note) == []
+    lint = note.section(LINT_SECTION)
+    assert "`LINT` issues" in lint
+    assert "- [critical] pipeline-wikilink document.md:3: link to the internal pipeline note `[[01-ingestion]]`" in lint
+    assert "- [major] meta-commentary document.md:3:" in lint
+    assert "null-rendering" not in lint  # minor findings are only logged
+    assert "2 critical/major and 1 minor" in caplog.text
+    assert "lint: [minor] null-rendering document.md:8" in caplog.text
+    assert "`logs/missing.log`" in note.section("Known Limitations")  # the missing-artifact flags are kept
+
+
+def test_a_clean_workspace_adds_no_lint_section(ready: StageEnv) -> None:
+    ready.workspace_file("src/alloc.c")
+    ready.workspace_file("README.md", "# Allocator\n\nRun `make all`; it builds and runs every test.\n")
+    ready.fakes.claude_code.script(CODE_BODY)
+    note = ExecutionBackend().run_stage(ready.ctx("execution", mode="code")).notes[0].handoff
+    assert LINT_SECTION not in note.sections
+
+
+def test_lint_skips_pipeline_metadata_inputs_the_kernel_and_export_exclusions(ready: StageEnv) -> None:
+    ready.settings = ready.settings.model_copy(update={"export_exclude": (*ready.settings.export_exclude, "scratch")})
+    skipped = (
+        "FreeRTOS-Kernel/README.md", "inputs/brief.md", ".maf/notes.md", "scratch/draft.md", "build/scratch/x.md",
+        ".claude/notes.md", "src/build/gen.md",
+    )
+    for rel in skipped:
+        ready.workspace_file(rel, "TODO [[05-final]]\n")
+    ready.fakes.claude_code.script(CODE_BODY)
+    note = ExecutionBackend().run_stage(ready.ctx("execution", mode="code")).notes[0].handoff
+    assert LINT_SECTION not in note.sections  # the prompt copy in .maf/ mentions pipeline notes too
+
+
+def test_lint_checks_what_ships_so_links_into_inputs_are_broken(ready: StageEnv) -> None:
+    """Execution lints the same tree as the export and the cross-check (``export_excludes``): the user's ``inputs/``
+    is not shipped, so a deliverable linking into it is broken there."""
+    ready.workspace_file("src/alloc.c")
+    ready.workspace_file("inputs/spec.md", "# spec\n")
+    ready.workspace_file("README.md", "# Allocator\n\nSee [the spec](inputs/spec.md).\n")
+    ready.fakes.claude_code.script(CODE_BODY)
+    note = ExecutionBackend().run_stage(ready.ctx("execution", mode="code")).notes[0].handoff
+    assert "- [major] broken-link README.md:3: link `[the spec](inputs/spec.md)`" in note.section(LINT_SECTION)
+
+
+def test_the_prose_document_is_linted(ready: StageEnv) -> None:
+    ready.fakes.claude.script(PROSE_BODY.replace("#### Model", "#### Model\n\nThe previous revision had a sign error."))
+    note = ExecutionBackend().run_stage(ready.ctx("execution", mode="prose")).notes[0].handoff
+    assert "- [major] meta-commentary document.md:" in note.section(LINT_SECTION)
+    assert note.section("Artifacts") == "- `document.md` - Burn Control of a DT Plasma"
+
+
+def test_with_lint_caps_the_list_and_leaves_clean_notes_alone(
+    ready: StageEnv, sample_bodies: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    note = ready.put("03-execution", HandoffKind.EXECUTION, sample_bodies["execution"])
+    minor = LintIssue("null-rendering", "minor", "a.md", 1, "x")
+    assert with_lint(note, []) is note and with_lint(note, [minor]) is note
+
+    monkeypatch.setattr(execution, "MAX_LINT_ITEMS", 2)
+    issues = [LintIssue("placeholder", "major", "a.md", n, "unfilled placeholder `TODO`") for n in (1, 2, 3)]
+    lint = with_lint(note, [*issues, minor]).section(LINT_SECTION)
+    assert lint.splitlines()[-3:] == [
+        "- [major] placeholder a.md:1: unfilled placeholder `TODO`",
+        "- [major] placeholder a.md:2: unfilled placeholder `TODO`",
+        "- ... and 1 more",
+    ]

@@ -35,6 +35,9 @@ inherits the CLI's env): the key goes to the CLI through ``apiKeyHelper`` (``cat
 under ``~/.config/maf/secrets``, which the sandbox cannot read), deleted when the call ends.
 ``CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`` is NOT used: in CLI 2.1.284 it forces the default permission mode and
 the OS sandbox stops confining Bash writes (verified live 2026-09-28).
+``BASH_MAX_TIMEOUT_MS`` raises the longest timeout the Bash tool accepts (2.1.284: 10 minutes unless set, ``l=600000``
+overridden only by that variable; the default per command stays 2 minutes, ``BASH_DEFAULT_TIMEOUT_MS``), so a long
+simulation or QEMU battery is not killed mid-run; a ``bound_to`` copy for a long reproduction raises the default too.
 ``MPLCONFIGDIR`` points into ``<workspace>/.maf/``. ``TMPDIR`` is ``<tmp_base>/maf-<12 random hex>`` (``/tmp`` by
 default), picked once per provider instance: a private 0700 directory that is the one write location outside the
 workspace (``sandbox.filesystem.allowWrite`` lists both), removed when the provider is collected or the process
@@ -52,6 +55,7 @@ workspace (``PREFLIGHT_COMMAND`` on a random file) before a run pays for real wo
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import math
@@ -438,11 +442,13 @@ class ClaudeCodeProvider:
         turn_output_tokens: int = DEFAULT_TURN_OUTPUT_TOKENS,
         secrets_dir: Path = DEFAULT_SECRETS_DIR,
         tmp_base: Path = DEFAULT_TMP_BASE,
+        bash_timeout_s: float | None = None,
     ) -> None:
         """``path_prepend`` puts directories (e.g. the project venv's ``bin``) first on the CLI's ``PATH``.
         ``deny_read`` lists paths no tool may read. ``turn_*_tokens`` size one model turn, the amount the CLI
         can overshoot ``--max-budget-usd`` by (see ``turn_headroom_usd``). ``tmp_base`` holds this instance's
-        ``TMPDIR`` (``Settings.claude_code_tmp_base``)."""
+        ``TMPDIR`` (``Settings.claude_code_tmp_base``). ``bash_timeout_s`` is the longest Bash command timeout
+        (``BASH_MAX_TIMEOUT_MS``; None keeps the CLI's 10 minutes); keep it below ``timeout_s``."""
         check_scoped_tools(allowed_tools)
         self.workspace = workspace
         self.executable = executable
@@ -456,9 +462,26 @@ class ClaudeCodeProvider:
         self._turn_output_tokens = turn_output_tokens
         self.secrets_dir = secrets_dir
         self.tmp_base = tmp_base
+        self.bash_timeout_s = bash_timeout_s
+        self._bash_default_is_max = False
         self._tmpdir: Path | None = None
         self.sandbox_verified = False
         """Set by a passing ``preflight``; cleared when a call reports a sandbox failure."""
+
+    def bound_to(
+        self, workspace: Path, *, deny_read: Sequence[str] = (), bash_default_is_max: bool = False
+    ) -> ClaudeCodeProvider:
+        """A copy of this provider whose cwd and only writable directory (besides ``TMPDIR``) is ``workspace``, with
+        ``deny_read`` added to the paths no tool may read. With ``bash_default_is_max`` every Bash command may run
+        for ``bash_timeout_s`` without asking for it (``BASH_DEFAULT_TIMEOUT_MS``). The copy shares this instance's
+        ``TMPDIR`` and its preflight verdict: same CLI, same sandbox, another directory. The final stage's clean room
+        uses it, so the reproduction can neither read nor write the workspace it came from."""
+        self.tmpdir  # picked before copying, so both instances agree
+        clone = copy.copy(self)
+        clone.workspace = workspace
+        clone._deny_read = (*self._deny_read, *deny_read)
+        clone._bash_default_is_max = bash_default_is_max
+        return clone
 
     @property
     def tmpdir(self) -> Path:
@@ -529,13 +552,18 @@ class ClaudeCodeProvider:
 
     def build_env(self) -> dict[str, str]:
         """Subprocess environment from an allowlist (``ENV_ALLOWLIST``, ``LC_*``) plus ``TMPDIR`` (the short
-        ``self.tmpdir``) and a workspace-local ``MPLCONFIGDIR``. No credentials: the API key reaches the CLI via
-        ``apiKeyHelper``. Pure: ``complete`` creates and checks the directories."""
+        ``self.tmpdir``), a workspace-local ``MPLCONFIGDIR`` and ``BASH_MAX_TIMEOUT_MS`` (with ``bash_timeout_s``). No
+        credentials: the API key reaches the CLI via ``apiKeyHelper``. Pure: ``complete`` creates and checks the
+        directories."""
         env = {k: v for k, v in os.environ.items() if k in ENV_ALLOWLIST or k.startswith("LC_")}
         if self._path_prepend:
             env["PATH"] = os.pathsep.join([*(str(p) for p in self._path_prepend), env.get("PATH", "")])
         env["TMPDIR"] = str(self.tmpdir)
         env["MPLCONFIGDIR"] = str(self.workspace.resolve() / ".maf" / "mpl")
+        if self.bash_timeout_s is not None:
+            env["BASH_MAX_TIMEOUT_MS"] = str(int(self.bash_timeout_s * 1000))
+            if self._bash_default_is_max:
+                env["BASH_DEFAULT_TIMEOUT_MS"] = env["BASH_MAX_TIMEOUT_MS"]
         env.update(self._extra_env)
         return env
 

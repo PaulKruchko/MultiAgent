@@ -251,6 +251,37 @@ def test_build_env_drops_other_keys_and_scopes_temp_dirs(
     assert not (tmp_path / "ws").exists() and not provider.tmpdir.exists()  # pure: nothing created
     assert env["PATH"].startswith("/venv/bin:")
     assert env["FOO"] == "bar"
+    assert "BASH_MAX_TIMEOUT_MS" not in env and "BASH_DEFAULT_TIMEOUT_MS" not in env  # the CLI's own 10 minutes
+
+
+def test_bash_timeout_raises_the_cli_cap(tmp_path: Path, tmp_base: Path) -> None:
+    """Claude Code 2.1.284 kills a Bash command after 10 minutes unless ``BASH_MAX_TIMEOUT_MS`` says otherwise, so a
+    long reproduction never reached ``; echo $? > REPRO_EXIT``. The default per command stays 2 minutes."""
+    provider, _ = _provider(tmp_path, _out("claude_code_success"), bash_timeout_s=2700)
+    env = provider.build_env()
+    assert env["BASH_MAX_TIMEOUT_MS"] == "2700000" and "BASH_DEFAULT_TIMEOUT_MS" not in env
+
+
+def test_bound_to_rebinds_the_directory_and_denies_the_workspace(tmp_path: Path, tmp_base: Path, api_key: None) -> None:
+    """The clean room's session: another cwd and writable directory, the workspace unreadable, long commands by
+    default; the original provider is unchanged and both share one ``TMPDIR`` and the preflight verdict."""
+    provider, runner = _provider(tmp_path, _out("claude_code_success"), bash_timeout_s=1800)
+    provider.sandbox_verified = True
+    room = tmp_path / "rooms" / "r1"
+    clone = provider.bound_to(room, deny_read=(str(tmp_path / "ws"),), bash_default_is_max=True)
+    assert (clone.workspace, clone.sandbox_verified, clone.tmpdir) == (room, True, provider.tmpdir)
+    settings = json.loads(_flag(clone.build_argv(_req()), "--settings"))
+    assert settings["sandbox"]["filesystem"]["allowWrite"] == [str(room.resolve()), str(provider.tmpdir)]
+    assert str(tmp_path / "ws") in settings["sandbox"]["filesystem"]["denyRead"]
+    assert f"Read(/{tmp_path / 'ws'}/**)" in settings["permissions"]["deny"]
+    env = clone.build_env()
+    assert env["BASH_MAX_TIMEOUT_MS"] == env["BASH_DEFAULT_TIMEOUT_MS"] == "1800000"
+    assert env["MPLCONFIGDIR"] == str(room.resolve() / ".maf" / "mpl")
+    assert provider.workspace == tmp_path / "ws" and "BASH_DEFAULT_TIMEOUT_MS" not in provider.build_env()
+    original = json.loads(_flag(provider.build_argv(_req()), "--settings"))
+    assert str(tmp_path / "ws") not in original["sandbox"]["filesystem"]["denyRead"]
+    clone.complete(_req())
+    assert runner.calls[-1]["cwd"] == room
 
 
 # --- parse_output -------------------------------------------------------------------------------

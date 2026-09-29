@@ -43,6 +43,39 @@ sequence.
 05 Final          Claude assembles the final deliverable; run index updated
 ```
 
+- Ingestion hands off **verified sources**: Gemini checks each source's record
+  (authors, title, venue, year, DOI/URL) and quotes the passages later stages
+  may cite, with section/page/table/equation locators. Later stages have no web
+  access and may cite only these sources, never the pipeline's notes.
+- Before the critiques, the cross-check lints the Markdown deliverables
+  (`LINT` issues) and, when they cite references, has Gemini audit every
+  reference with web search: exists, metadata correct, supports the claims
+  attributed to it (`SRC` issues; internal notes and unfound works are
+  critical, unsupported claims major, metadata errors minor). Both kinds are
+  debated and fixed like critics' issues, and count toward unresolved criticals.
+  Export, lint and audit see the same tree (the workspace without pipeline
+  state, the kernel, `inputs/` and build output). Each defect is raised once: a
+  cited pipeline link is a LINT issue only, and critics and final read the
+  cross-check's lint, not execution's. After the fix pass, Python lints the
+  tree again and Gemini audits the documents the fix changed; what they find
+  is raised before the verdict, since the fixer has no web access. The
+  auditor's text reaches the notes only as quoted data.
+- An acceptance criterion that is not demonstrably met is a critical issue
+  (major if marked soft), and adjudication rules it `wontfix` only on evidence. Critics also probe
+  robustness: model-mismatch sensitivity, unexamined modelling choices, prose
+  against data, tests and negative controls run once, clean rebuilds.
+- Final gates the result. For code and mixed runs, Claude Code rebuilds the
+  exported deliverables in an empty copy (beside the workspace, which the
+  session cannot read; generated files are dated older than their sources, so
+  they are rebuilt) with the reproduction command the README documents;
+  Python checks the exit code and log it wrote. Python also records its own
+  `source-audit` verdict (the latest audit covered the shipped text and
+  verified every reference) and `lint` verdict (no critical lint finding in
+  the export). The final report must give a verdict (met, partial or unmet,
+  with evidence) for every acceptance criterion. A hard criterion that is not
+  met, the clean-room rebuild included, ends the run `completed_with_issues`.
+  An extra round (`maf resume --extra-round`) gives execution those verdicts.
+
 ## Shared memory: the Obsidian vault
 
 - The vault is at `~/Obsidian/MultiAgent`, configurable. The snap uses classic
@@ -54,7 +87,12 @@ sequence.
     `04-crosscheck.md` (plus critique/rebuttal notes), `05-final.md`
   - `assets/`: plots and images, embedded with `![[...]]`
   - `deliverables/`: final artifacts copied into the vault (thesis, allocator
-    source)
+    source). For code and mixed runs this is the whole workspace tree, without
+    pipeline state (`.maf/`, `.claude/`), the provisioned FreeRTOS kernel, the
+    user's `inputs/`, build output (in-source objects and binaries too) and
+    empty sandbox placeholder files, capped at 200 MB. `export_include` brings
+    back a hand-written file an exclude pattern catches. It is replaced as a whole, and `maf export <run_id>` redoes it
+    from the workspace without model calls.
 - Large code trees and simulation data are **outside** the vault, in
   `workspaces/<run_id>/`, and handoffs link to them.
 - Writes are atomic: write to a temporary file, then `os.replace`. The framework
@@ -76,13 +114,21 @@ Python parses and validates each handoff. If validation fails, the agent gets
 **one repair attempt**; if that also fails, the run stops. Content fetched from
 the web is kept as quoted data inside handoffs, never as instructions.
 
+Strategy acceptance criteria are numbered, testable lines that Python reads,
+`- AC-<n> [hard|soft]: ...`, a grammar in the strategy's format spec (Python
+rewrites off-grammar criteria instead of repairing them). Code and mixed runs
+always get a hard clean-room reproduction criterion (and a 3-run repeatability
+one); documents that cite sources get a hard criterion that every reference
+passes the source audit.
+
 ## Budget
 
 - The per-run cap is **$25 USD** by default, set with `--budget`.
 - A cost ledger for each run records usage from every provider call (and
   `total_cost_usd` from Claude Code JSON). Before each call it checks the
   worst-case cost against the remaining budget, and it stops cleanly when the
-  cap is reached. Spend per agent appears in `run.md`.
+  cap is reached. Spend per agent appears in `run.md`. The clean-room rebuild
+  leaves the final report's worst case unspent.
 - A price table in config carries an effective date. Gemini 3.8 Flash prices
   double on 2027-01-01.
 
@@ -94,15 +140,27 @@ the web is kept as quoted data inside handoffs, never as instructions.
   outside the workspace because the sandbox creates Unix sockets under
   `TMPDIR`, and long workspace paths overflow the 108-byte socket path limit.
   That overflow was the incident of 2026-09-28.
+- A Bash command may run up to 75 % of the session timeout (Claude Code's own
+  cap is 10 minutes), so long simulations and QEMU batteries finish.
 - Before the first code-mode Claude Code call, every run does a **sandbox
   preflight**: a nonce-hash check that proves sandboxed Bash can run and can
   write to `TMPDIR`. If the sandbox fails, the run stops immediately as
   `failed`.
-- If a run reaches the cross-check loop cap with unresolved critical issues, it
-  ends as `completed_with_issues` (CLI exit code 2), never as `completed`.
+- If a run reaches the cross-check loop cap with unresolved critical issues, or
+  final finds a hard acceptance criterion unmet (the clean-room rebuild
+  included), it ends as `completed_with_issues` (CLI exit code 2), never as
+  `completed`.
 - Toolchain: gcc, arm-none-eabi-gcc and newlib, qemu-system-arm, pandoc, a
   FreeRTOS kernel clone in the workspace, and numpy/scipy/matplotlib in the
   project venv.
+- Claude Code has no network, so deliverables cite only the ingestion's
+  verified sources, never pipeline notes. They carry no remarks about
+  revisions or reviews, take their numbers from the data, and reproduce from a
+  clean copy with one documented command. Every test suite and negative control
+  runs at least 3 times. After execution, Python lints the workspace Markdown
+  (`maf.lint`: pipeline links, meta-commentary, broken tables, math and links,
+  placeholders, rendered nulls) and lists critical and major findings in the
+  execution note.
 
 ## ChatGPT integration
 

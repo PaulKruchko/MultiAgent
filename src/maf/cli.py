@@ -6,6 +6,7 @@ Owner: orchestration.
     maf resume RUN_ID [--note TEXT] [--budget USD] [--extra-round]
     maf status RUN_ID [--json]
     maf list [--json] [--limit N]
+    maf export RUN_ID
     maf serve [--host 127.0.0.1] [--port 8765]
 
 Global options: ``--vault PATH``, ``--workspaces PATH``, ``--config PATH``.
@@ -13,10 +14,14 @@ Exit codes of ``run``/``resume`` follow the run's status: 0 completed (also awai
 ``--no-wait``); 2 completed_with_issues; 1 failed or budget exceeded. Usage errors (bad arguments, unknown run,
 bad config) also exit 2, before any run starts; the output tells them apart.
 ``run`` prints the run_id first, then progress lines per stage, then the path of 05-final.md on stdout.
-A completed_with_issues run then ends with one stderr line naming the unresolved critical count and the last
-cross-check note; failed and budget-exceeded runs end with the error on stderr.
+A completed_with_issues run (unresolved critical issues after the loop cap, or acceptance criteria not met, maf's
+own checks included: clean-room reproduction, source audit, deliverable lint) then ends with one stderr line naming the counts and the notes to read; failed and
+budget-exceeded runs end with the error on stderr.
 ``resume`` refuses a completed_with_issues run (exit 2, nothing runs) unless ``--extra-round`` is given, which
 runs one more execution + cross-check pass and then final again.
+``export`` rewrites the run's ``deliverables/`` from its workspace with the final stage's export (no model calls,
+any status), names what the exclude patterns left out, and notes it in run.md: exit 0 when exported, 1 when the export is refused (too large, run busy, no
+workspace), 2 for an unknown run.
 ``run --no-wait`` creates the run, starts ``maf resume RUN_ID`` as a detached process (output in
 ``workspace/.maf/run.log``) and returns immediately.
 """
@@ -27,22 +32,23 @@ import argparse
 import json
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TextIO
 
 from maf.config import Settings, load_settings
-from maf.handoff import HandoffKind
+from maf.handoff import HandoffInvalid, HandoffKind
 from maf.pipeline import Pipeline
 from maf.types import RunStatus
-from maf.vault import RunIndex, latest_crosscheck, note_name
+from maf.vault import ExportError, RunIndex, format_bytes, latest_crosscheck, note_name
 
 EXIT_OK = 0
 EXIT_FAILED = 1
 """Failed or budget exceeded: the run stopped without a final report."""
 EXIT_USAGE = 2
 EXIT_WITH_ISSUES = 2
-"""completed_with_issues: final ran after the cross-check loop cap with unresolved critical issues."""
+"""completed_with_issues: final ran, but critical issues stayed unresolved after the cross-check loop cap or
+acceptance criteria (maf's clean-room, source-audit and lint checks included) are not met."""
 
 _GLOBAL_OPTIONS = ("vault", "workspaces", "config")
 
@@ -117,6 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
     list_.add_argument("--json", action="store_true")
     list_.add_argument("--limit", type=_positive_int, default=20, metavar="N")
 
+    export = sub.add_parser("export", parents=[common], help="re-export a run's deliverables from its workspace")
+    export.add_argument("run_id")
+
     serve = sub.add_parser("serve", parents=[common], help="serve the MCP endpoint for the ChatGPT app")
     serve.add_argument("--host", help="bind address (loopback only; default from settings)")
     serve.add_argument("--port", type=_port, help="TCP port (default from settings)")
@@ -158,11 +167,9 @@ def _report(pipeline: Pipeline, index: RunIndex, out: TextIO, err: TextIO) -> in
     if index.status.finished:
         print(paths.note(note_name(HandoffKind.FINAL)), file=out, flush=True)
     if index.status == RunStatus.COMPLETED_WITH_ISSUES:
-        crosscheck = latest_crosscheck(index)
-        where = f"; see {paths.note(crosscheck)}" if crosscheck else ""
         print(
-            f"completed with issues: {index.unresolved_critical} unresolved critical issue(s) after the cross-check "
-            f"loop cap{where} ({_spend(index)}; one more pass: maf resume {index.run_id} --extra-round)",
+            f"completed with issues: {_issues_line(index, paths.note)} ({_spend(index)}; one more pass: "
+            f"maf resume {index.run_id} --extra-round)",
             file=err,
         )
     elif index.status == RunStatus.AWAITING_REVIEW:
@@ -174,6 +181,23 @@ def _report(pipeline: Pipeline, index: RunIndex, out: TextIO, err: TextIO) -> in
         error = " ".join((index.error or "unknown error").split())  # one line, even for multi-line provider output
         print(f"failed: {error} ({_spend(index)})", file=err)
     return exit_code_for(index.status)
+
+
+def _issues_line(index: RunIndex, note_path: Callable[[str], Path]) -> str:
+    """What keeps a completed_with_issues run from completed, with the note to read for each part."""
+    parts: list[str] = []
+    if index.unresolved_critical > 0 or index.criteria_unmet == 0:
+        crosscheck = latest_crosscheck(index)
+        where = f"; see {note_path(crosscheck)}" if crosscheck else ""
+        parts.append(f"{index.unresolved_critical} unresolved critical issue(s) after the cross-check loop cap{where}")
+    if index.criteria_unmet > 0:
+        ids = ", ".join(line.split(" ", 1)[0] for line in index.unmet_criteria if line.strip())
+        noun = "criterion" if index.criteria_unmet == 1 else "criteria"
+        parts.append(
+            f"{index.criteria_unmet} acceptance {noun} not met{f' ({ids})' if ids else ''}; "
+            f"see {note_path(note_name(HandoffKind.FINAL))}"
+        )
+    return "; ".join(parts)
 
 
 def _launch_detached(args: argparse.Namespace, pipeline: Pipeline, run_id: str) -> Path:
@@ -247,8 +271,11 @@ def _status_lines(index: RunIndex) -> list[str]:
         f"tier:     {index.tier}",
         f"spent:    ${index.spent_usd:.4f} of ${index.budget_usd:.2f}",
     ]
-    if index.unresolved_critical or index.status == RunStatus.COMPLETED_WITH_ISSUES:
+    if index.unresolved_critical or (index.status == RunStatus.COMPLETED_WITH_ISSUES and not index.criteria_unmet):
         lines.append(f"unresolved critical: {index.unresolved_critical}")
+    if index.criteria_unmet:
+        lines.append(f"criteria unmet: {index.criteria_unmet}")
+        lines += [f"  - {' '.join(line.split())}" for line in index.unmet_criteria]
     if index.spend_by_agent:
         lines.append("by agent: " + ", ".join(f"{a} ${usd:.4f}" for a, usd in sorted(index.spend_by_agent.items())))
     if index.handoffs:
@@ -256,6 +283,9 @@ def _status_lines(index: RunIndex) -> list[str]:
     if index.error:
         lines.append(f"error:    {index.error}")
     lines.append(f"workspace: {index.workspace}")
+    if index.exported_at is not None:
+        note = f" ({index.export_note})" if index.export_note else ""
+        lines.append(f"exported: {index.exported_at.isoformat()}{note}")
     return lines
 
 
@@ -296,6 +326,30 @@ def _cmd_list(args: argparse.Namespace, pipeline: Pipeline) -> int:
     return EXIT_OK
 
 
+def _cmd_export(args: argparse.Namespace, pipeline: Pipeline) -> int:
+    try:
+        pipeline.status(args.run_id)
+    except (FileNotFoundError, ValueError):
+        print(f"maf: no such run: {args.run_id}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        _index, export = pipeline.export(args.run_id)
+    except (ExportError, HandoffInvalid, RuntimeError, OSError) as exc:
+        print(f"maf: export failed: {' '.join(str(exc).split())}", file=sys.stderr)
+        return EXIT_FAILED
+    deliverables = pipeline.vault.paths(args.run_id).deliverables
+    print(f"exported {export.files} file(s), {format_bytes(export.total_bytes)}, to {deliverables}")
+    tree = export.tree
+    if tree is not None and tree.placeholders:
+        print(f"left out {len(tree.placeholders)} empty sandbox placeholder file(s): {', '.join(tree.placeholders)}")
+    if tree is not None and tree.excluded:
+        print(f"{tree.excluded_note()} (export_include brings a file back)")
+    if tree is not None and tree.skipped:
+        print(f"skipped {len(tree.skipped)} unsafe entr{'y' if len(tree.skipped) == 1 else 'ies'}: "
+              + "; ".join(tree.skipped), file=sys.stderr)
+    return EXIT_OK
+
+
 def _cmd_serve(args: argparse.Namespace, pipeline: Pipeline) -> int:
     from maf.mcp_server import serve
 
@@ -316,6 +370,7 @@ _COMMANDS = {
     "resume": _cmd_resume,
     "status": _cmd_status,
     "list": _cmd_list,
+    "export": _cmd_export,
     "serve": _cmd_serve,
 }
 

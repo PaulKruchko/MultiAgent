@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -11,11 +12,18 @@ import pytest
 from maf.handoff import HandoffInvalid, HandoffKind, HandoffMeta, build_handoff, dump_frontmatter
 from maf.types import RunStatus
 from maf.vault import (
+    DEFAULT_EXPORT_EXCLUDES,
+    PROTECTED_EXPORT_EXCLUDES,
+    ExportError,
+    ExportTooLarge,
     RunIndex,
     Vault,
     atomic_copy,
     atomic_write_text,
+    describe_issues,
     embed,
+    export_excluded,
+    format_bytes,
     latest_crosscheck,
     note_name,
     render_run_body,
@@ -502,3 +510,273 @@ def test_run_md_on_disk_has_body(vault: Vault) -> None:
     assert "created: 2026-09-28T12:00:00\n" in text
     assert "brief: |-\n  Design a portable O(1) allocator.\n" in text
     assert "\n---\n\n# 2026-09-28-portable-allocator\n" in text
+
+
+# ---------------------------------------------------------------------------
+# acceptance criteria and exports in run.md
+
+
+def test_run_md_without_the_new_keys_still_loads(vault: Vault) -> None:
+    """run.md files written before criteria_unmet / exported_at existed read with the defaults."""
+    vault.create_run(make_index(vault), [])
+    run_md = vault.paths(RUN_ID).run_md
+    data = make_index(vault, status=RunStatus.COMPLETED, stage="final").model_dump(mode="json")
+    for key in ("criteria_unmet", "unmet_criteria", "exported_at", "export_note"):
+        data.pop(key)
+    run_md.write_text(dump_frontmatter(data) + "\n# legacy\n", encoding="utf-8")
+    index = vault.read_index(RUN_ID)
+    assert (index.status, index.criteria_unmet, index.unmet_criteria, index.exported_at) == (RunStatus.COMPLETED, 0, [], None)
+
+
+def test_completed_with_unmet_criteria_reads_as_completed_with_issues(vault: Vault) -> None:
+    index = make_index(vault, status=RunStatus.COMPLETED, criteria_unmet=1, unmet_criteria=["AC-2 [unmet]: size"])
+    assert index.status == RunStatus.COMPLETED_WITH_ISSUES and index.has_issues
+    assert not make_index(vault, status=RunStatus.COMPLETED).has_issues
+
+
+def test_criteria_and_export_round_trip_through_run_md(vault: Vault) -> None:
+    exported = datetime(2026, 9, 29, 9, 30, 0)
+    index = make_index(
+        vault,
+        status=RunStatus.COMPLETED_WITH_ISSUES,
+        criteria_unmet=2,
+        unmet_criteria=["AC-2 [unmet]: verified sources support each ITER claim", "clean-room [unmet]: Clean-room"],
+        exported_at=exported,
+        export_note="maf export: 57 file(s), 1.2 MB",
+    )
+    vault.create_run(index, [])
+    text = vault.paths(RUN_ID).run_md.read_text()
+    assert "\ncriteria_unmet: 2\n" in text and "\nexported_at: 2026-09-29T09:30:00\n" in text
+    assert vault.read_index(RUN_ID) == index
+    assert "- Deliverables exported: 2026-09-29T09:30:00 (maf export: 57 file(s), 1.2 MB)" in text
+    assert "- Acceptance criteria not met: 2" in text
+
+
+def test_render_run_body_callout_for_unmet_criteria(vault: Vault) -> None:
+    index = make_index(
+        vault,
+        status=RunStatus.COMPLETED_WITH_ISSUES,
+        criteria_unmet=2,
+        unmet_criteria=["AC-2 [unmet]: verified sources support each ITER claim", "clean-room [unmet]: rebuild"],
+        handoffs=["04-crosscheck", "05-final"],
+    )
+    callout, rest = render_run_body(index).split("## Status\n\n", 1)[1].split("\n\n", 1)
+    assert callout.splitlines() == [
+        "> [!warning] Completed with 2 acceptance criteria not met",
+        "> 2 acceptance criteria not met; see `## Acceptance` in [[05-final]]:",
+        "> - AC-2 [unmet]: verified sources support each ITER claim",
+        "> - clean-room [unmet]: rebuild",
+        "> Do not treat this run's deliverables as verified.",
+    ]
+    assert rest.startswith("- Status: **completed_with_issues**\n")
+    assert describe_issues(index) == "2 acceptance criteria not met (AC-2, clean-room)"
+
+
+def test_render_run_body_callout_for_both_kinds_of_issue(vault: Vault) -> None:
+    index = make_index(
+        vault,
+        status=RunStatus.COMPLETED_WITH_ISSUES,
+        unresolved_critical=3,
+        criteria_unmet=1,
+        unmet_criteria=["clean-room [unmet]: rebuild"],
+        handoffs=["04-crosscheck-r3", "05-final"],
+    )
+    callout = render_run_body(index).split("## Status\n\n", 1)[1].split("\n\n", 1)[0]
+    lines = callout.splitlines()
+    assert lines[0] == "> [!warning] Completed with 3 unresolved critical issue(s) and 1 acceptance criterion not met"
+    assert "[[04-crosscheck-r3]]" in lines[1] and lines[2].startswith("> 1 acceptance criterion not met")
+    assert describe_issues(index) == (
+        "3 unresolved critical issue(s) after the cross-check loop cap; 1 acceptance criterion not met (clean-room)"
+    )
+    assert describe_issues(make_index(vault)) == ""
+
+
+def test_format_bytes() -> None:
+    assert [format_bytes(n) for n in (0, 999, 1000, 1_234_567, 5_000_000_000)] == ["0 B", "999 B", "1.0 kB", "1.2 MB", "5.0 GB"]
+
+
+@pytest.mark.parametrize(
+    ("rel", "excluded"),
+    [
+        (".maf/prompt.md", True),
+        ("sub/.claude/x", True),
+        ("FreeRTOS-Kernel/tasks.c", True),
+        ("inputs/spec.pdf", True),
+        ("tests/inputs/case1.txt", False),  # inputs/* is the root folder only
+        ("build/alloc.o", True),
+        ("tests/build/x.o", True),
+        ("build", False),  # a build script, not a build directory
+        ("scripts/build", False),
+        ("pkg.egg-info/PKG-INFO", True),
+        ("src/__pycache__/a.pyc", True),
+        ("src/mod.pyc", True),
+        ("src/alloc.c", False),
+        (".gitignore", False),
+        ("prog.o", True),
+        ("lib/libx.so", True),
+        ("fw/test.elf", True),
+        ("a.out", True),
+        ("x/CMakeFiles/y", True),
+        ("REPRO_EXIT", True),
+        ("results/metrics.csv", False),
+    ],
+)
+def test_default_export_excludes(rel: str, excluded: bool) -> None:
+    assert export_excluded(rel, DEFAULT_EXPORT_EXCLUDES) is excluded
+
+
+def _tree(root: Path, files: dict[str, str | bytes]) -> None:
+    for rel, content in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+
+
+def _listing(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() or p.is_symlink()}
+
+
+def test_export_workspace_copies_the_tree_safely(vault: Vault, tmp_path: Path) -> None:
+    paths = vault.create_run(make_index(vault), [])
+    ws = paths.workspace
+    outside = tmp_path / "secret.txt"
+    outside.write_text("do not export")
+    _tree(ws, {
+        "README.md": "readme", "src/alloc.c": "int x;", "run.sh": "#!/bin/sh\n", "src/__init__.py": "",
+        "web/package.json": "",  # empty but not at the root: a real file of the deliverable
+        ".env": "", ".env.local": "", "package.json": "", ".npmrc": "registry=x",  # the last is not empty: kept
+        ".maf/p.md": "p", "build/a.o": b"o", "empty-dir/.keep": "",
+    })
+    (ws / "run.sh").chmod(0o755)
+    (ws / "empty-dir" / ".keep").unlink()
+    (ws / "alias.c").symlink_to(ws / "src" / "alloc.c")
+    (ws / "leak.txt").symlink_to(outside)
+    (ws / "dangling").symlink_to(ws / "nowhere")
+    (ws / "srclink").symlink_to(ws / "src", target_is_directory=True)
+    os.mkfifo(ws / "pipe")
+
+    result = vault.export_workspace(RUN_ID)
+
+    got = _listing(paths.deliverables)
+    assert got == {"README.md", "src/alloc.c", "run.sh", "src/__init__.py", "web/package.json", ".npmrc", "alias.c"}
+    assert result.files == tuple(sorted(got))
+    assert result.total_bytes == sum((paths.deliverables / rel).stat().st_size for rel in got)
+    assert sorted(result.placeholders) == [".env", ".env.local", "package.json"]
+    assert sorted(result.skipped) == [
+        "dangling (dangling symlink)", "leak.txt (symlink out of the workspace)", "pipe (not a regular file)",
+        "srclink/ (symlinked directory)",
+    ]
+    assert not (paths.deliverables / "alias.c").is_symlink()
+    assert (paths.deliverables / "alias.c").read_text() == "int x;"
+    assert os.access(paths.deliverables / "run.sh", os.X_OK)
+    assert not (paths.deliverables / "empty-dir").exists()
+    assert paths.deliverables.stat().st_mode & 0o777 != 0o700  # not the staging folder's private mode
+    assert result.excluded == ("build/",)  # .maf/ is pipeline state, not reported
+    assert result.describe() == f"7 file(s), {result.total_bytes} B; excluded: build/"
+
+
+def test_symlinks_into_excluded_paths_are_not_exported(vault: Vault) -> None:
+    """Lint and the source audit never read ``.maf/`` or ``inputs/``, so a link into them must not ship their content
+    as a regular file."""
+    paths = vault.create_run(make_index(vault), [])
+    ws = paths.workspace
+    _tree(ws, {".maf/execution-r1.md": "PROMPT: internal pipeline notes", "inputs/data.csv": "private", "a.md": "a"})
+    (ws / "docs").mkdir()
+    os.symlink("../.maf/execution-r1.md", ws / "docs" / "brief.md")
+    os.symlink("../inputs/data.csv", ws / "docs" / "data.csv")
+    os.symlink("../a.md", ws / "docs" / "a.md")
+    result = vault.export_workspace(RUN_ID)
+    assert _listing(paths.deliverables) == {"a.md", "docs/a.md"}
+    assert sorted(result.skipped) == [
+        "docs/brief.md (symlink into the excluded .maf/execution-r1.md)",
+        "docs/data.csv (symlink into the excluded inputs/data.csv)",
+    ]
+
+
+def test_in_source_build_output_is_left_out_and_reported(vault: Vault) -> None:
+    paths = vault.create_run(make_index(vault), [])
+    _tree(paths.workspace, {
+        "prog.c": "int main(void){return 0;}", "prog.o": b"\x7fELF", "a.out": b"\x7fELF", "lib/libx.a": b"!<arch>",
+        "lib/x.h": "x", "fw/test.elf": b"\x7fELF", "cmake/CMakeFiles/x.o": b"o", "cmake/CMakeCache.txt": "c",
+        "cmake/CMakeLists.txt": "project(x)", "src/__pycache__/m.pyc": b"\x00", "src/m.py": "",
+        ".maf/p.md": "p", "inputs/spec.pdf": b"%PDF",
+    })
+    result = vault.export_workspace(RUN_ID)
+    assert result.files == ("cmake/CMakeLists.txt", "lib/x.h", "prog.c", "src/m.py")
+    assert result.excluded == (
+        "a.out", "cmake/CMakeCache.txt", "cmake/CMakeFiles/", "fw/", "lib/libx.a", "prog.o", "src/__pycache__/",
+    )
+    assert result.describe().endswith(
+        "excluded: a.out, cmake/CMakeCache.txt, cmake/CMakeFiles/, fw/, lib/libx.a and 2 more"
+    )
+
+
+def test_re_include_patterns_bring_back_build_files_but_never_pipeline_state(vault: Vault) -> None:
+    """``build/*`` drops a hand-written ``build/`` too; a ``!`` pattern (``Settings.export_include``) restores it, and
+    the protected patterns, repeated last, still win."""
+    paths = vault.create_run(make_index(vault), [])
+    _tree(paths.workspace, {
+        "build/package/Dockerfile": "FROM x", "build/toolchain.cmake": "set(x)", "build/a.o": b"o",
+        ".maf/p.md": "p", "inputs/i.md": "i",
+    })
+    patterns = (*DEFAULT_EXPORT_EXCLUDES, "!build/package/*", "!build/*.cmake", "!*.md", *PROTECTED_EXPORT_EXCLUDES)
+    result = vault.export_workspace(RUN_ID, excludes=patterns)
+    assert result.files == ("build/package/Dockerfile", "build/toolchain.cmake")
+    assert result.excluded == ("build/a.o",)
+
+
+def test_export_workspace_replaces_the_previous_tree_and_cleans_leftovers(vault: Vault) -> None:
+    paths = vault.create_run(make_index(vault), [])
+    _tree(paths.workspace, {"a.txt": "a"})
+    _tree(paths.deliverables, {"stale/old.txt": "old"})
+    leftover = paths.root / ".deliverables-crashed.tmp"
+    _tree(leftover, {"half.txt": "h"})
+    vault.export_workspace(RUN_ID, excludes=())
+    assert _listing(paths.deliverables) == {"a.txt"}
+    assert sorted(p.name for p in paths.root.iterdir() if p.name.startswith(".deliverables")) == []
+
+
+def test_export_workspace_restores_the_old_tree_if_the_swap_fails(vault: Vault, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = vault.create_run(make_index(vault), [])
+    _tree(paths.workspace, {"new.txt": "n"})
+    _tree(paths.deliverables, {"old.txt": "o"})
+    real_replace = os.replace
+    calls: list[str] = []
+
+    def flaky(src: object, dst: object) -> None:
+        calls.append(str(dst))
+        if len(calls) == 2:
+            raise OSError("disk trouble")
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("maf.vault.os.replace", flaky)
+    with pytest.raises(OSError, match="disk trouble"):
+        vault.export_workspace(RUN_ID)
+    monkeypatch.setattr("maf.vault.os.replace", real_replace)
+    assert _listing(paths.deliverables) == {"old.txt"}
+    assert not [p for p in paths.root.iterdir() if p.name.startswith(".deliverables")]
+
+
+def test_export_workspace_caps_and_errors(vault: Vault) -> None:
+    paths = vault.create_run(make_index(vault), [])
+    _tree(paths.workspace, {"data/big.bin": b"x" * 5000, "src/a.c": "int a;", "README.md": "r"})
+    _tree(paths.deliverables, {"keep.txt": "k"})
+    with pytest.raises(ExportTooLarge) as too_big:
+        vault.export_workspace(RUN_ID, max_bytes=4000)
+    message = str(too_big.value)
+    assert "would be 5.0 kB in 3 file(s), over the cap of 4.0 kB and 20000 files" in message
+    assert "largest entries: data/ (5.0 kB), src/ (6 B), README.md (1 B)" in message
+    with pytest.raises(ExportTooLarge, match="over the cap of .* and 2 files"):
+        vault.export_workspace(RUN_ID, max_files=2)
+    assert _listing(paths.deliverables) == {"keep.txt"}  # nothing was touched
+    assert vault.export_workspace(RUN_ID, excludes=("data",), max_files=2).files == ("README.md", "src/a.c")
+
+    with pytest.raises(FileNotFoundError):
+        vault.export_workspace("2026-09-28-nope")
+    shutil.rmtree(paths.workspace)
+    with pytest.raises(ExportError, match="does not exist"):
+        vault.export_workspace(RUN_ID)
+

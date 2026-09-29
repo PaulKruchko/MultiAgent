@@ -6,12 +6,17 @@ Steps:
 1. ChatGPT (``chatgpt`` role), structured output with ``TRIAGE_SCHEMA``: decides ``execution_mode``,
    Gemini instructions, search queries and deliverable. Python renders it to ``01a-routing``
    (kind ROUTING, ``from: chatgpt``, ``to: gemini``).
-2. Gemini (``gemini`` role) with ``web_search=True`` when there are search queries, and every
-   user input file as an ``Attachment``. Produces ``01-ingestion`` (kind INGESTION) via ``generate_handoff``.
-   Grounding citations from ``CompletionResult.citations`` are appended to ``## Sources`` by Python
-   when the model omitted them. Python then wraps every section in a ``quote_untrusted`` callout
-   (``quote_ingestion``): the whole note derives from web and file content, which DESIGN.md requires to
-   stay quoted data.
+2. Gemini (``gemini`` role) with ``web_search=True`` and ``url_context=True`` (so it can read the pages it
+   quotes) when there are search queries, and every user input file as an ``Attachment``. Produces
+   ``01-ingestion`` (kind INGESTION) via ``generate_handoff``. ``## Sources`` lists the *verified sources*: one
+   entry per source with checked bibliographic metadata and verbatim excerpts with locators
+   (``maf.handoff.SOURCES_GRAMMAR``). ``check_ingestion`` enforces that grammar, that ``[S<n>]`` citations in
+   ``## Key Facts``/``## Data Tables`` name an entry and that ``File:`` names an attached file; its errors go
+   through the one repair. Later stages may cite only these entries, never the pipeline's own notes.
+   Grounding citations from ``CompletionResult.citations`` that the model did not list are appended to
+   ``## Sources`` by Python, labelled as consulted but not citable. Python then wraps every section in a
+   ``quote_untrusted`` callout (``quote_ingestion``): the whole note derives from web and file content, which
+   DESIGN.md requires to stay quoted data.
 
 ``index_updates = {"mode": triage["execution_mode"]}``.
 """
@@ -20,6 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Sequence
+from pathlib import PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -68,6 +76,13 @@ MAX_SEARCH_QUERIES = 12
 SEARCH_QUERY_ALLOWANCE = 2
 """Gemini may issue more queries than listed; the worst-case estimate allows this many per listed query."""
 
+CONSULTED_LABEL = (
+    "Search results and pages the model consulted without listing them as verified sources "
+    "(added by maf; not citable):"
+)
+
+_CITED_IDS = re.compile(r"\[(S\d+(?:\s*[,;]\s*S\d+)*)\]")
+
 
 class Triage(BaseModel):
     """Validated ``TRIAGE_SCHEMA`` object."""
@@ -106,7 +121,9 @@ class IngestionBackend:
         request_kw: dict[str, Any] = {"attachments": attachments}
         if triage.search_queries:
             request_kw["web_search"] = True
+            request_kw["url_context"] = True
             request_kw["max_search_queries"] = max(5, SEARCH_QUERY_ALLOWANCE * len(triage.search_queries))
+        input_files = list(ctx.index.input_files)
         prompt = render_prompt(
             "ingestion",
             routing=render_inputs({routing_name: routing}),
@@ -123,6 +140,7 @@ class IngestionBackend:
             to="strategy",
             inputs=[routing_name],
             purpose="ingestion",
+            check=lambda handoff: check_ingestion(handoff, input_files),
             **request_kw,
         )
         citations = [c for r in generated.results for c in r.citations]
@@ -226,9 +244,41 @@ def _attachment_list(ctx: StageContext, attachments: tuple[Attachment, ...]) -> 
     return "\n".join(f"- `{a.path.resolve().relative_to(workspace).as_posix()}`" for a in attachments)
 
 
+def check_ingestion(handoff: Handoff, input_files: Sequence[str]) -> list[str]:
+    """Stage-specific validation of the Gemini note (its errors go through the one repair): ``## Sources``
+    follows ``maf.handoff.SOURCES_GRAMMAR``, every ``[S<n>]`` cited in ``## Key Facts`` or ``## Data Tables``
+    names an entry, and every ``File:`` names an attached input (workspace path or bare file name)."""
+    errors = hf.source_errors(handoff.section("Sources"))
+    if errors:
+        return errors
+    sources = hf.parse_sources(handoff.section("Sources"))
+    ids = {s.id for s in sources}
+    for name in ("Key Facts", "Data Tables"):
+        errors += [
+            f"'## {name}' cites [{sid}], but '## Sources' has no entry {sid}"
+            for sid in cited_source_ids(handoff.section(name))
+            if sid not in ids
+        ]
+    attached = {*input_files, *(PurePosixPath(f).name for f in input_files)}
+    for source in sources:
+        if source.file and source.file not in attached:
+            listed = ", ".join(f"`{f}`" for f in input_files) or "none"
+            errors.append(
+                f"'## Sources' entry {source.id}: File `{source.file}` is not an attached file (attached: {listed})"
+            )
+    return errors
+
+
+def cited_source_ids(text: str) -> list[str]:
+    """``S<n>`` ids cited as ``[S1]`` or ``[S1, S3]``, in first-seen order."""
+    found = [sid.strip() for group in _CITED_IDS.findall(text) for sid in re.split(r"[,;]", group)]
+    return list(dict.fromkeys(found))
+
+
 def add_missing_citations(handoff: Handoff, citations: list[Citation]) -> Handoff:
-    """Append grounding sources the model did not cite to ``## Sources``. Titles come from the web,
-    so they are flattened, stripped of link syntax and quoted as data."""
+    """Append grounding sources the model did not list to ``## Sources``, labelled as consulted but not citable
+    (only the verified entries are). Titles come from the web, so they are flattened, stripped of link syntax
+    and quoted as data."""
     sources = handoff.section("Sources")
     missing: dict[str, Citation] = {}
     for citation in citations:
@@ -241,7 +291,9 @@ def add_missing_citations(handoff: Handoff, citations: list[Citation]) -> Handof
     for uri, citation in missing.items():
         title = one_line(citation.title, 200).translate(str.maketrans("", "", "[]`<>|"))
         lines.append(f'- <{uri}> "{title}" (search grounding)' if title else f"- <{uri}> (search grounding)")
-    addition = "Grounding sources returned by the search tool (added by maf):\n\n" + "\n".join(lines)
+    addition = f"{CONSULTED_LABEL}\n\n" + "\n".join(lines)
+    if sources.strip() == hf.NONE_MARKER:
+        return with_sections(handoff, {"Sources": f"No verified source.\n\n{addition}"})
     return with_sections(handoff, {"Sources": f"{sources.rstrip()}\n\n{addition}"})
 
 

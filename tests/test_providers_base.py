@@ -116,6 +116,13 @@ def test_attachment_mime_type() -> None:
     assert attachment_mime_type(Attachment(path=Path("noext"))) == "application/octet-stream"
 
 
+def test_url_context_is_an_opt_in_request_field() -> None:
+    assert _req().url_context is False
+    request = _req(web_search=True, url_context=True)
+    assert request.url_context is True
+    assert estimate_request_tokens(request) == estimate_request_tokens(_req())  # the provider prices fetched pages
+
+
 # --- structured output -------------------------------------------------------------------------
 
 SCHEMA = {
@@ -242,6 +249,8 @@ def test_build_providers_constructs_all_adapters_without_network(settings: Setti
     assert code.sandbox_verified is False
     assert len(str(code.tmpdir)) <= max_tmpdir_bytes() and not code.tmpdir.is_relative_to(workspace)
     assert code.build_env()["TMPDIR"] == str(code.tmpdir)
+    assert code.bash_timeout_s == settings.bash_timeout_s == 0.75 * settings.claude_code_timeout_s
+    assert code.build_env()["BASH_MAX_TIMEOUT_MS"] == str(int(settings.bash_timeout_s * 1000))
     assert not workspace.exists()  # construction has no side effects
 
 
