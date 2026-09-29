@@ -24,6 +24,9 @@ Round r (= ``ctx.index.round``):
       many works (up to ``SOURCE_AUDIT_MAX_CALLS``), and an audit that accounts for too few of them is incomplete.
       For each work it checks that it exists, that its metadata are right, and that it supports a sample of the
       claims the text attributes to it. ``01-ingestion`` ``## Sources`` (the verified sources) is shown as a lead.
+      The documents go out with maf's API keys and key-shaped strings masked (``maf.redact``): Gemini fetches the
+      URLs it finds in them from outside the sandbox, so a "reference" carrying a key a sandboxed command read would
+      otherwise send the key to that URL's host.
       Every verdict but ``verified`` becomes an ``SRC-<n>`` issue (``SOURCE_AUDIT_SEVERITY``, ``raised_by="gemini"``),
       except an ``internal_note`` whose reference is itself a pipeline link that the lint already raised in that
       document (``lint_covered``): that one stays a LINT issue. The issue line holds only maf's words (document,
@@ -95,6 +98,7 @@ from maf.config import ModelRole
 from maf.handoff import Handoff, HandoffKind, Issue, Response, Ruling
 from maf.prompts import render_prompt
 from maf.providers import CompletionRequest, CompletionResult, StructuredOutputError
+from maf.redact import known_secrets, redact
 from maf.stages.base import (
     NO_MODEL,
     WORKSPACE_META_DIR,
@@ -608,7 +612,7 @@ class CrosscheckBackend:
                     round=str(ctx.round),
                     scope=audit_scope(max_refs, part, calls),
                     verified_sources=verified or "None: the run has no ingestion report with verified sources.",
-                    documents=render_documents(cited),
+                    documents=redact(render_documents(cited), known_secrets()),  # url_context fetches its URLs
                 ),
                 system=role_system("gemini", ctx.settings),
                 max_output_tokens=default_output_tokens(ctx.settings, "gemini"),

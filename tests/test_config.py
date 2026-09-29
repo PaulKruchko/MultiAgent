@@ -331,6 +331,13 @@ def test_invalid_override_raises_value_error(tmp_path: Path) -> None:
         load_settings(tmp_path / "none.yaml", budget_usd=0)
 
 
+@pytest.mark.parametrize("field", ["budget_usd", "mcp_max_budget_usd"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_budgets_must_be_finite(tmp_path: Path, field: str, value: float) -> None:
+    with pytest.raises(ValueError, match=field):
+        load_settings(tmp_path / "none.yaml", **{field: value})
+
+
 def test_deliverable_and_verification_defaults() -> None:
     s = Settings()
     assert s.export_exclude == DEFAULT_EXPORT_EXCLUDE
@@ -362,3 +369,30 @@ def test_bash_timeout_defaults_to_a_share_of_the_session_timeout() -> None:
     assert Settings().bash_timeout_s == 2700.0
     assert Settings(claude_code_timeout_s=1200).bash_timeout_s == 900.0
     assert Settings(claude_code_bash_timeout_s=1500).bash_timeout_s == 1500.0
+
+
+def test_mcp_allowed_origins_default_empty_and_exact() -> None:
+    assert Settings().mcp_allowed_origins == ()
+    ok = ("https://chatgpt.com", "http://localhost:6274", "http://[::1]:8080")
+    assert Settings(mcp_allowed_origins=ok).mcp_allowed_origins == ok
+
+
+@pytest.mark.parametrize(
+    "origin", ["*", "https://chatgpt.com/", "https://*.chatgpt.com", "http://localhost:*", "HTTPS://chatgpt.com",
+               "null", "chatgpt.com", "https://chatgpt.com/path", ""],
+)
+def test_mcp_allowed_origins_rejects_wildcards_paths_and_non_origins(origin: str) -> None:
+    with pytest.raises(ValueError, match="mcp_allowed_origins"):
+        Settings(mcp_allowed_origins=(origin,))
+
+
+def test_mcp_spend_limits_default_low_and_validate() -> None:
+    """An MCP run gets $5 at most unless the config raises it (not budget_usd's $25); at most two MCP runs wait or run
+    at once; MCP runs may commit $25 per rolling 24 hours."""
+    s = Settings()
+    assert (s.mcp_max_budget_usd, s.mcp_budget_ceiling_usd) == (5.0, 5.0)
+    assert (s.mcp_max_pending_runs, s.mcp_daily_budget_usd) == (2, 25.0)
+    assert Settings(mcp_max_budget_usd=None).mcp_budget_ceiling_usd == s.budget_usd  # explicit null: budget_usd
+    for bad in ({"mcp_max_pending_runs": 0}, {"mcp_daily_budget_usd": 0}, {"mcp_daily_budget_usd": float("inf")}):
+        with pytest.raises(ValueError):
+            Settings(**bad)

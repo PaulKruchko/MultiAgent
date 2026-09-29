@@ -222,11 +222,49 @@ def test_mcp_budget_ceiling(settings: Settings, fake_providers: FakeProviders) -
     result, pipeline = _mcp_tool(settings, fake_providers, "start_run", brief="x", budget_usd=1e9)
     assert result.is_error and "ceiling" in result.content[0].text
     assert pipeline.list_runs() == []
-    result, pipeline = _mcp_tool(settings, fake_providers, "start_run", brief="x", budget_usd=10.0)
+    result, _ = _mcp_tool(settings, fake_providers, "start_run", brief="y", budget_usd=10.0)
+    assert result.is_error and "ceiling $5.00" in result.content[0].text  # the default MCP ceiling, not budget_usd
+    uncapped = settings.model_copy(update={"mcp_max_budget_usd": None})  # explicit null: budget_usd is the ceiling
+    result, pipeline = _mcp_tool(uncapped, fake_providers, "start_run", brief="x", budget_usd=10.0)
     assert not result.is_error
-    capped = settings.model_copy(update={"mcp_max_budget_usd": 5.0})
-    result, _ = _mcp_tool(capped, fake_providers, "start_run", brief="y", budget_usd=10.0)
-    assert result.is_error
+
+
+def test_fail_orphans_fails_a_dead_servers_queue_at_once(settings: Settings, fake_providers: FakeProviders) -> None:
+    """A run queued by a ``maf serve`` that died (crash, restart) must not sit pending forever just because it was
+    queued less than the grace period ago; a live server's queue is left alone."""
+    from maf.pipeline import boot_id, process_owner
+
+    pipeline = _pipeline(settings, fake_providers)
+    dead = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True)
+    queued_dead = pipeline.create("queued by a dead server", origin="mcp", owner=f"{boot_id()}:{dead.stdout.strip()}")
+    other_boot = pipeline.create("queued before a reboot", origin="mcp", owner=f"another-boot:{os.getppid()}")
+    ours = pipeline.create("pid of this process", origin="mcp", owner=process_owner())
+    live = pipeline.create("queued by a live server", origin="mcp", owner=f"{boot_id()}:{os.getppid()}")
+    cli_run = pipeline.create("cli run about to take its lock")
+    failed = pipeline.fail_orphans()  # the default grace applies only to runs without an owner
+    assert sorted(failed) == sorted([queued_dead.run_id, other_boot.run_id, ours.run_id])
+    assert pipeline.status(live.run_id).status == RunStatus.PENDING
+    assert pipeline.status(cli_run.run_id).status == RunStatus.PENDING
+
+
+def test_fail_orphans_fails_an_unlocked_running_run_at_once(settings: Settings, fake_providers: FakeProviders) -> None:
+    """RUNNING is only written under the run lock, so RUNNING with a free lock means the process died."""
+    pipeline = _pipeline(settings, fake_providers)
+    index = pipeline.create("crashed mid-stage")
+    index.status = RunStatus.RUNNING
+    pipeline.vault.write_index(index)
+    assert pipeline.fail_orphans() == [index.run_id]
+
+
+def test_cli_run_md_leaves_out_origin_and_owner(settings: Settings, fake_providers: FakeProviders) -> None:
+    """Older maf versions forbid unknown run.md keys; a CLI run must stay readable by them."""
+    pipeline = _pipeline(settings, fake_providers)
+    cli_run = pipeline.create("cli")
+    text = pipeline.vault.paths(cli_run.run_id).run_md.read_text()
+    assert "origin:" not in text and "owner:" not in text
+    mcp_run = pipeline.create("mcp", origin="mcp", owner="b:1")
+    text = pipeline.vault.paths(mcp_run.run_id).run_md.read_text()
+    assert "origin: mcp" in text and "owner: b:1" in text
 
 
 # --------------------------------------------------------------------------- Claude Code headroom

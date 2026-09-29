@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import math
 import os
 import stat
 import threading
@@ -80,7 +81,10 @@ REVIEW_NOTE_REL = Path(".maf") / "review-note.md"
 """Workspace-relative location of the persisted ``resume --note`` text."""
 
 ORPHAN_GRACE_S = 120.0
-"""A PENDING/RUNNING run whose lock is free is only treated as orphaned after run.md is this old."""
+"""A PENDING run with no recorded owner (a CLI run between ``create`` and taking its lock, or one queued by an older
+maf) whose lock is free is only treated as orphaned after run.md is this old."""
+
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 RUN_LOCK_NAME = ".lock"
 """Per-run lock file in the run folder (a dotfile, so Obsidian ignores it)."""
@@ -151,6 +155,45 @@ def check_confined_input(path: Path, root: Path) -> None:
         raise ValueError(f"input file {path} is empty")
 
 
+def not_an_inbox_file(given: str | Path) -> ValueError:
+    """The one refusal a remote caller gets for any input file problem: it echoes only the caller's own string, so
+    it tells nothing about files outside the inbox (whether they exist, where a symlink points)."""
+    return ValueError(f"not an allowed inbox file: {given}")
+
+
+def boot_id() -> str:
+    """This boot's id (``/proc/sys/kernel/random/boot_id``), or "" where it cannot be read."""
+    try:
+        return BOOT_ID_PATH.read_text(encoding="ascii").strip()
+    except OSError:
+        return ""
+
+
+def process_owner() -> str:
+    """``<boot id>:<pid>`` of this process, recorded as ``RunIndex.owner`` of the runs a server queues."""
+    return f"{boot_id()}:{os.getpid()}"
+
+
+def owner_alive(owner: str) -> bool:
+    """True if ``owner`` (``process_owner()`` of some process) names another process that is still running. This
+    process counts as dead: when it recovers orphans it has queued nothing yet, so a match is an earlier incarnation
+    whose pid was reused. A pid reused by an unrelated process reads as alive (the run then waits for that process)."""
+    boot, _, pid_text = owner.rpartition(":")
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return False
+    if pid <= 0 or pid == os.getpid() or boot != boot_id():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
+
+
 def _describe(exc: BaseException) -> str:
     message = str(exc).strip()
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
@@ -204,25 +247,31 @@ class Pipeline:
         tier: Tier | None = None,
         review: bool | None = None,
         input_root: Path | None = None,
+        origin: str | None = None,
+        owner: str | None = None,
     ) -> RunIndex:
         """Create the run folder, workspace, and run.md (status PENDING, stage ingestion). No model calls.
         Missing input files raise ``FileNotFoundError`` before anything is created.
 
         ``input_root`` (set for remote callers such as MCP) confines input files to that directory; see
-        ``check_confined_input``. Violations raise ``ValueError``."""
+        ``check_confined_input``. Then every problem with a file, a missing one included, raises the same
+        ``ValueError`` (``not_an_inbox_file``), which names only the string the caller gave: the confinement check
+        runs before any existence check, so a refusal says nothing about files outside the inbox. The details go to
+        the debug log. ``origin`` and ``owner`` are recorded in run.md (``RunIndex``)."""
         brief = brief.strip()
         if not brief:
             raise ValueError("brief must not be empty")
         budget = self.settings.budget_usd if budget_usd is None else budget_usd
-        if budget <= 0:
-            raise ValueError(f"budget must be positive, got {budget}")
+        if not (math.isfinite(budget) and budget > 0):  # NaN would slip past every cap comparison
+            raise ValueError(f"budget must be positive and finite, got {budget}")
         sources: list[Path] = []
         for file in files or []:
+            if input_root is not None:
+                sources.append(self._confined_source(file, input_root))
+                continue
             path = Path(file).expanduser().resolve()
             if not path.is_file():
                 raise FileNotFoundError(f"input file not found: {file}")
-            if input_root is not None:
-                check_confined_input(path, input_root)
             sources.append(path)
 
         for _ in range(_CREATE_ATTEMPTS):
@@ -238,6 +287,8 @@ class Pipeline:
                 updated=now,
                 workspace=str(paths.workspace),
                 brief=brief,
+                origin=origin,
+                owner=owner,
             )
             try:
                 self.vault.create_run(index, sources)
@@ -245,6 +296,17 @@ class Pipeline:
                 continue  # another creator took this id between new_run_id and create_run
             return self.vault.read_index(run_id)
         raise RuntimeError(f"could not allocate a unique run id for brief {brief[:60]!r}")
+
+    @staticmethod
+    def _confined_source(file: str | Path, input_root: Path) -> Path:
+        """``file`` resolved, if ``check_confined_input`` accepts it; else ``not_an_inbox_file(file)``."""
+        try:
+            path = Path(file).expanduser().resolve()
+            check_confined_input(path, input_root)
+        except (OSError, ValueError, RuntimeError) as exc:  # RuntimeError: a symlink loop
+            log.debug("refused input file %r: %s", str(file), exc)
+            raise not_an_inbox_file(file) from None
+        return path
 
     def status(self, run_id: str) -> RunIndex:
         return self.vault.read_index(run_id)
@@ -296,8 +358,8 @@ class Pipeline:
         ``extra_round=True`` on a COMPLETED_WITH_ISSUES run schedules one more execution + crosscheck pass at
         ``round + 1`` followed by final (see the module docstring). ``extra_round`` on any other status raises
         ``ValueError``."""
-        if budget_usd is not None and budget_usd <= 0:
-            raise ValueError(f"budget must be positive, got {budget_usd}")
+        if budget_usd is not None and not (math.isfinite(budget_usd) and budget_usd > 0):
+            raise ValueError(f"budget must be positive and finite, got {budget_usd}")
         with self._guard(run_id):
             index = self.vault.read_index(run_id)
             if extra_round and index.status != RunStatus.COMPLETED_WITH_ISSUES:
@@ -348,19 +410,24 @@ class Pipeline:
             return index, export
 
     def fail_orphans(self, *, grace_s: float = ORPHAN_GRACE_S) -> list[str]:
-        """Mark FAILED every run left PENDING or RUNNING by a process that is gone: its run lock is free and
-        run.md has not changed for ``grace_s`` seconds. Returns the affected run ids. Never spends money:
-        the user decides with ``maf resume`` whether to continue them."""
+        """Mark FAILED every run left PENDING or RUNNING by a process that is gone. Returns the affected run ids.
+        Never spends money: the user decides with ``maf resume`` whether to continue them.
+
+        A run whose lock another process holds is being advanced and is left alone. With the lock free:
+        - RUNNING: orphaned at once. RUNNING is only ever written under the run lock, so a free lock means the
+          process advancing it died.
+        - PENDING with an ``owner`` (queued by a ``maf serve``): orphaned at once if that process is gone (another
+          boot, a dead pid, or this process's own pid); left alone while it runs, since it is that server's queue.
+        - PENDING without an owner (a CLI run about to take its lock, or queued by an older maf): orphaned only once
+          run.md has not changed for ``grace_s`` seconds."""
         failed: list[str] = []
         for index in self.list_runs():
-            if index.status not in (RunStatus.PENDING, RunStatus.RUNNING):
-                continue
-            if (self.clock() - index.updated).total_seconds() < grace_s:
+            if not self._maybe_orphaned(index, grace_s):
                 continue
             try:
                 with self._guard(index.run_id):
                     current = self.vault.read_index(index.run_id)
-                    if current.status not in (RunStatus.PENDING, RunStatus.RUNNING):
+                    if not self._maybe_orphaned(current, grace_s):
                         continue
                     previous = current.status.value
                     current.status = RunStatus.FAILED
@@ -371,6 +438,16 @@ class Pipeline:
             except RuntimeError:
                 continue  # another process is advancing it right now
         return failed
+
+    def _maybe_orphaned(self, index: RunIndex, grace_s: float) -> bool:
+        """``fail_orphans``'s test, short of the lock (the caller takes it)."""
+        if index.status == RunStatus.RUNNING:
+            return True
+        if index.status != RunStatus.PENDING:
+            return False
+        if index.owner:
+            return not owner_alive(index.owner)
+        return (self.clock() - index.updated).total_seconds() >= grace_s
 
     # ------------------------------------------------------------------ internals
 

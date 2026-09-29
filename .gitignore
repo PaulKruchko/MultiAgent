@@ -221,3 +221,5 @@ __marimo__/
 .venv/
 workspaces/
 __pycache__/
+# mcp_inbox default: private input files for runs started from ChatGPT
+inbox/

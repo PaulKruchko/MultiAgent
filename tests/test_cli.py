@@ -127,6 +127,9 @@ def test_parser_other_commands() -> None:
         ["run"],
         ["run", "b", "--budget", "0"],
         ["run", "b", "--budget", "abc"],
+        ["run", "b", "--budget", "inf"],
+        ["run", "b", "--budget", "nan"],
+        ["resume", "r", "--budget", "inf"],
         ["run", "b", "--tier", "ultra"],
         ["list", "--limit", "0"],
         ["serve", "--port", "70000"],
@@ -457,13 +460,146 @@ def test_list_empty_text_and_json_limit(env: Env, capsys: pytest.CaptureFixture[
     assert len(capsys.readouterr().out.strip().splitlines()) == 3
 
 
-def test_serve_passes_host_and_port(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_serve_passes_host_and_port(env: Env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import maf.mcp_server
 
     seen: dict[str, Any] = {}
-    monkeypatch.setattr(maf.mcp_server, "serve", lambda pipeline, host, port: seen.update(host=host, port=port))
+    monkeypatch.setattr(maf.mcp_server, "serve", lambda pipeline, host, port, transport, uds: seen.update(
+        host=host, port=port, transport=transport, uds=uds))
     assert cli.main(env.argv("serve", "--port", "9123")) == 0
-    assert seen == {"host": "127.0.0.1", "port": 9123}
+    assert seen == {"host": "127.0.0.1", "port": 9123, "transport": "http", "uds": None}
+    assert cli.main(env.argv("serve", "--uds", str(tmp_path / "s.sock"))) == 0
+    assert seen["uds"] == tmp_path / "s.sock"
+    assert cli.main(env.argv("serve", "--stdio")) == 0
+    assert seen["transport"] == "stdio"
+
+
+def test_serve_stdio_rejects_host_and_port(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(env.argv("serve", "--stdio", "--port", "9000")) == cli.EXIT_USAGE
+    assert "--stdio" in capsys.readouterr().err
+    assert cli.main(env.argv("serve", "--stdio", "--uds", "/tmp/x.sock")) == cli.EXIT_USAGE
+
+
+def test_serve_exits_1_when_it_cannot_listen(env: Env, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    """A taken address is transient (the unit restarts on 1); configuration errors exit 2 (no restart)."""
+    import maf.mcp_server
+
+    def busy(*args: Any, **kwargs: Any) -> None:
+        raise OSError(98, "Address already in use")
+
+    monkeypatch.setattr(maf.mcp_server, "serve", busy)
+    assert cli.main(env.argv("serve")) == cli.EXIT_FAILED
+    assert "cannot listen" in capsys.readouterr().err
+
+
+def test_serve_env_file_loads_keys_into_maf_only(env: Env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                capsys: pytest.CaptureFixture[str]) -> None:
+    """The stdio recipe: tunnel-client spawns maf without provider keys; maf reads them itself."""
+    import os
+
+    import maf.mcp_server
+
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(maf.mcp_server, "serve", lambda *a, **k: seen.update(
+        openai=os.environ.get("OPENAI_API_KEY"), runtime=os.environ.get("CONTROL_PLANE_API_KEY")))
+    monkeypatch.setenv("CONTROL_PLANE_API_KEY", "runtime-key-inherited")
+    env_file = tmp_path / "maf.env"
+    env_file.write_text("OPENAI_API_KEY=from-file-123\nGEMINI_API_KEY=\n# c\n")
+    env_file.chmod(0o644)
+    assert cli.main(env.argv("serve", "--stdio", "--env-file", str(env_file))) == cli.EXIT_USAGE
+    assert "chmod 600" in capsys.readouterr().err and seen == {}
+    env_file.chmod(0o600)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert cli.main(env.argv("serve", "--stdio", "--env-file", str(env_file))) == 0
+    assert seen == {"openai": "from-file-123", "runtime": None}  # the tunnel's runtime key is dropped
+    assert "GEMINI_API_KEY" not in os.environ  # empty template lines set nothing
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert cli.main(env.argv("serve", "--env-file", str(tmp_path / "missing.env"))) == cli.EXIT_USAGE
+
+
+def test_chatgpt_commands_never_build_a_pipeline(
+    env: Env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from maf import chatgpt
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(cli, "make_pipeline", lambda settings: pytest.fail("chatgpt must not build a pipeline"))
+    seen: dict[str, Any] = {}
+
+    def fake_setup(settings: Settings, *, layout: chatgpt.Layout, params: chatgpt.UnitParams, reload: bool) -> int:
+        seen.update(action="setup", port=params.mcp_port, health=params.health_port, reload=reload,
+                    unit_dir=layout.unit_dir)
+        return 0
+
+    def fake_status(settings: Settings, *, layout: chatgpt.Layout, tunnel_client: Path | None, lines: int) -> int:
+        seen.update(action="status", lines=lines)
+        return 1
+
+    monkeypatch.setattr(chatgpt, "setup", fake_setup)
+    monkeypatch.setattr(chatgpt, "status", fake_status)
+    assert cli.main(env.argv("chatgpt", "setup", "--no-reload", "--health-port", "18766")) == 0
+    assert (seen["action"], seen["port"], seen["health"], seen["reload"]) == ("setup", 8765, 18766, False)
+    assert seen["unit_dir"] == tmp_path / "home" / ".config" / "systemd" / "user"
+    assert cli.main(env.argv("chatgpt", "status", "--lines", "3")) == 1
+    assert (seen["action"], seen["lines"]) == ("status", 3)
+    assert not env.vault.exists() and not env.workspaces.exists()
+
+
+@pytest.mark.parametrize("argv", [["chatgpt"], ["chatgpt", "bogus"], ["chatgpt", "status", "--lines", "0"]])
+def test_chatgpt_usage_errors_exit_2(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(argv) == cli.EXIT_USAGE
+    assert capsys.readouterr().err
+
+
+def test_chatgpt_setup_refuses_public_host(env: Env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                           capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config = tmp_path / "config.yaml"
+    config.write_text("mcp_host: 0.0.0.0\n", encoding="utf-8")
+    assert cli.main(env.argv("--config", str(config), "chatgpt", "setup", "--no-reload")) == cli.EXIT_USAGE
+    assert "loopback" in capsys.readouterr().err
+    assert not (tmp_path / "home" / ".config").exists()
+
+
+def test_chatgpt_setup_writes_the_given_config_and_vault_into_the_unit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--config``/``--vault`` (and MAF_* variables) must reach the service, or it silently reads other settings."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("MAF_BUDGET_USD", "12")
+    config = tmp_path / "c.yaml"
+    config.write_text(f"mcp_max_budget_usd: 3\nmcp_inbox: {tmp_path / 'inbox'}\n", encoding="utf-8")
+    assert cli.main(["--config", str(config), "--vault", str(tmp_path / "v"), "chatgpt", "setup", "--no-reload",
+                     "--health-port", "18777"]) == 0
+    unit = (home / ".config" / "systemd" / "user" / "maf-mcp.service").read_text()
+    exec_start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+    assert f" serve --config {config} --vault {tmp_path / 'v'} --host 127.0.0.1 --port 8765 --uds " in exec_start
+    assert "Environment=MAF_BUDGET_USD=12\n" in unit
+    # A re-run that leaves out a source the unit has is refused, not silently re-rendered with other settings.
+    monkeypatch.setenv("MAF_CONFIG", str(config))
+    assert cli.main(["chatgpt", "setup", "--no-reload"]) == cli.EXIT_USAGE
+    assert f"runs with --vault {tmp_path / 'v'}, which this setup was not given" in capsys.readouterr().err
+    # With the same sources it goes through, and keeps the installed health port (and binary) instead of resetting them.
+    monkeypatch.setenv("MAF_VAULT", str(tmp_path / "v"))
+    assert cli.main(["chatgpt", "setup", "--no-reload"]) == 0
+    tunnel = (home / ".config" / "systemd" / "user" / "maf-tunnel.service").read_text()
+    assert "--health.listen-addr 127.0.0.1:18777" in tunnel
+    assert f" serve --config {config} --vault" in (home / ".config" / "systemd" / "user" / "maf-mcp.service").read_text()
+
+
+def test_chatgpt_setup_refuses_the_mcp_port_as_health_port(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                           capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert cli.main(["--vault", str(tmp_path / "v"), "--workspaces", str(tmp_path / "w"), "chatgpt", "setup",
+                     "--no-reload", "--health-port", "8765"]) == cli.EXIT_USAGE
+    assert "health port" in capsys.readouterr().err
+    assert cli.main(["chatgpt", "setup", "--no-reload", "--tunnel-client", "tc"]) == cli.EXIT_USAGE
+    assert "absolute" in capsys.readouterr().err
+    assert not (tmp_path / "home" / ".config").exists()
 
 
 def test_serve_refuses_public_host(env: Env, capsys: pytest.CaptureFixture[str]) -> None:

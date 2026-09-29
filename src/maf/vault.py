@@ -40,7 +40,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, get_args
+from typing import BinaryIO, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -48,6 +48,11 @@ from maf import lint as _lint
 from maf.config import check_workspaces_outside_vault
 from maf.handoff import Handoff, HandoffKind, dump_frontmatter, load_frontmatter, parse_handoff, render_handoff
 from maf.types import AgentName, ExecutionMode, ProviderName, RunStatus, StageName, Tier
+
+
+OPTIONAL_INDEX_KEYS = ("origin", "owner")
+"""``RunIndex`` keys left out of run.md while None (RunIndex forbids unknown keys, so older maf versions could not
+read a run.md that has them)."""
 
 
 class RunIndex(BaseModel):
@@ -95,6 +100,12 @@ class RunIndex(BaseModel):
     export_note: str | None = None
     """One line on that export, e.g. ``maf export: 57 file(s), 1.2 MB``."""
     tags: list[str] = Field(default_factory=lambda: ["maf", "maf/run"])
+    origin: Literal["mcp"] | None = None
+    """``mcp`` for a run created by the MCP server's ``start_run`` (counted by ``mcp_daily_budget_usd``); None for CLI
+    runs. Written to run.md only when set, like ``owner``, so a CLI run.md stays readable by older maf versions."""
+    owner: str | None = None
+    """``<boot id>:<pid>`` of the ``maf serve`` process that queued the run (``maf.pipeline.process_owner``), so
+    ``Pipeline.fail_orphans`` can tell a dead server's queued runs (fail them at once) from a live one's (leave them)."""
 
     @model_validator(mode="after")
     def _completed_with_open_criticals(self) -> RunIndex:
@@ -544,6 +555,9 @@ class Vault:
         """Atomically rewrite run.md: frontmatter plus ``render_run_body(index)``."""
         paths = self.paths(index.run_id)
         data = index.model_dump(mode="json")
+        for key in OPTIONAL_INDEX_KEYS:
+            if data.get(key) is None:
+                del data[key]
         data["created"] = index.created
         data["updated"] = index.updated
         if index.exported_at is not None:

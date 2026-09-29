@@ -137,7 +137,12 @@ def test_sandbox_settings(tmp_path: Path) -> None:
 
 def test_default_sandbox_denies_credentials(tmp_path: Path) -> None:
     settings = sandbox_settings(tmp_path)
-    assert "~/.ssh" in SENSITIVE_READ_PATHS
+    # Credentials, shell files that export keys, histories and browser profiles: what a prompt injection in a
+    # ChatGPT-written brief would read first.
+    for path in ("~/.ssh", "~/.config", "~/.bashrc", "~/.profile", "~/.bash_profile", "~/.zshrc", "~/.bash_history",
+                 "~/.python_history", "~/.pypirc", "~/.npmrc", "~/.pgpass", "~/.mozilla", "~/snap/firefox", "~/.var/app"):
+        assert path in SENSITIVE_READ_PATHS, path
+    assert len(set(SENSITIVE_READ_PATHS)) == len(SENSITIVE_READ_PATHS)
     assert settings["sandbox"]["filesystem"]["denyRead"] == list(SENSITIVE_READ_PATHS)
     assert "Read(~/.ssh/**)" in settings["permissions"]["deny"]
 

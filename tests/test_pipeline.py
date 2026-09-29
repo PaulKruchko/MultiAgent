@@ -246,7 +246,9 @@ def test_create_missing_file_creates_nothing(h: Harness, tmp_path: Path) -> None
     assert h.pipeline.list_runs() == []
 
 
-@pytest.mark.parametrize(("brief", "budget"), [("   ", None), ("ok", 0.0), ("ok", -1.0)])
+@pytest.mark.parametrize(
+    ("brief", "budget"), [("   ", None), ("ok", 0.0), ("ok", -1.0), ("ok", float("nan")), ("ok", float("inf"))]
+)
 def test_create_rejects_bad_arguments(h: Harness, brief: str, budget: float | None) -> None:
     with pytest.raises(ValueError):
         h.pipeline.create(brief, budget_usd=budget)
@@ -850,10 +852,11 @@ def test_list_runs_and_ledger_for(h: Harness) -> None:
     assert ledger.spent_usd == 0.0
 
 
-def test_resume_rejects_nonpositive_budget(h: Harness) -> None:
+@pytest.mark.parametrize("budget", [0, -1.0, float("nan"), float("inf")])
+def test_resume_rejects_nonpositive_or_non_finite_budget(h: Harness, budget: float) -> None:
     run_id = h.pipeline.create("x").run_id
     with pytest.raises(ValueError):
-        h.pipeline.resume(run_id, budget_usd=0)
+        h.pipeline.resume(run_id, budget_usd=budget)
 
 
 # --------------------------------------------------------------------------- end to end with the real stage backends

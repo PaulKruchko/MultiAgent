@@ -7,7 +7,9 @@ Owner: orchestration.
     maf status RUN_ID [--json]
     maf list [--json] [--limit N]
     maf export RUN_ID
-    maf serve [--host 127.0.0.1] [--port 8765]
+    maf serve [--host 127.0.0.1] [--port 8765] [--uds PATH] [--env-file PATH] | maf serve --stdio [--env-file PATH]
+    maf chatgpt setup [--no-reload] [--tunnel-client PATH] [--health-port N]
+    maf chatgpt status [--lines N]
 
 Global options: ``--vault PATH``, ``--workspaces PATH``, ``--config PATH``.
 Exit codes of ``run``/``resume`` follow the run's status: 0 completed (also awaiting review, or started with
@@ -24,12 +26,28 @@ any status), names what the exclude patterns left out, and notes it in run.md: e
 workspace), 2 for an unknown run.
 ``run --no-wait`` creates the run, starts ``maf resume RUN_ID`` as a detached process (output in
 ``workspace/.maf/run.log``) and returns immediately.
+``serve`` logs to stderr (the journal under systemd); ``--stdio`` serves MCP over stdin/stdout instead of HTTP, and
+``--uds PATH`` serves HTTP on a 0600 Unix socket instead of the TCP port (``--host``/``--port`` then only name the
+Host header). ``--env-file PATH`` (a private ``KEY=value`` file such as ``~/.config/maf/maf.env``) loads provider keys
+into maf's own environment, so the process that spawns ``serve --stdio`` (tunnel-client) never needs them. ``serve``
+exits 2 for usage and configuration errors (the unit does not restart on 2) and 1 when it cannot listen.
+``chatgpt setup`` installs the systemd user units and 0600 env templates for the ChatGPT app, ``chatgpt status``
+checks them (``maf.chatgpt``): exit 0 when ready, 1 when not, 2 for usage errors. Neither builds a pipeline. ``setup``
+writes the config, vault and workspaces it was given (global options or ``MAF_CONFIG``/``MAF_VAULT``/
+``MAF_WORKSPACES``/``MAF_BUDGET_USD``) into the maf-mcp unit, so the service reads the same settings (a re-run that
+leaves out a source the installed unit has is a usage error), and keeps the installed unit's tunnel-client path and
+health port unless ``--tunnel-client``/``--health-port`` override them.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
+import math
+import os
+import re
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -58,8 +76,8 @@ def _positive_float(text: str) -> float:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
-    if not value > 0:
-        raise argparse.ArgumentTypeError(f"must be positive: {text!r}")
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError(f"must be positive and finite: {text!r}")
     return value
 
 
@@ -129,6 +147,28 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", parents=[common], help="serve the MCP endpoint for the ChatGPT app")
     serve.add_argument("--host", help="bind address (loopback only; default from settings)")
     serve.add_argument("--port", type=_port, help="TCP port (default from settings)")
+    serve.add_argument("--stdio", action="store_true",
+                       help="serve over stdin/stdout instead of HTTP (for an MCP host that spawns maf)")
+    serve.add_argument("--uds", type=Path, metavar="PATH",
+                       help="serve HTTP on this Unix socket (mode 0600) instead of the TCP port; --host/--port then "
+                            "only name the Host header clients send")
+    serve.add_argument("--env-file", type=Path, metavar="PATH",
+                       help="load KEY=value lines (provider keys) from this private file into maf's environment")
+
+    chatgpt = sub.add_parser("chatgpt", parents=[common], help="ChatGPT app via the Secure MCP Tunnel: units, status")
+    actions = chatgpt.add_subparsers(dest="chatgpt_command", metavar="ACTION", required=True)
+    setup = actions.add_parser("setup", parents=[common],
+                               help="install the systemd user units and 0600 env templates, then daemon-reload")
+    setup.add_argument("--no-reload", action="store_true", help="skip systemctl --user daemon-reload")
+    setup.add_argument("--tunnel-client", type=Path, metavar="PATH",
+                       help="tunnel-client binary (default ~/.local/bin/tunnel-client)")
+    setup.add_argument("--health-port", type=_port, metavar="N",
+                       help="tunnel-client health/admin port on 127.0.0.1 (default 8766)")
+    status = actions.add_parser("status", parents=[common],
+                                help="unit states, recent logs, MCP health and tunnel readiness (no secrets shown)")
+    status.add_argument("--lines", type=_positive_int, default=10, metavar="N", help="journal lines per unit")
+    status.add_argument("--tunnel-client", type=Path, metavar="PATH",
+                        help="tunnel-client binary (default ~/.local/bin/tunnel-client)")
     return parser
 
 
@@ -350,20 +390,103 @@ def _cmd_export(args: argparse.Namespace, pipeline: Pipeline) -> int:
     return EXIT_OK
 
 
+def _configure_serve_logging() -> None:
+    """INFO and up to stderr (journald adds timestamps); a no-op when logging is already configured."""
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
+
+
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+SERVE_DROPPED_VARIABLES = ("CONTROL_PLANE_API_KEY", "CONTROL_PLANE_TUNNEL_ID")
+"""tunnel-client's own credentials, inherited by ``serve --stdio`` from the tunnel-client that spawns it. maf never
+uses them, so ``serve`` drops them from its environment."""
+
+
+def load_env_file(path: Path) -> list[str]:
+    """Set the non-empty ``KEY=value`` lines of ``path`` (systemd EnvironmentFile syntax, ``maf.chatgpt.read_env_file``)
+    in ``os.environ``; return the keys set. ``ValueError`` if the file is missing, not a regular file, readable or
+    writable by group or others, or has a malformed key."""
+    from maf.chatgpt import read_env_file
+
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise ValueError(f"--env-file {path}: {exc.strerror or exc}") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"--env-file {path} is not a regular file")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError(f"--env-file {path} is accessible to group or others (mode "
+                         f"{stat.S_IMODE(info.st_mode):04o}): chmod 600 it")
+    values = read_env_file(path)
+    bad = sorted(key for key in values if not _ENV_NAME_RE.fullmatch(key))
+    if bad:
+        raise ValueError(f"--env-file {path}: malformed variable name(s): {', '.join(bad)}")
+    loaded = [key for key, value in values.items() if value]
+    for key in loaded:
+        os.environ[key] = values[key]
+    return loaded
+
+
 def _cmd_serve(args: argparse.Namespace, pipeline: Pipeline) -> int:
     from maf.mcp_server import serve
 
+    if args.stdio and (args.host or args.port or args.uds):
+        print("maf: --stdio does not take --host, --port or --uds", file=sys.stderr)
+        return EXIT_USAGE
     host = args.host or pipeline.settings.mcp_host
     port = args.port or pipeline.settings.mcp_port
+    uds = args.uds.expanduser() if args.uds is not None else None
+    if args.env_file is not None:
+        try:
+            load_env_file(args.env_file.expanduser())
+        except ValueError as exc:
+            print(f"maf: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+    for name in SERVE_DROPPED_VARIABLES:
+        os.environ.pop(name, None)
+    _configure_serve_logging()
     try:
-        serve(pipeline, host=host, port=port)
+        serve(pipeline, host=host, port=port, transport="stdio" if args.stdio else "http", uds=uds)
     except ValueError as exc:
         print(f"maf: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    except OSError as exc:  # the address is taken: transient, so the unit may restart
+        print(f"maf: cannot listen: {exc}", file=sys.stderr)
+        return EXIT_FAILED
     except KeyboardInterrupt:
         pass
     return EXIT_OK
 
+
+def _cmd_chatgpt(args: argparse.Namespace, settings: Settings) -> int:
+    from maf import chatgpt
+
+    layout = chatgpt.Layout.default()
+    if args.chatgpt_command == "setup":
+        try:
+            installed_client, installed_health = chatgpt.installed_tunnel_options(layout)
+            serve_args, environment = chatgpt.settings_sources(
+                config=getattr(args, "config", None),
+                vault=getattr(args, "vault", None),
+                workspaces=getattr(args, "workspaces", None),
+                environ=os.environ,
+            )
+            params = chatgpt.default_params(
+                settings, layout,
+                tunnel_client=args.tunnel_client or installed_client,
+                health_port=args.health_port or installed_health or chatgpt.DEFAULT_HEALTH_PORT,
+                serve_args=serve_args,
+                environment=environment,
+            )
+            return chatgpt.setup(settings, layout=layout, params=params, reload=not args.no_reload)
+        except ValueError as exc:
+            print(f"maf: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+    return chatgpt.status(settings, layout=layout, tunnel_client=args.tunnel_client, lines=args.lines)
+
+
+_SETTINGS_COMMANDS: dict[str, Callable[[argparse.Namespace, Settings], int]] = {"chatgpt": _cmd_chatgpt}
+"""Commands that need settings but no pipeline (so they never create vault or workspace folders)."""
 
 _COMMANDS = {
     "run": _cmd_run,
@@ -387,6 +510,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"maf: bad configuration: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    if args.command in _SETTINGS_COMMANDS:
+        return _SETTINGS_COMMANDS[args.command](args, settings)
     try:
         pipeline = make_pipeline(settings)
     except Exception as exc:  # noqa: BLE001 - report setup problems without a traceback

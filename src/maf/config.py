@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal
@@ -224,8 +225,16 @@ exported either; the clean-room check copies ``inputs/`` and the kernel back in)
 the same paths (``maf.stages.base.export_excludes``)."""
 
 
+_ORIGIN_RE = re.compile(r"https?://(\[[0-9a-f:.]+\]|[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*)(:[0-9]{1,5})?")
+"""A serialized web origin as browsers send it: lowercase scheme and host, optional port, nothing else."""
+
 BASH_TIMEOUT_SHARE = 0.75
 """Default ``Settings.bash_timeout_s`` as a share of ``claude_code_timeout_s``."""
+
+DEFAULT_MCP_MAX_BUDGET_USD = 5.0
+"""Default ``Settings.mcp_max_budget_usd``: an MCP run gets at most this unless the config raises it."""
+DEFAULT_MCP_DAILY_BUDGET_USD = 25.0
+"""Default ``Settings.mcp_daily_budget_usd`` (rolling 24 hours, MCP runs only)."""
 
 
 class Settings(BaseModel):
@@ -237,7 +246,7 @@ class Settings(BaseModel):
     """Interpreter Claude Code should use for simulations (numpy/scipy/matplotlib live here)."""
     claude_executable: Path = Field(default_factory=lambda: Path.home() / ".local" / "bin" / "claude")
 
-    budget_usd: float = Field(default=25.0, gt=0)
+    budget_usd: float = Field(default=25.0, gt=0, allow_inf_nan=False)
     tier: Tier = "default"
     review: bool = False
     max_crosscheck_loops: int = Field(default=2, ge=0)
@@ -298,10 +307,26 @@ class Settings(BaseModel):
 
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8765
+    """``maf serve`` listens on ``http://<mcp_host>:<mcp_port>/mcp``. Under ``maf serve --uds`` (the systemd unit) it
+    listens on the Unix socket instead, and these only name the Host header clients must send."""
     mcp_inbox: Path | None = Field(default_factory=lambda: Path.home() / "MultiAgent" / "inbox")
-    """``start_run`` over MCP only accepts input files inside this directory. None means no files over MCP."""
-    mcp_max_budget_usd: float | None = Field(default=None, gt=0)
-    """Highest ``budget_usd`` an MCP client may request; None means ``budget_usd``. Only the CLI can go higher."""
+    """``start_run`` over MCP only accepts input files inside this directory. None means no files over MCP. The default
+    is inside the repo checkout, where ``.gitignore`` keeps it out of commits; ``maf chatgpt setup`` creates it 0700."""
+    mcp_max_budget_usd: float | None = Field(default=DEFAULT_MCP_MAX_BUDGET_USD, gt=0, allow_inf_nan=False)
+    """Highest ``budget_usd`` an MCP client may request, and the budget of a ``start_run`` that names none (unless
+    ``budget_usd`` is lower). ``null`` means ``budget_usd``. Only the CLI can go higher."""
+    mcp_max_pending_runs: int = Field(default=2, ge=1)
+    """Most MCP runs one ``maf serve`` holds at once, queued or running; ``start_run`` refuses more. Bounds what a
+    remembered ChatGPT approval (or a prompt injection riding on it) can queue."""
+    mcp_daily_budget_usd: float = Field(default=DEFAULT_MCP_DAILY_BUDGET_USD, gt=0, allow_inf_nan=False)
+    """Cap on MCP spend over any rolling 24 hours: ``start_run`` refuses a run whose budget, added to what the MCP
+    runs created in the last 24 h committed (the budget of a queued or running run, the actual spend of a finished
+    or stopped one; ``maf.mcp_server.mcp_committed_usd``), would exceed it. CLI runs do not count."""
+    mcp_allowed_origins: tuple[str, ...] = ()
+    """Origin header values ``maf serve`` accepts (exact ``scheme://host[:port]``, no wildcards). Empty by default:
+    tunnel-client and other non-browser clients send no Origin, and any browser page is refused. If the tunnel ever
+    forwards one (the journal shows ``Invalid Origin header: <origin>``), add exactly that origin, such as
+    ``https://chatgpt.com``; DNS-rebinding protection stays on either way."""
 
     @model_validator(mode="after")
     def _workspaces_outside_vault(self) -> Settings:
@@ -313,6 +338,17 @@ class Settings(BaseModel):
     def _absolute_tmp_base(cls, value: Path) -> Path:
         if not value.is_absolute():
             raise ValueError(f"claude_code_tmp_base must be an absolute path, got {str(value)!r}")
+        return value
+
+    @field_validator("mcp_allowed_origins")
+    @classmethod
+    def _exact_origins(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for origin in value:
+            if not _ORIGIN_RE.fullmatch(origin):
+                raise ValueError(
+                    f"mcp_allowed_origins entries must be exact origins like 'https://chatgpt.com' (scheme://host[:port], "
+                    f"lowercase, no path or wildcard), got {origin!r}"
+                )
         return value
 
     @field_validator("export_exclude", "export_include")

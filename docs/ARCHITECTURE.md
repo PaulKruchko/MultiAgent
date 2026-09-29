@@ -13,10 +13,12 @@ DESIGN.md wins and this document is fixed. Code lives in `src/maf/`, and tests i
 | **B: vault+handoff** | `vault.py`, `handoff.py` | run folder layout, atomic writes, run.md, wikilinks, handoff schemas |
 | **C: providers** | `providers/*.py`, `tests/fixtures/providers/*` | OpenAI / Gemini / Anthropic / Claude Code adapters |
 | **D: stages** | `stages/*.py`, `prompts/*.md`, `prompts/roles/*.md`, `lint.py` | the five stage backends and their prompts, the deliverable linter |
-| **E: orchestration** | `pipeline.py`, `cli.py`, `mcp_server.py` | state machine, CLI, MCP server |
+| **E: orchestration** | `pipeline.py`, `cli.py`, `mcp_server.py`, `chatgpt.py`, `redact.py`, `scripts/*.sh`, `contrib/systemd/*` | state machine, CLI, MCP server, ChatGPT tunnel units and setup, API-key masking |
 
 Each owner also owns `tests/test_<module>*.py` for its files. The dependency direction is strictly
-`types <- config <- ledger/providers.base <- handoff <- vault <- stages <- pipeline <- cli/mcp_server`.
+`types <- config <- ledger/providers.base <- handoff <- vault <- stages <- pipeline <- cli/mcp_server`
+(`chatgpt` depends on `config` and `redact` only, and imports `mcp_server` lazily for its loopback check; `redact`
+imports nothing from `maf`, and stages, `chatgpt` and `mcp_server` use it).
 `ledger` imports provider types only under `TYPE_CHECKING`. `lint` imports nothing from `maf` (standard library only).
 
 ## 2. Data flow
@@ -116,6 +118,11 @@ Claude model rules (opus-5-5 and fable-5-1): thinking cannot be disabled, no sam
 no forced `tool_choice`, `stop_reason == "refusal"` raises `ProviderRefusal`, and effort must be set explicitly (Opus 5.5 defaults to `medium`).
 
 Claude Code sandbox (verified live 2026-09-28):
+- `SENSITIVE_READ_PATHS` are denied to the file tools (`permissions.deny`) and to sandboxed Bash
+  (`sandbox.filesystem.denyRead`): key stores (`~/.ssh`, `~/.gnupg`, `~/.config`, `~/.netrc`, `~/.pypirc`, `~/.npmrc`,
+  `~/.pgpass`, ...), shell startup files and histories (`~/.bashrc`, `~/.profile`, `~/.bash_history`, ...), browser
+  and mail profiles. Sandboxed Bash reads everything else, and a brief can come from ChatGPT, so the list covers what a
+  prompt injection would read first. Entries may be files, directories or missing.
 - `TMPDIR` = `<claude_code_tmp_base>/maf-<12 random hex>` (`/tmp/maf-…`, 21 bytes), picked once per provider instance
   (so `build_env` and `build_argv` agree), a 0700 directory owned by the user (created, or checked and its mode
   repaired, before each call) and removed when the provider is garbage-collected or the process exits. The name is
@@ -251,6 +258,9 @@ criteria final found not `met`, maf's gates (`clean-room`, `source-audit`, `lint
 `unresolved_critical > 0 or criteria_unmet > 0`; `describe_issues(index)` is the one-line summary the pipeline and CLI
 print. The `completed_with_issues` callout covers both: the unresolved count (linking the cross-check) and every unmet
 criterion as a bullet (linking `05-final`); `## Status` lists `Acceptance criteria not met: N` and the last export.
+`origin` (`mcp` for runs created by the MCP server, counted by `mcp_daily_budget_usd`) and `owner` (`<boot id>:<pid>`
+of the `maf serve` that queued the run, for orphan recovery) are left out of run.md while None
+(`OPTIONAL_INDEX_KEYS`), since `RunIndex` forbids unknown keys and older maf versions must still read CLI runs.
 
 `export_workspace(run_id, *, excludes=None, placeholders=None, max_bytes=None, max_files=None) -> ExportResult` makes
 `deliverables/` a copy of the workspace tree (code/mixed runs). Left out: `excludes` (default
@@ -444,8 +454,9 @@ Stage details settled at integration:
     heading, citation-like entries under Notes, Endnotes or Further reading, footnote definitions, DOIs, numeric
     citations (two or more, or one a list entry defines), author-year (also corporate: `(ITER Organization, 2018)`),
     narrative (`Shimada et al. (2007)`) or Pandoc citations, internal source ids (`[S2]`); external links only trigger
-    it; pipeline links are left to the lint) are read by Python and sent, up to `SOURCE_AUDIT_BUDGET_CHARS`, to Gemini
-    (`purpose="source_audit"`, `web_search` + `url_context`, `SOURCE_AUDIT_SCHEMA`, `max_search_queries` = 2 per
+    it; pipeline links are left to the lint) are read by Python and sent, up to `SOURCE_AUDIT_BUDGET_CHARS` and with
+    maf's API keys and key-shaped strings masked (`maf.redact`: Gemini fetches the URLs in them from outside the
+    sandbox), to Gemini (`purpose="source_audit"`, `web_search` + `url_context`, `SOURCE_AUDIT_SCHEMA`, `max_search_queries` = 2 per
     estimated work, at least 5), with `01-ingestion` `## Sources` as a lead. Each distinct work is audited once and its
     `document` names every citing document; the distinct estimate (`distinct_reference_estimate`, a work shared by
     documents counted once) splits the audit into calls of `settings.source_audit_max_refs` works (`{{scope}}`
@@ -521,6 +532,12 @@ and writes run.md, in that order, so a crash repeats at most the current stage.
 `export(run_id) -> (RunIndex, Export)` rewrites `deliverables/` with `maf.stages.final.export_run` under the run lock
 (`RuntimeError` while the run is advanced elsewhere) at any status, with no model calls, and sets `exported_at`,
 `export_note` (`maf export: ...`) and `updated`; a refused export (`ExportError`) writes nothing.
+`create(..., input_root=, origin=, owner=)`: with `input_root` (MCP) every input-file problem raises the same
+`ValueError` (`not_an_inbox_file`: `not an allowed inbox file: <as given>`), and confinement is checked before
+existence, so a remote caller learns nothing about files outside the inbox. `fail_orphans()` marks FAILED, under the
+run lock (a locked run is skipped): a RUNNING run at once (RUNNING is only written under the lock); a PENDING run with
+an `owner` at once when that process is gone (another boot, a dead pid, this process's pid), never while it lives;
+a PENDING run without one after `ORPHAN_GRACE_S` of no change.
 Both completed statuses are terminal: `resume` returns them unchanged and writes nothing (no note, no budget), except
 `resume(extra_round=True)` on a COMPLETED_WITH_ISSUES run, which moves it to execution `round + 1` (05-final leaves
 `handoffs` until final runs again), runs that pass and its cross-check (the loop cap still applies, so normally exactly
@@ -530,7 +547,15 @@ non-retryable one such as `SandboxUnavailable` is never retried or swallowed, so
 partial spend is already in the ledger); anything else → FAILED with `error` (`"<stage>: <Type>: <message>"`).
 
 ### cli.py (E)
-`maf run | resume | status | list | export | serve`, with the global `--vault --workspaces --config`. Exit codes of `run`/`resume`
+`maf run | resume | status | list | export | serve [--stdio] [--uds PATH] [--env-file PATH] | chatgpt setup|status`,
+with the global `--vault --workspaces --config`. `chatgpt` needs settings but never builds a pipeline (no vault or
+workspace folders are created); it exits 0 when ready or done, 1 when not ready, and 2 for usage errors. `chatgpt
+setup` writes the given `--config`/`--vault`/`--workspaces` (or `MAF_CONFIG`/`MAF_VAULT`/`MAF_WORKSPACES`, as absolute
+paths) into maf-mcp's `ExecStart` and `MAF_BUDGET_USD` into an `Environment=` line (`chatgpt.settings_sources`),
+refuses to drop a source the installed unit has (`dropped_sources`), and keeps the installed tunnel-client path and
+health port unless overridden. `serve --stdio` refuses
+`--host`/`--port`/`--uds`; `--env-file` loads a 0600 `KEY=value` file into maf's environment; `serve` drops
+`CONTROL_PLANE_*` from it, exits 2 for usage/config errors and 1 when it cannot listen. Exit codes of `run`/`resume`
 follow the run status: 0 completed (also awaiting review, or started with `--no-wait`), 2 completed_with_issues,
 1 failed or budget exceeded. Usage errors (bad arguments, unknown run, bad config, `--extra-round` on a run that is not
 completed_with_issues) also exit 2, before anything runs; the output tells them apart. A finished run prints the
@@ -546,7 +571,9 @@ left-out placeholders and `ExportResult.excluded_note()`; skipped unsafe entries
 no mode, run busy, unreadable file), 2 for an unknown run.
 
 ### mcp_server.py (E)
-mcp 2.x `MCPServer` (renamed from FastMCP) serves streamable HTTP at `http://127.0.0.1:8765/mcp`, and only loopback addresses are allowed.
+mcp 2.x `MCPServer` (renamed from FastMCP) serves streamable HTTP at `http://127.0.0.1:8765/mcp`, and only loopback
+addresses are allowed; with `uds` (the systemd unit) it serves the same app on a 0600 Unix socket (`bind_unix`), and
+host/port only set the accepted Host header.
 Tools: `start_run` (write, returns `run_id` immediately; `RunManager` runs the pipeline on a single background worker thread),
 `get_run_status`, `get_run_result`, `list_runs` (read-only annotations). Tests use `mcp.Client(server)` in-process.
 `status` is the `RunStatus` value everywhere; `get_run_status` and `get_run_result` also return `unresolved_critical`,
@@ -555,7 +582,41 @@ Tools: `start_run` (write, returns `run_id` immediately; `RunManager` runs the p
 server instructions tell ChatGPT that `completed_with_issues` means the result is not verified, from open criticals
 and/or unmet acceptance criteria (`clean-room`: the export did not rebuild from scratch; `source-audit`: a reference
 was not verified; `lint`: the deliverables link pipeline notes).
-The tunnel (a systemd user unit for tunnel-client) and the Platform dashboard steps are manual and documented separately.
+Transport security (`transport_security`) keeps mcp's DNS-rebinding protection on for every loopback bind. Host must
+be `allowed_hosts(host, port)`: the bind address or `localhost`, with this port, which is what tunnel-client sends.
+Origin must be absent or exactly one of `Settings.mcp_allowed_origins` (default empty; validated as
+`scheme://host[:port]`). `serve(pipeline, host, port, transport="http"|"stdio", uds=None)` binds its listener first
+(`bind_tcp`/`bind_unix`; `OSError` if taken, before any run is touched), then marks orphaned runs failed, then runs
+uvicorn on the bound sockets with `HTTP_SHUTDOWN_GRACE_S`, or mcp's stdio transport. SIGTERM behaves like Ctrl+C. An
+omitted `start_run` budget is `min(budget_usd, mcp_budget_ceiling_usd)` (`mcp_max_budget_usd`, $5 by default; null
+means `budget_usd`); a given one must be finite, positive and at most the ceiling (pydantic parses `"NaN"` and
+`"Infinity"` into floats, and NaN passes every `>` comparison). `start_run` then refuses, under `RunManager.admission`,
+when `mcp_max_pending_runs` MCP runs are queued or running (`active_count`), or when the run's budget plus
+`mcp_committed_usd` (MCP runs of the last 24 h: budget if open, spend if finished or stopped) exceeds
+`mcp_daily_budget_usd`; it creates runs with `origin="mcp"` and `owner=process_owner()`. `final_markdown`, `error` and
+`unmet_criteria` pass through `maf.redact.redact` with the key values of maf's environment. `Pipeline.create` and
+`resume` refuse non-finite budgets too. serverInfo is `maf` with `maf.__version__`.
+
+### chatgpt.py (E)
+`maf chatgpt setup` renders `maf-mcp.service` (`maf serve [settings sources] --host --port --uds %t/maf/mcp.sock`,
+`RuntimeDirectory=maf` 0700, `EnvironmentFile=~/.config/maf/maf.env`, `RestartPreventExitStatus=2`, `KillMode=mixed`,
+`TimeoutStopSec=2h`, bwrap-compatible hardening) and `maf-tunnel.service` (`tunnel-client run --mcp.server-url
+url=http://127.0.0.1:<port>/mcp,unix-socket=%t/maf/mcp.sock`, `EnvironmentFile=~/.config/maf/tunnel.env`, provider keys
+unset, `Requires=`/`After=` maf-mcp, full hardening) into `$XDG_CONFIG_HOME/systemd/user`, writes both env files as 0600
+templates only if they are missing, creates `mcp_inbox` 0700 if missing, and runs `daemon-reload`. It refuses a
+relative tunnel-client path and a health port equal to `mcp_port`, and names the restart a changed, active unit needs.
+`contrib/systemd/` equals `render_units(contrib_params())` (tested). `maf chatgpt status` shows:
+- unit states and journal lines, redacted with `redact`;
+- key presence, never values;
+- an MCP `initialize` + `tools/list` round trip over the installed unit's socket (else TCP), with proxies ignored;
+- tunnel-client `/readyz`, plus `health --require-control-plane-poll`, because readyz alone stays 200 while polls
+  fail with 401;
+- linger and log hints.
+
+tunnel-client always runs with every API key variable unset.
+`scripts/install-tunnel-client.sh` installs the pinned, SHA-256-verified tunnel-client, and
+`scripts/chatgpt-setup-wizard.sh` walks through the manual Platform and ChatGPT steps. [CHATGPT.md](CHATGPT.md) has
+the setup, the security model and the verification record.
 
 ## 4. Ledger semantics (summary)
 

@@ -100,6 +100,7 @@ ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "L
 cloud or GitHub tokens, is dropped, so Bash children cannot copy it into workspace artifacts."""
 
 SENSITIVE_READ_PATHS: tuple[str, ...] = (
+    # credentials and key stores
     "~/.ssh",
     "~/.gnupg",
     "~/.aws",
@@ -111,8 +112,45 @@ SENSITIVE_READ_PATHS: tuple[str, ...] = (
     "~/.git-credentials",
     "~/.claude",
     "~/.local/share/keyrings",
+    "~/.password-store",
+    "~/.pki",
+    "~/.pypirc",
+    "~/.npmrc",
+    "~/.pgpass",
+    "~/.vault-token",
+    "~/.cargo/credentials",
+    "~/.cargo/credentials.toml",
+    # shell startup files, which often export API keys, and histories, which hold keys typed or pasted
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.bash_login",
+    "~/.profile",
+    "~/.bash_aliases",
+    "~/.zshrc",
+    "~/.zshenv",
+    "~/.zprofile",
+    "~/.bash_history",
+    "~/.zsh_history",
+    "~/.python_history",
+    "~/.node_repl_history",
+    "~/.psql_history",
+    "~/.mysql_history",
+    "~/.sqlite_history",
+    "~/.viminfo",
+    # browser and mail profiles (cookies, saved passwords)
+    "~/.mozilla",
+    "~/.thunderbird",
+    "~/snap/firefox",
+    "~/snap/chromium",
+    "~/snap/thunderbird",
+    "~/.var/app",
 )
-"""Denied to both the file tools (``permissions.deny``) and sandboxed Bash (``sandbox.filesystem.denyRead``)."""
+"""Denied to both the file tools (``permissions.deny``) and sandboxed Bash (``sandbox.filesystem.denyRead``). Sandboxed
+Bash can read the rest of the filesystem, and a brief can come from a ChatGPT conversation that read untrusted pages,
+so everything here is what a prompt injection would look for first: key files, shell files that export keys (the docs
+move provider keys to the ``~/.config/maf/maf.env`` this list already covers), histories and browser profiles. Entries
+may be files or directories and may be missing (the list always held missing ones, such as ``~/.kube`` on the dev
+host, and runs passed the sandbox preflight)."""
 
 DEFAULT_TURN_CONTEXT_TOKENS = 200_000
 DEFAULT_TURN_OUTPUT_TOKENS = 64_000
