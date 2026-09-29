@@ -648,6 +648,7 @@ def test_export_workspace_copies_the_tree_safely(vault: Vault, tmp_path: Path) -
         "README.md": "readme", "src/alloc.c": "int x;", "run.sh": "#!/bin/sh\n", "src/__init__.py": "",
         "web/package.json": "",  # empty but not at the root: a real file of the deliverable
         ".env": "", ".env.local": "", "package.json": "", ".npmrc": "registry=x",  # the last is not empty: kept
+        ".idea": "", ".vscode": "", ".bashrc": "",  # editor/shell placeholders the sandbox mounts as empty files
         ".maf/p.md": "p", "build/a.o": b"o", "empty-dir/.keep": "",
     })
     (ws / "run.sh").chmod(0o755)
@@ -664,7 +665,7 @@ def test_export_workspace_copies_the_tree_safely(vault: Vault, tmp_path: Path) -
     assert got == {"README.md", "src/alloc.c", "run.sh", "src/__init__.py", "web/package.json", ".npmrc", "alias.c"}
     assert result.files == tuple(sorted(got))
     assert result.total_bytes == sum((paths.deliverables / rel).stat().st_size for rel in got)
-    assert sorted(result.placeholders) == [".env", ".env.local", "package.json"]
+    assert sorted(result.placeholders) == [".bashrc", ".env", ".env.local", ".idea", ".vscode", "package.json"]
     assert sorted(result.skipped) == [
         "dangling (dangling symlink)", "leak.txt (symlink out of the workspace)", "pipe (not a regular file)",
         "srclink/ (symlinked directory)",

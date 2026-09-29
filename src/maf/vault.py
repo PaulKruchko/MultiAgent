@@ -223,6 +223,8 @@ SANDBOX_PLACEHOLDER_FILES: tuple[str, ...] = (
     ".gitconfig",
     ".gitmodules",
     ".ripgreprc",
+    ".idea",  # editor config dirs, mounted as empty files (seen live 2026-09-29)
+    ".vscode",
 )
 """Names (``fnmatch``) of the zero-byte files Claude Code's sandbox may leave at the workspace root as mount points
 for paths it protects. An export leaves them out only when they are empty and at the root: a real ``package.json``
