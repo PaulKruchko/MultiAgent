@@ -11,7 +11,12 @@ Mode (``ctx.index.mode``):
   ``- `path` - description``. PNGs under the workspace referenced there are copied to ``assets/`` and
   embedded; the stage rewrites the Artifacts bullets to add the embeds (``Vault.copy_asset`` reuses
   identical files, so re-runs are idempotent). Listed paths that do not exist are flagged in
-  ``## Known Limitations`` rather than rejected.
+  ``## Known Limitations`` rather than rejected. The session is a ``work_session``: with less than its floor
+  (``session_floor``) left for it the run stops ``budget_exceeded`` before spawning (checked before the preflight too,
+  with the preflight's budget left out), a session whose clamped budget runs out stops it ``budget_exceeded`` too, and
+  a timed-out session gets one continuation (noted in the ``## Summary``). In a looped round (round > 1) the session
+  holds back ``round_reserve_usd`` (the next cross-check's calls, the smallest fix session and final), as far as its
+  floor allows.
 - ``prose``: Claude Messages (``claude`` role) returns the handoff body with the full document under
   an H3 in ``## Artifacts`` (see ``prompts/execution_prose.md``). The stage moves that document to
   ``workspace/document.md`` and replaces it in ``## Artifacts`` with the bullet ``- `document.md` - <title>``,
@@ -50,12 +55,16 @@ from maf.stages.base import (
     NoteOut,
     StageContext,
     StageOutput,
+    continuation_note,
+    ensure_session_budget,
     escape_note_tags,
     export_excludes,
+    generate,
     generate_handoff,
     render_inputs,
     review_block,
     role_system,
+    round_reserve_usd,
     with_sections,
     write_workspace_file,
 )
@@ -182,6 +191,7 @@ class ExecutionBackend:
     def _run_code(
         self, ctx: StageContext, mode: ExecutionMode, consumed: list[str], inputs: str, fix_context: str
     ) -> Handoff:
+        ensure_session_budget(ctx, "execution")  # before the preflight is paid for
         ensure_sandbox(ctx)
         kernel = provision_freertos(ctx.settings.freertos_path, ctx.paths.workspace)
         prompt = render_prompt(
@@ -197,7 +207,11 @@ class ExecutionBackend:
         )
         write_workspace_file(ctx, f"{WORKSPACE_META_DIR}/execution-r{ctx.round}.md", prompt)
         workspace = ctx.paths.workspace
-        handoff = generate_handoff(
+        # A looped round keeps back what the rest of the run needs, so an approved loop still reaches final.
+        reserve = 0.0
+        if ctx.round > 1:
+            reserve = round_reserve_usd(ctx, mode, f"{ctx.index.brief}\n\n{inputs}\n\n{fix_context}")
+        generated = generate(
             ctx,
             "claude_code",
             HandoffKind.EXECUTION,
@@ -207,7 +221,13 @@ class ExecutionBackend:
             inputs=consumed,
             purpose="execution",
             check=lambda h: check_artifacts(h, workspace),
+            session=True,
+            reserve_usd=reserve,
         )
+        handoff = generated.handoff
+        continued = continuation_note(generated.results[0])
+        if continued:
+            handoff = with_sections(handoff, {"Summary": f"{handoff.section('Summary')}\n\n{continued}"})
         return finish_code_artifacts(ctx, handoff)
 
     def _run_prose(self, ctx: StageContext, consumed: list[str], inputs: str, fix_context: str) -> Handoff:

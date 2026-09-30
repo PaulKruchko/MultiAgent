@@ -99,8 +99,10 @@ ISSUE_RE = re.compile(rf"^- \[(?P<severity>critical|major|minor)\] (?P<id>{_CRIT
 """``## Issues`` in critique notes, e.g. ``- [critical] GPT-3: free() of a foreign block corrupts the bitmap``."""
 RESPONSE_RE = re.compile(rf"^- (?P<id>{_ANY_ID}) \[(?P<stance>accept|reject|partial)\]:(?P<text>(?: .*)?)$")
 """``## Responses`` in the rebuttal note (Claude, as author of the execution)."""
-RULING_RE = re.compile(rf"^- (?P<id>{_ANY_ID}) \[(?P<ruling>fix|wontfix)\]:(?P<text>(?: .*)?)$")
-"""``## Rulings`` in adjudication (ChatGPT) for every issue whose response was ``reject`` or ``partial``."""
+RULING_RE = re.compile(rf"^- (?P<id>{_ANY_ID}) \[(?P<ruling>fix|wontfix|relax)\]:(?P<text>(?: .*)?)$")
+"""``## Rulings`` in adjudication (ChatGPT) for every issue whose response was ``reject`` or ``partial``, and for
+the unmet acceptance criteria the author accepted. ``relax`` (unmet criteria only) rules the criterion over-specified
+relative to the brief: the issue becomes major and the criterion soft for the rest of the run."""
 VERDICT_RE = re.compile(r"^(?P<verdict>PASS|LOOP)$")
 """``## Verdict`` first non-empty line in crosscheck. Computed by Python, not a model."""
 
@@ -180,7 +182,7 @@ class Ruling(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: str
-    ruling: Literal["fix", "wontfix"]
+    ruling: Literal["fix", "wontfix", "relax"]
     text: str
 
 
@@ -366,7 +368,7 @@ def parse_handoff(text: str) -> Handoff:
 _GRAMMARS: dict[tuple[HandoffKind, str], tuple[re.Pattern[str], str]] = {
     (HandoffKind.CRITIQUE, "Issues"): (ISSUE_RE, "- [critical|major|minor] <GPT|GEM|CLA>-<n>: <text>"),
     (HandoffKind.REBUTTAL, "Responses"): (RESPONSE_RE, "- <ID> [accept|reject|partial]: <text>"),
-    (HandoffKind.ADJUDICATION, "Rulings"): (RULING_RE, "- <ID> [fix|wontfix]: <text>"),
+    (HandoffKind.ADJUDICATION, "Rulings"): (RULING_RE, "- <ID> [fix|wontfix|relax]: <text>"),
 }
 _VERDICT_SECTION = (HandoffKind.CROSSCHECK, "Verdict")
 _DUP_RE = re.compile(r"^(?P<base>.+) \((?P<n>\d+)\)$")
@@ -378,7 +380,9 @@ _ITEM_LIKE: dict[tuple[HandoffKind, str], re.Pattern[str]] = {
     (HandoffKind.REBUTTAL, "Responses"): re.compile(
         rf"^[-*+]\s+{_ID}\s*(?:[:\[]|(?:accept|reject|partial)\b)", re.IGNORECASE
     ),
-    (HandoffKind.ADJUDICATION, "Rulings"): re.compile(rf"^[-*+]\s+{_ID}\s*(?:[:\[]|(?:fix|wontfix)\b)", re.IGNORECASE),
+    (HandoffKind.ADJUDICATION, "Rulings"): re.compile(
+        rf"^[-*+]\s+{_ID}\s*(?:[:\[]|(?:fix|wontfix|relax)\b)", re.IGNORECASE
+    ),
 }
 """A (stripped) bullet shaped like an item that does not match the grammar: a ``[tag]`` before an id, or an id
 followed by ``:``, ``[`` or a stance/ruling word (``- [high] GPT-2: ...``, ``- GEM-2 reject: ...``). Indented, it is
@@ -798,12 +802,17 @@ _CRITERION_LABEL = re.compile(
     re.IGNORECASE,
 )
 
+MAX_HARD_CRITERIA = 6
+"""Most ``hard`` criteria a strategy may set (``hard_criteria_errors``): each unmet one is a critical issue that
+loops the cross-check, and ten of them, several absolute, drove the 2026-09-29 thesis run out of budget."""
+
 ACCEPTANCE_CRITERIA_GRAMMAR = f"""### `## {ACCEPTANCE_CRITERIA}` line grammar
 
 Python reads this section. Write one item per criterion, numbered from 1, each a top-level bullet of exactly the
 form `- AC-<n> [hard]: <criterion>` or `- AC-<n> [soft]: <criterion>`, with nothing else at the top level; details
 may follow on continuation lines indented by two spaces. `hard`: the deliverable fails without it, and the run does
 not count as complete while it is unmet. `soft`: a quality goal, reported but not blocking. Each id appears once.
+At most {MAX_HARD_CRITERIA} criteria may be `hard`; mark every other one `soft`.
 
 Example: `- AC-2 [hard]: arm-none-eabi-size reports .text < 2048 bytes for alloc.o built with -Os`"""
 """Injected into the strategy format spec (and so into its repair prompt)."""
@@ -915,6 +924,21 @@ def acceptance_criteria_errors(section: str) -> list[str]:
     return errors
 
 
+def hard_criteria_errors(section: str, limit: int = MAX_HARD_CRITERIA) -> list[str]:
+    """The strategy stage's check (errors go through the one repair): at most ``limit`` criteria of ``section`` (read
+    with ``parse_acceptance_criteria``, so an unlabeled criterion counts as hard) may be ``hard``. Not part of
+    ``validate_body``: hand-edited and older strategy notes with more hard criteria stay valid."""
+    hard = [c.id for c in parse_acceptance_criteria(section) if c.hard]
+    if len(hard) <= limit:
+        return []
+    return [
+        f"'## {ACCEPTANCE_CRITERIA}' has {len(hard)} hard criteria ({', '.join(hard)}); at most {limit} may be hard. "
+        f"Keep hard only the criteria the user's request directly requires and that can be demonstrated within the "
+        f"run's budget (the required clean-room, repeatability and source-audit criteria count toward the {limit}), "
+        "and mark the others [soft]. Drop absolute demands ('every', 'all') the request does not make itself."
+    ]
+
+
 def normalize_acceptance_criteria(section: str) -> str:
     """``section`` unchanged if it follows the strict grammar, else its ``parse_acceptance_criteria`` reading, one
     ``Criterion.line`` per criterion."""
@@ -922,6 +946,53 @@ def normalize_acceptance_criteria(section: str) -> str:
         return section
     criteria = parse_acceptance_criteria(section)
     return "\n".join(c.line for c in criteria) if criteria else section
+
+
+_RELAXATION_RE = re.compile(
+    rf"^(?P<criterion>AC-\d+) \((?P<issue>{_ANY_ID}), round (?P<round>\d+)\): (?P<reason>.*)$"
+)
+
+
+@dataclass(frozen=True)
+class Relaxation:
+    """An acceptance criterion the adjudicator ruled over-specified relative to the brief (a ``relax`` ruling on an
+    unmet-criterion issue). maf treats the criterion as soft from then on: later critiques may raise it as major at
+    most, and final's gate reports it without blocking. Kept in ``RunIndex.relaxed_criteria`` as ``line``."""
+
+    criterion: str
+    """``AC-<n>``."""
+    issue: str
+    """The issue the ruling was on, e.g. ``GPT-4``."""
+    round: int
+    reason: str
+    """The adjudicator's one-line justification."""
+
+    @property
+    def line(self) -> str:
+        return f"{self.criterion} ({self.issue}, round {self.round}): {self.reason}"
+
+
+def parse_relaxations(lines: list[str]) -> dict[str, Relaxation]:
+    """``{criterion id: Relaxation}`` of ``RunIndex.relaxed_criteria`` lines (the first line for an id wins). A line
+    off the ``Relaxation.line`` form still relaxes the criterion its first word names, when that is an ``AC-<n>``."""
+    out: dict[str, Relaxation] = {}
+    for raw in lines:
+        line = " ".join(raw.split())
+        match = _RELAXATION_RE.match(line)
+        if match:
+            relaxation = Relaxation(match["criterion"], match["issue"], int(match["round"]), match["reason"])
+        elif re.match(r"^AC-\d+\b", line):
+            ident, _, rest = line.partition(" ")
+            relaxation = Relaxation(ident.rstrip(":"), "", 0, rest.lstrip(": ") or "relaxed")
+        else:
+            continue
+        out.setdefault(relaxation.criterion, relaxation)
+    return out
+
+
+def relaxed_criteria(criteria: list[Criterion], relaxed: dict[str, Relaxation]) -> list[Criterion]:
+    """``criteria`` with every relaxed one made soft (text unchanged)."""
+    return [Criterion(c.id, False, c.text) if c.id in relaxed else c for c in criteria]
 
 
 # ---------------------------------------------------------------------------

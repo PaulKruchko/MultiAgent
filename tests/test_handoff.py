@@ -648,7 +648,7 @@ def test_format_spec_lists_sections_in_order(kind: HandoffKind) -> None:
 def test_format_spec_grammars() -> None:
     assert "- [critical|major|minor] <GPT|GEM|CLA>-<n>: <text>" in format_spec(HandoffKind.CRITIQUE)
     assert "[accept|reject|partial]" in format_spec(HandoffKind.REBUTTAL)
-    assert "[fix|wontfix]" in format_spec(HandoffKind.ADJUDICATION)
+    assert "[fix|wontfix|relax]" in format_spec(HandoffKind.ADJUDICATION)
     assert "PASS" in format_spec(HandoffKind.CROSSCHECK)
     assert "line grammar" not in format_spec(HandoffKind.ROUTING)
     assert "indented by two spaces" in format_spec(HandoffKind.REBUTTAL)

@@ -354,7 +354,9 @@ def test_budget_stop_then_resume_with_higher_budget(
 ) -> None:
     script = Script(sample_bodies)
     # Ingestion + strategy spend $0.03 and execution $0.50; three concurrent critiques each reserve a
-    # $0.05 worst case, so they cannot all fit under $0.60.
+    # $0.05 worst case, so they cannot all fit under $0.60. (The budget is far below the work-session minimum, which
+    # is not what this test is about: tests/test_budget_resilience.py covers it.)
+    settings = settings.model_copy(update={"claude_code_min_session_usd": 0.1})
     pipeline, run_id = _start(settings, fake_providers, script, budget_usd=0.60)
 
     stopped = pipeline.run(run_id)
@@ -734,6 +736,7 @@ def test_process_resumed_into_crosscheck_verifies_the_sandbox_before_the_critiqu
     """A budget stop at crosscheck, then ``resume``: the new process has not seen execution's preflight, so the
     crosscheck stage runs its own (ledger stage crosscheck) before paying for critiques; round 2 reuses it."""
     script = Script(sample_bodies)
+    settings = settings.model_copy(update={"claude_code_min_session_usd": 0.1})  # as in the budget-stop test
     pipeline, code = _sandboxed_pipeline(settings, fake_providers, script)
     # $0.03 ingestion + strategy, $0.04 preflight, $0.50 execution; the three $0.05 critique reservations cannot fit.
     run_id = pipeline.create(BRIEF, budget_usd=0.64).run_id

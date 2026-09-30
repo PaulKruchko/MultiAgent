@@ -28,7 +28,8 @@ from maf.vault import note_name
 class Backend:
     """Stage backend producing no notes; ``final`` writes 05-final and one deliverable; can block or raise.
     ``unresolved`` > 0 makes ``crosscheck`` report that many unresolved critical issues and loop back; ``unmet``
-    lines are the acceptance criteria ``final`` reports as not met."""
+    lines are the acceptance criteria ``final`` reports as not met; ``relaxed`` lines the criteria ``crosscheck`` reports
+    relaxed."""
 
     def __init__(self, name: StageName, final_body: str) -> None:
         self.name = name
@@ -38,6 +39,7 @@ class Backend:
         self.error: Exception | None = None
         self.unresolved = 0
         self.unmet: list[str] = []
+        self.relaxed: list[str] = []
 
     def run_stage(self, ctx: StageContext) -> StageOutput:
         self.entered.set()
@@ -46,7 +48,10 @@ class Backend:
         if self.error is not None:
             raise self.error
         if self.name == "crosscheck":
-            return StageOutput(notes=[], index_updates={"unresolved_critical": self.unresolved}, loop_back=self.unresolved > 0)
+            updates: dict[str, Any] = {"unresolved_critical": self.unresolved}
+            if self.relaxed:
+                updates["relaxed_criteria"] = list(self.relaxed)
+            return StageOutput(notes=[], index_updates=updates, loop_back=self.unresolved > 0)
         if self.name != "final":
             return StageOutput(notes=[])
         artifact = ctx.paths.workspace / "alloc.c"
@@ -151,7 +156,7 @@ def test_start_run_returns_immediately_then_completes(env: Env, tmp_path: Path) 
     assert (status["budget_usd"], status["round"], status["error"]) == (4.0, 1, None)
     assert set(status) == {
         "run_id", "status", "stage", "round", "spent_usd", "budget_usd", "spend_by_agent", "unresolved_critical",
-        "criteria_unmet", "unmet_criteria", "error", "handoffs",
+        "criteria_unmet", "unmet_criteria", "relaxed_criteria", "loop_skipped", "error", "handoffs",
     }
     pending = _ok(env.tool("get_run_result", run_id=run_id))
     assert pending["final_markdown"] is None and pending["deliverables"] == []
@@ -171,6 +176,7 @@ def test_start_run_returns_immediately_then_completes(env: Env, tmp_path: Path) 
     result = _ok(env.tool("get_run_result", run_id=run_id))
     assert (result["status"], result["unresolved_critical"], result["criteria_unmet"]) == ("completed", 0, 0)
     assert (result["unmet_criteria"], result["deliverables_total"]) == ([], 1)
+    assert (result["relaxed_criteria"], result["loop_skipped"]) == ([], None)
     assert result["final_markdown"].startswith("## Summary")
     assert "## Limitations" in result["final_markdown"]
     assert result["vault_path"] == str(env.pipeline.vault.paths(run_id).root)
@@ -407,6 +413,24 @@ def test_mcp_committed_usd_counts_recent_mcp_runs_only(settings: Settings) -> No
         run(25, RunStatus.COMPLETED, spent=4.0),   # older than 24 h: not counted
     ]
     assert mcp_server.mcp_committed_usd(runs, now) == pytest.approx(5.0 + 5.0 + 0.75 + 0.5)
+
+
+def test_relaxed_criteria_reach_the_client_structured(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A completed run whose adjudicator relaxed a hard criterion says so in both payloads, not only deep inside
+    final_markdown (which may be truncated), and the instructions tell ChatGPT to pass it on."""
+    key = "plain-looking-secret-0123456789"
+    monkeypatch.setenv("OPENAI_API_KEY", key)
+    env.backends["crosscheck"].relaxed = [f"AC-9 (GPT-4, round 1): over-specified; saw {key}"]
+    run_id = _ok(env.tool("start_run", brief="x"))["run_id"]
+    assert env.manager.wait(run_id, timeout=10) is not None
+    status = _ok(env.tool("get_run_status", run_id=run_id))
+    result = _ok(env.tool("get_run_result", run_id=run_id))
+    for payload in (status, result):
+        assert payload["status"] == "completed" and payload["criteria_unmet"] == 0
+        assert payload["relaxed_criteria"] == ["AC-9 (GPT-4, round 1): over-specified; saw [redacted]"]
+        assert payload["loop_skipped"] is None
+    assert "relaxed_criteria lists hard acceptance criteria the adjudicator relaxed" in mcp_server.SERVER_INSTRUCTIONS
+    assert "even a 'completed' run was not verified against those as written" in mcp_server.SERVER_INSTRUCTIONS
 
 
 def test_results_mask_api_keys(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:

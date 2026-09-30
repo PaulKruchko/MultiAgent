@@ -418,10 +418,13 @@ def test_complete_crash_without_json_charges_worst_case(tmp_path: Path, api_key:
 
 
 def test_complete_timeout_charges_full_budget(tmp_path: Path, api_key: None) -> None:
+    """A killed session reports no cost: it is charged its worst case, and stays a ``ClaudeCodeTimeout`` so the
+    stages can run one continuation (``maf.stages.base.work_session``)."""
     provider, _ = _provider(tmp_path, ClaudeCodeTimeout("timed out", provider="claude_code"))
-    with pytest.raises(ProviderError, match="timed out") as info:
+    with pytest.raises(ClaudeCodeTimeout, match="timed out") as info:
         provider.complete(_req(max_budget_usd=2.5))
     assert info.value.cost_usd == pytest.approx(2.5 + provider.turn_headroom_usd(_req()))
+    assert not info.value.retryable
 
 
 def test_complete_runner_crash_is_wrapped_and_charged(tmp_path: Path, api_key: None) -> None:

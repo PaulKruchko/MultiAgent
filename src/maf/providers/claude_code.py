@@ -17,6 +17,12 @@ CLI facts, verified from ``claude --help`` (v2.1.284) and strings in the binary:
   ``error_during_execution``, ``error_max_budget_usd``}, ``is_error``, ``result`` (final text),
   ``session_id``, ``total_cost_usd``, ``duration_ms``, ``duration_api_ms``, ``num_turns``,
   ``usage``, ``modelUsage``, ``permission_denials``, ``structured_output`` (with ``--json-schema``).
+  It is printed once, at the end, so a session killed at its timeout leaves no cost report on stdout.
+- ``--output-format stream-json`` (print mode needs ``--verbose`` with it) is NOT used. The 2.1.284 binary writes the
+  same result object as the last event of the stream (``L.write(ze)`` of the message ``json`` mode prints), and its
+  schema has ``total_cost_usd``, ``is_error`` and ``structured_output``, which would let a timed-out session's
+  streamed usage be estimated. But no stream from a real run is recorded as a fixture (recording one is a paid call),
+  so the switch waits for one (checked 2026-09-29).
 
 Sandbox: the subprocess cwd is ``workspaces/<run_id>/``. Writes outside it are prevented by
 (a) no ``--add-dir``, (b) ``--permission-mode dontAsk`` with an explicit allowlist, and
@@ -239,7 +245,9 @@ Runner = Callable[[Sequence[str], str, Path, dict[str, str], float], CompletedPr
 
 
 class ClaudeCodeTimeout(ProviderError):
-    """The CLI exceeded ``timeout_s`` and was killed. Spend is unknown, so ``complete`` charges the full budget."""
+    """The CLI exceeded ``timeout_s`` and was killed. Spend is unknown, so ``complete`` raises it with ``cost_usd`` at
+    the worst case (budget plus one turn): the cap stays hard. Its work stays in the workspace, so an execution or fix
+    session gets one continuation (``maf.stages.base.work_session``)."""
 
 
 class ClaudeCodeBudgetExhausted(ProviderError):
@@ -471,7 +479,7 @@ class ClaudeCodeProvider:
         *,
         executable: Path,
         allowed_tools: Sequence[str],
-        timeout_s: float = 3600.0,
+        timeout_s: float = 5400.0,
         runner: Runner | None = None,
         extra_env: dict[str, str] | None = None,
         path_prepend: Sequence[Path] = (),
@@ -613,8 +621,8 @@ class ClaudeCodeProvider:
           ``subtype == "error_max_budget_usd"`` raises its subclass ``ClaudeCodeBudgetExhausted``.
         - ``cost_usd`` = ``total_cost_usd`` (authoritative; not re-priced from tokens).
         - ``text`` = ``result``; ``parsed`` = ``structured_output`` when a schema was given.
-        - A timeout, a crash without a JSON result, or a runner failure charges ``worst_case_cost``
-          (budget plus one turn), since the real spend is unknown.
+        - A timeout (``ClaudeCodeTimeout``), a crash without a JSON result, or a runner failure charges
+          ``worst_case_cost`` (budget plus one turn), since the real spend is unknown.
         - A sandbox start-up failure (``sandbox_failure`` on the result text, stderr and the strings in
           ``structured_output``) raises ``SandboxUnavailable`` carrying ``total_cost_usd`` (the worst case when
           there is no JSON result). It is checked first, so it never surfaces as a plain failure or as a
@@ -637,7 +645,7 @@ class ClaudeCodeProvider:
             argv = self.build_argv(request, api_key_helper=f"cat {shlex.quote(str(key_file))}")
             proc = self._runner(argv, self.build_stdin(request), self.workspace, env, self.timeout_s)
         except ClaudeCodeTimeout as exc:
-            raise ProviderError(str(exc), provider=PROVIDER, cost_usd=unknown_spend) from exc
+            raise ClaudeCodeTimeout(str(exc), provider=PROVIDER, cost_usd=unknown_spend) from exc
         except ProviderError:
             raise  # the CLI could not be started: nothing was spent
         except Exception as exc:

@@ -9,7 +9,8 @@ Two systemd user units (docs/CHATGPT.md explains the whole setup):
   open to every local user and to containers on the host network, a socket in the owner's runtime directory only to
   the owner. Provider keys come from ``~/.config/maf/maf.env`` (services do not read ``~/.bashrc``). SIGTERM goes to
   maf only (``KillMode=mixed``): it stops serving at once and the in-flight run stops at its next stage boundary, for
-  up to ``MCP_STOP_TIMEOUT``. Exit 2 (usage or configuration error) is not restarted.
+  up to ``TimeoutStopSec`` (``mcp_stop_timeout``: the longest stage, derived from ``claude_code_timeout_s``). Exit 2
+  (usage or configuration error) is not restarted.
 - ``maf-tunnel.service``: ``tunnel-client run`` with the upstream ``url=http://127.0.0.1:<mcp_port>/mcp,
   unix-socket=%t/maf/mcp.sock`` (tunnel-client dials the socket and sends ``Host: 127.0.0.1:<mcp_port>``), the tunnel
   id and runtime key from ``~/.config/maf/tunnel.env``. ``Requires=``/``After=`` maf-mcp, so tunnel restarts never touch
@@ -37,6 +38,7 @@ such as ``PrivateDevices=`` or ``ProtectClock=``, fail in a user unit with 218/C
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import re
 import stat
@@ -64,10 +66,28 @@ TUNNEL_ENV_KEYS = ("CONTROL_PLANE_TUNNEL_ID", "CONTROL_PLANE_API_KEY")
 MAF_ENV_KEYS = ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY")
 DEFAULT_HEALTH_PORT = 8766
 """tunnel-client's loopback health/admin listener (/healthz, /readyz, /ui); its own default 8080 is often taken."""
-MCP_STOP_TIMEOUT = "2h"
-"""maf-mcp ``TimeoutStopSec``: stop waits for the in-flight stage to end. One Claude Code session is capped at
-``claude_code_timeout_s`` (60 min by default) and a stage may run more than one, so a stop normally takes seconds to
-minutes and rarely hits this; after it systemd kills the group and ``maf resume`` continues the run."""
+MCP_STOP_SESSIONS = 3
+"""Claude Code sessions one stage can run back to back, each up to ``claude_code_timeout_s``: an execution session, its
+continuation after a timeout and the repair of its handoff (a cross-check runs a fix session and its continuation, final
+the clean room)."""
+MCP_STOP_MARGIN_S = 1800.0
+"""The rest of the longest stage besides its sessions: the sandbox preflight, the critiques, rebuttal and adjudication,
+the source audits and the final report."""
+
+
+def mcp_stop_timeout(claude_code_timeout_s: float) -> str:
+    """maf-mcp ``TimeoutStopSec``: stop waits for the in-flight stage to end, and after this systemd SIGKILLs the whole
+    group. A Claude Code session killed that way is never recorded (SIGKILL cannot be caught, so ``metered_call`` does
+    not charge its worst case), and ``maf resume`` would continue against a ledger missing its spend. So it covers the
+    longest stage: ``MCP_STOP_SESSIONS`` sessions of ``claude_code_timeout_s`` plus ``MCP_STOP_MARGIN_S``, rounded up to
+    the minute: ``5h`` at the 90-minute default. A stop normally takes seconds to minutes; ``maf chatgpt setup`` must
+    run again after ``claude_code_timeout_s`` changes."""
+    minutes = math.ceil((MCP_STOP_SESSIONS * claude_code_timeout_s + MCP_STOP_MARGIN_S) / 60)
+    return f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}min"
+
+
+MCP_STOP_TIMEOUT = mcp_stop_timeout(Settings.model_fields["claude_code_timeout_s"].default)
+"""``mcp_stop_timeout`` at the default ``claude_code_timeout_s`` (the ``contrib/systemd/`` rendering)."""
 TUNNEL_ID_RE = re.compile(r"tunnel_[0-9a-f]{32}")
 CONTRIB_HOME = Path("/home/USER")
 """Home used to render ``contrib/systemd/`` (every path becomes ``%h/...``)."""
@@ -154,6 +174,8 @@ class UnitParams:
     """Extra ``maf serve`` arguments naming where settings come from (``settings_sources``), e.g. ``--config <path>``."""
     environment: tuple[tuple[str, str], ...] = ()
     """``Environment=`` pairs for maf-mcp (``MAF_BUDGET_USD``; ``settings_sources``)."""
+    stop_timeout: str = MCP_STOP_TIMEOUT
+    """maf-mcp ``TimeoutStopSec`` (``mcp_stop_timeout`` of the settings' ``claude_code_timeout_s``)."""
 
     @property
     def mcp_url(self) -> str:
@@ -206,6 +228,7 @@ def default_params(
         health_port=health_port,
         serve_args=serve_args,
         environment=environment,
+        stop_timeout=mcp_stop_timeout(settings.claude_code_timeout_s),
     )
 
 
@@ -299,10 +322,12 @@ Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=2
 # SIGTERM reaches maf only, not its Claude Code children: maf stops serving at once and the in-flight run stops at
-# its next stage boundary (marked failed, `maf resume` continues it). A stage running Claude Code can take up to an
-# hour or more; after TimeoutStopSec systemd kills the whole group. Use `systemctl --user stop --no-block` to not wait.
+# its next stage boundary (marked failed, `maf resume` continues it). A stage can run three Claude Code sessions back
+# to back (a session, its continuation after a timeout, a repair), each up to claude_code_timeout_s, so TimeoutStopSec
+# covers that: after it systemd kills the whole group, and a session killed that way never reaches the cost ledger.
+# Re-run `maf chatgpt setup` after changing claude_code_timeout_s. `systemctl --user stop --no-block` does not wait.
 KillMode=mixed
-TimeoutStopSec={MCP_STOP_TIMEOUT}
+TimeoutStopSec={p.stop_timeout}
 # Hardening compatible with Claude Code's bubblewrap sandbox, which needs unprivileged user namespaces. Not set on
 # purpose: RestrictNamespaces= (bwrap cannot create namespaces), and ProtectSystem=/ProtectHome=/PrivateTmp=/
 # PrivateDevices=/ProtectKernel*= (in a user unit they imply PrivateUsers=, inside which bwrap fails too),

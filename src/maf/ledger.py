@@ -49,17 +49,114 @@ log = logging.getLogger(__name__)
 
 
 class BudgetExceeded(RuntimeError):
-    """Raised before a call whose worst case would push spend past the cap."""
+    """Raised before a call whose worst case would push spend past the cap. The pipeline ends the run
+    BUDGET_EXCEEDED, which ``maf resume --budget`` continues."""
 
-    def __init__(self, *, cap_usd: float, spent_usd: float, requested_usd: float, what: str) -> None:
+    def __init__(
+        self, *, cap_usd: float, spent_usd: float, requested_usd: float, what: str, message: str | None = None
+    ) -> None:
         self.cap_usd = cap_usd
         self.spent_usd = spent_usd
         self.requested_usd = requested_usd
         self.what = what
         super().__init__(
-            f"budget cap ${cap_usd:.2f} reached: spent ${spent_usd:.4f}, "
+            message
+            or f"budget cap ${cap_usd:.2f} reached: spent ${spent_usd:.4f}, "
             f"next call ({what}) could cost up to ${requested_usd:.4f}"
         )
+
+
+class SessionBudgetTooSmall(BudgetExceeded):
+    """Raised before a Claude Code work session (execution, fix pass, continuation) whose ``--max-budget-usd``, clamped
+    to what the run has left (minus one turn of headroom and any ``reserve_usd`` held back for later stages), would be
+    below its minimum (``maf.stages.base.session_floor``): such a session would only stop at its cap half way. This
+    session is not started; the stage may have paid for earlier calls.
+
+    ``needed_cap_usd`` is the smallest cap (never below the current one) at which a resumed stage gets the session its
+    minimum after paying ``before_usd`` first (the sandbox preflight a resumed process runs again; default: the
+    minimum, the headroom, the reserve and ``before_usd`` on top of what is spent), and ``shortfall_usd`` how much the
+    cap must grow to reach it.
+    ``charged_usd`` is what this pass's sessions were already charged when the refused session was a continuation
+    (``maf.stages.base.work_session`` sets it)."""
+
+    def __init__(
+        self,
+        *,
+        cap_usd: float,
+        spent_usd: float,
+        what: str,
+        budget_usd: float,
+        minimum_usd: float,
+        headroom_usd: float,
+        reserve_usd: float = 0.0,
+        before_usd: float = 0.0,
+        needed_cap_usd: float | None = None,
+    ) -> None:
+        self.budget_usd = budget_usd
+        self.minimum_usd = minimum_usd
+        self.headroom_usd = headroom_usd
+        self.reserve_usd = reserve_usd
+        self.before_usd = before_usd
+        needed = spent_usd + before_usd + reserve_usd + headroom_usd + minimum_usd
+        # never below the cap: a refusal the cap would cover came from in-flight reservations, so the cap itself is due
+        self.needed_cap_usd = _round_up(max(cap_usd, needed if needed_cap_usd is None else needed_cap_usd))
+        self.shortfall_usd = max(0.0, self.needed_cap_usd - cap_usd)
+        self.charged_usd = 0.0
+        left = max(0.0, cap_usd - spent_usd)
+        reserve = f" and ${reserve_usd:.2f} for the stages after it" if reserve_usd > 0 else ""
+        before = (
+            f" (a resumed stage first pays up to ${before_usd:.2f} for the sandbox preflight)" if before_usd > 0 else ""
+        )
+        super().__init__(
+            cap_usd=cap_usd,
+            spent_usd=spent_usd,
+            requested_usd=minimum_usd + headroom_usd + reserve_usd,
+            what=what,
+            message=(
+                f"budget cap ${cap_usd:.2f} too low for the next Claude Code session ({what}): ${left:.2f} is left, "
+                f"and after holding back one turn (${headroom_usd:.2f}){reserve} the session would get "
+                f"${budget_usd:.2f}, below the ${minimum_usd:.2f} a work session needs (claude_code_min_session_usd, "
+                f"less for a small run); this session was not started. It needs at least ${self.shortfall_usd:.2f} "
+                f"more{before}: resume with --budget {self.needed_cap_usd:.2f} or higher"
+            ),
+        )
+
+
+class SessionBudgetExhausted(BudgetExceeded):
+    """A Claude Code work session stopped at its ``--max-budget-usd`` (``error_max_budget_usd``) after the run's
+    remaining budget (or a reserve held back for later stages) had clamped that cap below the session budget it asked
+    for: the run is out of money, not broken. The session's spend is already recorded; its work stays in the workspace
+    for ``maf resume --budget``. ``charged_usd`` is what this pass's sessions were charged: the stopped session, plus
+    a timed-out one before it when the stopped session was its continuation."""
+
+    def __init__(
+        self,
+        *,
+        cap_usd: float,
+        spent_usd: float,
+        what: str,
+        budget_usd: float,
+        requested_usd: float,
+        charged_usd: float = 0.0,
+    ) -> None:
+        self.budget_usd = budget_usd
+        self.charged_usd = charged_usd
+        super().__init__(
+            cap_usd=cap_usd,
+            spent_usd=spent_usd,
+            requested_usd=requested_usd,
+            what=what,
+            message=(
+                f"budget cap ${cap_usd:.2f} reached: the Claude Code session ({what}) stopped at its "
+                f"${budget_usd:.2f} cap, which the run's remaining budget had cut from ${requested_usd:.2f} "
+                f"(spent ${spent_usd:.4f}); its work stays in the workspace"
+            ),
+        )
+
+
+def _round_up(usd: float) -> float:
+    """``usd`` rounded up to the cent, so a suggested cap is never a fraction of a cent short."""
+    return math.ceil(usd * 100 - 1e-6) / 100
 
 
 class LedgerEntry(BaseModel):
@@ -298,13 +395,12 @@ def metered_call(
     """
     from maf.providers.base import ProviderError  # runtime import keeps ledger below providers
 
-    what = f"{stage}/{purpose or 'call'} via {provider.name}:{request.model}"
+    what = call_label(provider, request, stage=stage, purpose=purpose)
     available = ledger._available()
     if provider.name == "claude_code" or request.max_budget_usd is not None:
         headroom = turn_headroom(provider, request)
-        spendable = max(0.0, available - headroom)
         requested = request.max_budget_usd
-        clamped = spendable if requested is None else min(requested, spendable)
+        clamped = clamp_budget(available, headroom, requested)
         if provider.name == "claude_code" and clamped < MIN_CLAUDE_CODE_BUDGET_USD:
             raise BudgetExceeded(
                 cap_usd=ledger.cap_usd,
@@ -365,6 +461,29 @@ def metered_call(
         return result
     finally:
         ledger._release(token)
+
+
+def call_label(provider: Provider, request: CompletionRequest, *, stage: StageName, purpose: str = "") -> str:
+    """How budget errors name a call: ``execution/execution via claude_code:claude-opus-5-5``."""
+    return f"{stage}/{purpose or 'call'} via {provider.name}:{request.model}"
+
+
+def clamp_budget(available_usd: float, headroom_usd: float, requested_usd: float | None) -> float:
+    """Pure: the ``--max-budget-usd`` ``metered_call`` passes: ``requested_usd`` (everything spendable when None), at
+    most what is available minus the one-turn headroom."""
+    spendable = max(0.0, available_usd - headroom_usd)
+    return spendable if requested_usd is None else min(requested_usd, spendable)
+
+
+def planned_budget(
+    ledger: Ledger, provider: Provider, request: CompletionRequest, *, reserve_usd: float = 0.0
+) -> tuple[float, float]:
+    """``(budget, headroom)``: the ``--max-budget-usd`` ``metered_call`` would pass for ``request`` right now, and the
+    turn headroom it holds back. Work sessions check it against their minimum before spawning (``maf.stages.base``).
+    ``reserve_usd`` is left out of what is available: spend that must come first (a sandbox preflight) or that later
+    stages need."""
+    headroom = turn_headroom(provider, request)
+    return clamp_budget(ledger._available() - reserve_usd, headroom, request.max_budget_usd), headroom
 
 
 def turn_headroom(provider: Provider, request: CompletionRequest) -> float:

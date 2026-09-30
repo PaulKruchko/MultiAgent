@@ -256,7 +256,22 @@ class Settings(BaseModel):
 
     output_limits: OutputLimits = Field(default_factory=OutputLimits)
     claude_code_tools: tuple[str, ...] = DEFAULT_CLAUDE_CODE_TOOLS
-    claude_code_timeout_s: float = 3600.0
+    claude_code_timeout_s: float = 5400.0
+    """Wall-clock limit of one Claude Code session; the CLI is killed after it and the session is charged its worst
+    case. An execution or fix session that times out gets one continuation session in the same workspace
+    (``maf.stages.base.work_session``); a second timeout fails the run. 90 minutes: the thesis execution of 2026-09-29
+    was killed at 60 minutes with its work nearly done."""
+    claude_code_min_session_usd: float = Field(default=3.0, ge=0, allow_inf_nan=False)
+    """Smallest useful ``--max-budget-usd`` of a Claude Code work session (execution, fix pass, continuation). When
+    the run's remaining budget (minus one turn of headroom) would clamp a session below it (or below the session's own
+    budget, or ``claude_code_min_session_share`` of the run's budget, if either is smaller), the session is not started:
+    an execution stops the run ``budget_exceeded``, naming the budget to resume with, and a fix pass is skipped. The
+    sandbox preflight and the clean room keep their own minima."""
+    claude_code_min_session_share: float = Field(default=0.25, gt=0, le=1, allow_inf_nan=False)
+    """The minimum above never exceeds this share of the run's budget (``maf.stages.base.session_floor``), so a small
+    run still gets its sessions: the $5 MCP default leaves an Opus execution session about $2.50 after ingestion,
+    strategy, the preflight and one turn of headroom, against a minimum of $1.25. The minimum reaches the full $3 from
+    a $12 run on."""
     claude_code_bash_timeout_s: float | None = Field(default=None, gt=0)
     """Longest timeout of one Bash command in a Claude Code session (``BASH_MAX_TIMEOUT_MS``; the CLI's own cap is 10
     minutes), so a long simulation, QEMU battery or clean-room reproduction is not killed before it finishes. None

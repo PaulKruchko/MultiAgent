@@ -61,6 +61,12 @@ def test_next_step(
     assert next_step(_index(review=review, round=round_), finished, _out(loop_back), max_loops) == expected
 
 
+def test_next_step_never_loops_the_cross_check_of_an_extra_round() -> None:
+    """After a final (`resume --extra-round`) the cross-check goes to final even below the loop cap."""
+    extra = _index(round=2, completed_stages=["ingestion", "strategy", "execution", "crosscheck", "final", "execution"])
+    assert next_step(extra, "crosscheck", _out(True), 2) == Step("final", 2, RunStatus.RUNNING)
+
+
 def test_next_step_ignores_loop_back_outside_crosscheck() -> None:
     assert next_step(_index(), "execution", _out(True), 2) == Step("crosscheck", 1, RunStatus.RUNNING)
 
@@ -85,7 +91,8 @@ def test_completed_with_issues_is_terminal_and_finished() -> None:
 
 def test_allowed_index_updates() -> None:
     assert ALLOWED_INDEX_UPDATES == {
-        "mode", "unresolved_critical", "criteria_unmet", "unmet_criteria", "exported_at", "export_note"
+        "mode", "unresolved_critical", "relaxed_criteria", "loop_skipped", "criteria_unmet", "unmet_criteria",
+        "exported_at", "export_note",
     }
 
 

@@ -42,14 +42,15 @@ not in the official docs. A maf run takes many minutes, so tools never wait for 
 | Tool | Kind | Returns |
 |---|---|---|
 | `start_run(brief, files?, budget_usd?, tier?)` | write (ChatGPT asks you to confirm, unless you told it to remember) | `run_id` and `pending`, immediately. The run is created on disk (no model calls yet) and queued on a single worker. Refused beyond the MCP limits (security model, item 4). |
-| `get_run_status(run_id)` | read-only | status, stage, round, spend (total and per agent), open criticals, unmet criteria, error, handoff notes |
-| `get_run_result(run_id)` | read-only | the 05-final report (up to 60,000 characters), deliverable paths (up to 200), the vault folder |
+| `get_run_status(run_id)` | read-only | status, stage, round, spend (total and per agent), open criticals, unmet criteria, relaxed criteria, a loop skipped for budget, error, handoff notes |
+| `get_run_result(run_id)` | read-only | the 05-final report (up to 60,000 characters), open criticals, unmet and relaxed criteria, a loop skipped for budget, deliverable paths (up to 200), the vault folder |
 | `list_runs(limit?)` | read-only | the newest runs |
 
 So you start a run, then ask for its status now and then, and fetch the result once it is `completed` or
 `completed_with_issues`. The server's instructions tell ChatGPT this. They also explain that `completed_with_issues`
 means "not verified" (open critical issues, or unmet acceptance criteria such as `clean-room`, `source-audit` or
-`lint`).
+`lint`), and that `relaxed_criteria` lists hard criteria the adjudicator relaxed to soft as over-specified relative to
+the request, so even a `completed` run was not verified against those as written, which ChatGPT should tell you.
 
 Runs execute one at a time in the background. A second `start_run` waits as `pending` until the first one finishes.
 A third is refused while two MCP runs are queued or running (`mcp_max_pending_runs`).
@@ -99,6 +100,17 @@ What stands between the internet and your machine:
    `budget_exceeded` before the final report. A live `start_run` with `budget_usd` 0.60 stopped at ingestion after
    spending $0.0043; the one-page TLSF briefing completed on a $2 budget and spent $0.75.
 
+   Code and mixed runs need more. A Claude Code work session (execution, fix pass) holds back one turn of headroom
+   ($2.28 on Opus) and is started only with at least `claude_code_min_session_usd` ($3), but never more than
+   `claude_code_min_session_share` (a quarter) of the run's budget. So a $5 run still gets its execution session:
+   about $0.16 goes to ingestion and strategy and a few cents to the sandbox preflight, and the session starts with
+   about $2.50 against a $1.25 minimum. What follows is thin. A session that spends all of that leaves too little for
+   the cross-check or the final report, and the run stops `budget_exceeded` with its workspace exported as partial,
+   unverified deliverables. A cheaper one leaves room for the cross-check and final, but the fix pass, which keeps
+   the final report and the clean room affordable, is then usually skipped (`Fix pass skipped: budget` in the
+   cross-check note) and no second round fits. For a code run that can loop, allow $20 or more with the CLI
+   (`maf resume RUN_ID --budget USD` continues a run ChatGPT started) or raise `mcp_max_budget_usd`.
+
 5. **Input files only from the inbox.** `files` must be absolute paths that resolve inside `mcp_inbox`
    (`~/MultiAgent/inbox` by default; `null` disables files over MCP). maf refuses:
    - relative paths and missing files;
@@ -136,7 +148,8 @@ What stands between the internet and your machine:
    files, `~/.netrc`, `~/.pypirc`, `~/.npmrc`, `~/.pgpass`...), shell startup files and histories (`~/.bashrc`,
    `~/.profile`, `~/.bash_history`...), browser and mail profiles, and the vault.
 10. **Keys are masked on the way out.** `get_run_status` and `get_run_result` mask maf's own key values and anything
-    shaped like an OpenAI, Anthropic or Google key in `final_markdown`, `error` and `unmet_criteria`. The source audit
+    shaped like an OpenAI, Anthropic or Google key in `final_markdown`, `error`, `unmet_criteria` and
+    `relaxed_criteria`. The source audit
     masks the same in the documents it sends to Gemini, because Gemini fetches the URLs it finds there from outside
     the sandbox, and a "reference" could carry a key to someone else's server.
 
@@ -327,10 +340,13 @@ It also prints fixes for recognizable log lines.
 
 **Stopping and restarting maf serve.** SIGTERM reaches maf only (`KillMode=mixed`), not the Claude Code session it
 may be running. maf stops serving at once, and the in-flight run stops at its **next stage boundary**, marked failed
-with "interrupted". Queued runs never start. `maf resume RUN_ID` continues either kind. A stage that runs Claude Code
-can take an hour or more, so `TimeoutStopSec=2h`; after that systemd kills the whole group. `systemctl --user stop`
-blocks until then, which is why `--no-block` helps. At system shutdown, the user manager's own stop timeout applies
-instead.
+with "interrupted". Queued runs never start. `maf resume RUN_ID` continues either kind. One stage can run three Claude
+Code sessions back to back (a session of up to `claude_code_timeout_s`, 90 minutes by default, its continuation after
+a timeout, and a repair), so setup writes `TimeoutStopSec` as three sessions plus 30 minutes: `5h` by default. After
+that systemd kills the whole group, and a Claude Code session killed that way is never recorded in the run's cost
+ledger (maf cannot catch SIGKILL to charge its worst case), which is why the timeout covers the longest stage. Re-run
+`maf chatgpt setup` after changing `claude_code_timeout_s`. `systemctl --user stop` blocks until the stage ends,
+which is why `--no-block` helps. At system shutdown, the user manager's own stop timeout applies instead.
 
 When maf serve starts, it first takes its socket (a second server on the same socket or port exits at once, touching
 no run), then marks failed the runs a dead process left behind, so ChatGPT does not poll them forever:

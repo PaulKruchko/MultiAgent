@@ -47,8 +47,12 @@ Round r (= ``ctx.index.round``):
    A missing response counts as ``accept``.
 4. **Adjudication**: ChatGPT rules ``fix``/``wontfix`` on every ``reject``/``partial`` in
    ``04c-adjudication[-rN]`` (kind ADJUDICATION); disputed unmet acceptance criteria are flagged, and may be
-   ruled ``wontfix`` only on evidence. Skipped (``None.``) when nothing is disputed.
-5. **Fixes**: issues to fix = accepted, plus ``partial``/``reject`` ruled ``fix``. Claude applies them:
+   ruled ``wontfix`` only on evidence. It is also shown the critical unmet-criterion issues the author accepted,
+   and may rule any unmet hard criterion ``relax``: over-specified relative to the brief (``new_relaxations``).
+   A relaxed criterion is soft for the rest of the run (``RunIndex.relaxed_criteria``, ``## Relaxed Criteria``):
+   its issues become major (``relax_issues``, also for later rounds' critics, who see it as ``[soft]``) and final's
+   gate reports it without blocking. Skipped (``None.``) when nothing is disputed and nothing can be relaxed.
+5. **Fixes**: issues to fix = accepted, plus ``partial``/``reject`` ruled ``fix`` or ``relax``. Claude applies them:
    Claude Code in the workspace (code/mixed) or Messages rewriting the prose deliverable. The fix prompt lists every
    finding of a LINT issue (``lint_details``). The fixer returns a structured list
    ``{"fixed": [ids], "not_fixed": [{"id", "reason"}]}`` (``FIX_REPORT_SCHEMA``). Python snapshots the workspace
@@ -58,6 +62,10 @@ Round r (= ``ctx.index.round``):
    new LINT issue; an SRC issue reported fixed whose document did not change counts as not fixed, and the Markdown
    deliverables whose text the pass changed are audited again, each reference that audit does not verify becoming a
    new SRC issue (unless an issue left unresolved already raises it). New issues open with ``AFTER_FIX``.
+   The code-mode fix session is a ``work_session`` that keeps final's reserve (``final_reserve_usd``) and the
+   post-fix re-audit's worst case unspent. It never stops the run for budget: when it cannot get its floor while
+   keeping them, the pass is skipped (every issue ``fix pass skipped: budget``, a ``Fix pass skipped: budget`` line in
+   the Summary), and a session that runs out of the cap the reserve cut counts every issue as not fixed.
 6. **Verdict** (Python): unresolved critical = critical issues to fix that are in ``not_fixed`` or
    missing from ``fixed``, plus the new critical issues of step 5. ``LOOP`` if any, else ``PASS``. Python assembles
    ``04-crosscheck[-rN]`` (kind CROSSCHECK, ``from: maf``), with the extra sections ``## Source Audit`` (when an
@@ -65,9 +73,18 @@ Round r (= ``ctx.index.round``):
    plus the source audits, failed attempts included, so the notes still add up to the ledger total minus the
    preflights.
 
-``loop_back = verdict == "LOOP"``; ``index_updates = {"unresolved_critical": n}``. The pipeline decides
-whether a loop is still permitted. When ``round > max_crosscheck_loops`` a ``LOOP`` cannot loop any more: the
-note's Summary says the run goes to final and ends ``completed_with_issues``, and its ``to`` is ``final``.
+``loop_back = verdict == "LOOP"``; ``index_updates = {"unresolved_critical": n}`` (plus ``relaxed_criteria`` when a
+criterion was relaxed, and ``loop_skipped``). The pipeline decides whether a loop is still permitted. When
+``round > max_crosscheck_loops``, or in the extra round of ``maf resume --extra-round`` (a cross-check after a final:
+``"final" in completed_stages``), a ``LOOP`` cannot loop any more: the note's Summary says the run goes to final and
+ends ``completed_with_issues``, and its ``to`` is ``final``. Below the cap, a ``LOOP`` first checks the budget
+(``loop_estimate``: the last round's spend, at least the smallest round maf starts (an execution session, this
+cross-check's calls at their worst case and a fix session), plus a reserve for final's report and clean room). If the
+run cannot pay for that, the loop is skipped: ``loop_back`` is False, ``to`` is ``final``, the Summary says ``Loop
+skipped: budget`` with the estimate, and ``loop_skipped`` is ``budget``, so the run ends ``completed_with_issues`` with
+a final report instead of running out of money mid-loop. The estimate is logged either way. The looped round's
+execution holds back the rest of that estimate (``round_reserve_usd``) and its fix pass keeps final's reserve, so an
+affordable loop reaches final even when the next round costs more than the last.
 
 The debate notes' line grammars accept indented continuation lines (``maf.handoff``); the parsed item texts
 arrive here with the continuation folded in, so every item stays one line in the notes Python assembles.
@@ -92,14 +109,17 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from maf import handoff as hf
+from maf import ledger as _ledger
 from maf import lint as _lint
 from maf import vault as _vault
 from maf.config import ModelRole
-from maf.handoff import Handoff, HandoffKind, Issue, Response, Ruling
+from maf.handoff import Criterion, Handoff, HandoffKind, Issue, Relaxation, Response, Ruling
+from maf.ledger import LedgerEntry
 from maf.prompts import render_prompt
 from maf.providers import CompletionRequest, CompletionResult, StructuredOutputError
 from maf.redact import known_secrets, redact
 from maf.stages.base import (
+    FINAL_PROMPT_ALLOWANCE_CHARS,
     NO_MODEL,
     WORKSPACE_META_DIR,
     Check,
@@ -107,14 +127,20 @@ from maf.stages.base import (
     StageContext,
     StageOutput,
     assemble_handoff,
+    continuation_note,
+    crosscheck_overhead,
     default_output_tokens,
     escape_note_tags,
     export_excludes,
+    final_reserve_usd,
     generate_handoff,
     neutralize_headings,
     one_line,
     render_inputs,
     role_system,
+    round_entries,
+    smallest_session_usd,
+    work_session,
     write_workspace_file,
 )
 from maf.stages.execution import (
@@ -252,6 +278,12 @@ AFTER_FIX = "(found after the fix pass) "
 """Opens the text of an issue that maf's checks raised after the fix pass (``_post_fix_checks``)."""
 
 MAX_CHANGED_FILES_LISTED = 60
+
+RELAXED_SECTION = "Relaxed Criteria"
+"""Extra H2 of the cross-check note listing the acceptance criteria relaxed so far (``maf.handoff.Relaxation``)."""
+
+LOOP_SKIPPED_BUDGET = _vault.LOOP_SKIPPED_BUDGET
+"""``RunIndex.loop_skipped`` when a LOOP went to final because the budget could not pay for another round."""
 
 FIX_REPORT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -454,6 +486,7 @@ class CrosscheckBackend:
         mode = require_mode(ctx)
         if mode != "prose":
             ensure_sandbox(ctx)  # the code-mode fix pass is a Claude Code session
+        attempt_start = len(ctx.ledger.entries)
         rnd = ctx.round
         strategy_name = _vault.note_name(HandoffKind.STRATEGY)
         exec_name = _vault.note_name(HandoffKind.EXECUTION, rnd)
@@ -477,9 +510,12 @@ class CrosscheckBackend:
             checks=render_checks(audit, lint_issues, findings, lint_error),
         )
 
-        acceptance = "\n".join(escape_note_tags(c.line) for c in hf.parse_acceptance_criteria(strategy))
+        criteria = hf.parse_acceptance_criteria(strategy)
+        relaxed = hf.parse_relaxations(ctx.index.relaxed_criteria)
+        acceptance = "\n".join(escape_note_tags(line) for line in criteria_lines(criteria, relaxed))
         critiques = self._critiques(ctx, evidence, consumed, acceptance)
         issues = [i for agent, (_, note) in critiques.items() for i in hf.parse_issues(note.section("Issues"), agent)]
+        issues = relax_issues(issues, relaxed)  # a criterion relaxed in an earlier round is soft: major at most
         issues += [*audit.issues, *lint_issues]
         notes = [NoteOut(name, note) for name, note in critiques.values()]
 
@@ -489,14 +525,23 @@ class CrosscheckBackend:
         notes.append(NoteOut(rebuttal_name, rebuttal))
 
         adjudication_name = _vault.note_name(HandoffKind.ADJUDICATION, rnd)
-        adjudication = self._adjudicate(ctx, issues, responses, evidence, consumed + [rebuttal_name])
+        eligible = {c.id for c in criteria if c.hard and c.id not in relaxed}
+        adjudication = self._adjudicate(ctx, issues, responses, evidence, consumed + [rebuttal_name], eligible)
         rulings = hf.parse_rulings(adjudication.section("Rulings"))
         notes.append(NoteOut(adjudication_name, adjudication))
+        fresh, ignored = new_relaxations(issues, rulings, eligible, rnd)
+        issues = relax_issues(issues, fresh)
+        relaxed = {**relaxed, **fresh}
 
         to_fix = issues_to_fix(issues, responses, rulings)
         before = workspace_snapshot(ctx.paths.workspace) if to_fix else {}
-        report, fix_cost, fix_model = self._fix(
-            ctx, mode, to_fix, responses, rulings, evidence, audit, lint_details(groups, lint_issues)
+        reserve = 0.0
+        if mode != "prose" and to_fix:  # the fix session leaves final (and the re-audit after it) affordable
+            audited = [e for e in ctx.ledger.entries[attempt_start:] if e.purpose == SOURCE_AUDIT_PURPOSE]
+            stand_in = final_prompt_estimate(ctx, evidence, {"Issues": "\n".join(_issue_line(i) for i in issues)})
+            reserve = final_reserve_usd(ctx, mode, stand_in) + sum(e.worst_case_usd for e in audited)
+        report, fix_cost, fix_model, fix_note = self._fix(
+            ctx, mode, to_fix, responses, rulings, evidence, audit, lint_details(groups, lint_issues), reserve
         )
         changes = diff_snapshots(before, workspace_snapshot(ctx.paths.workspace)) if to_fix else None
         fixed = [i for i in report.fixed if i in {x.id for x in to_fix}]
@@ -509,14 +554,20 @@ class CrosscheckBackend:
         unresolved = unresolved_critical(to_fix, fixed, list(not_fixed))
         unresolved += [i for i in post.issues if i.severity == "critical"]
         verdict = "LOOP" if unresolved else "PASS"
-        capped = bool(unresolved) and rnd > ctx.settings.max_crosscheck_loops
+        extra_round = "final" in ctx.index.completed_stages  # `maf resume --extra-round`: one pass, then final
+        capped = bool(unresolved) and (rnd > ctx.settings.max_crosscheck_loops or extra_round)
 
-        cap_note = (
-            f"Loop cap reached (max {ctx.settings.max_crosscheck_loops} loop(s)): the run goes to final and ends "
-            f"`completed_with_issues` with {len(unresolved)} critical issue(s) unresolved."
-            if capped
-            else ""
-        )
+        cap_note = ""
+        if capped and extra_round:
+            cap_note = (
+                "Extra round (`maf resume --extra-round` pays for one pass): the run goes to final and ends "
+                f"`completed_with_issues` with {len(unresolved)} critical issue(s) unresolved."
+            )
+        elif capped:
+            cap_note = (
+                f"Loop cap reached (max {ctx.settings.max_crosscheck_loops} loop(s)): the run goes to final and ends "
+                f"`completed_with_issues` with {len(unresolved)} critical issue(s) unresolved."
+            )
         checks_note = "\n".join(
             line
             for line in (
@@ -524,6 +575,8 @@ class CrosscheckBackend:
                 audit_status(audit),
                 lint_status(findings, lint_issues, lint_error),
                 *post.notes,
+                relaxation_status(fresh, ignored),
+                fix_note,
             )
             if line
         )
@@ -537,33 +590,51 @@ class CrosscheckBackend:
         audits = [a for a in (audit, post.audit) if a is not None and a.status in ("done", "failed")]
         if audits:
             sections["Source Audit"] = "\n\n".join(render_audit(a) for a in audits)
-        sections |= {
-            "Rulings": "\n".join(f"- {r.id} [{r.ruling}]: {r.text}" for r in rulings) or hf.NONE_MARKER,
-            "Applied Fixes": _applied_fixes(to_fix, fixed, not_fixed),
-        }
+        sections["Rulings"] = "\n".join(f"- {r.id} [{r.ruling}]: {r.text}" for r in rulings) or hf.NONE_MARKER
+        if relaxed:
+            sections[RELAXED_SECTION] = render_relaxed(relaxed)
+        sections["Applied Fixes"] = _applied_fixes(to_fix, fixed, not_fixed)
         if changes is not None:
             sections["Changed Files"] = render_changes(changes)
         sections |= {
             "Unresolved Critical": "\n".join(_issue_line(i) for i in unresolved) or hf.NONE_MARKER,
             "Verdict": verdict,
         }
+
+        skipped: LoopEstimate | None = None
+        if unresolved and not capped:
+            estimate = loop_estimate(ctx, mode, final_prompt_estimate(ctx, evidence, sections))
+            log.info("cross-check round %d: loop budget check: %s", rnd, estimate.describe())
+            if estimate.affordable:
+                budget_note = f"Loop budget check: {estimate.describe()}, so the run loops."
+            else:
+                skipped = estimate
+                budget_note = (
+                    f"Loop skipped: budget. {_capitalized(estimate.describe())}. The run goes to final and ends "
+                    f"`completed_with_issues` with {len(unresolved)} critical issue(s) unresolved; "
+                    f"`maf resume {ctx.run_id} --extra-round --budget USD` pays for another round."
+                )
+            sections["Summary"] += f"\n\n{budget_note}"
+
         audit_cost = audit.cost_usd + (post.audit.cost_usd if post.audit is not None else 0.0)
         read = list(dict.fromkeys([*audit.consumed, *(post.audit.consumed if post.audit is not None else ())]))
+        loops = bool(unresolved) and not capped and skipped is None
         crosscheck = assemble_handoff(
             ctx,
             HandoffKind.CROSSCHECK,
             sections,
-            to="execution" if unresolved and not capped else "final",
+            to="execution" if loops else "final",
             inputs=consumed + read + [n.name for n in notes],
             model=fix_model or audit.model or (post.audit.model if post.audit is not None else "") or NO_MODEL,
             cost_usd=fix_cost + audit_cost,
         )
         notes.append(NoteOut(_vault.note_name(HandoffKind.CROSSCHECK, rnd), crosscheck))
-        return StageOutput(
-            notes=notes,
-            index_updates={"unresolved_critical": len(unresolved)},
-            loop_back=bool(unresolved),
-        )
+        updates: dict[str, Any] = {"unresolved_critical": len(unresolved)}
+        if skipped is not None or ctx.index.loop_skipped is not None:
+            updates["loop_skipped"] = LOOP_SKIPPED_BUDGET if skipped is not None else None
+        if fresh:
+            updates["relaxed_criteria"] = [r.line for r in relaxed.values()]
+        return StageOutput(notes=notes, index_updates=updates, loop_back=bool(unresolved) and skipped is None)
 
     # ------------------------------------------------------------------ steps
 
@@ -836,10 +907,19 @@ class CrosscheckBackend:
         responses: list[Response],
         evidence: _Evidence,
         consumed: list[str],
+        relaxable: set[str] | frozenset[str] = frozenset(),
     ) -> Handoff:
+        """Rulings on the disputed issues, and on the critical unmet-criterion issues the author accepted whose
+        criterion is in ``relaxable`` (hard, not relaxed yet), which the adjudicator may ``relax`` as over-specified
+        relative to the brief. Skipped (a ``None.`` note from maf) when there is neither."""
         by_id = {i.id: i for i in issues}
         disputed = [r for r in dict((r.id, r) for r in responses).values() if r.stance != "accept" and r.id in by_id]
-        if not disputed:
+        disputed_ids = {r.id for r in disputed}
+        accepted = [
+            i for i in issues
+            if i.id not in disputed_ids and i.severity == "critical" and acceptance_criterion_id(i) in relaxable
+        ]
+        if not disputed and not accepted:
             return assemble_handoff(
                 ctx,
                 HandoffKind.ADJUDICATION,
@@ -858,7 +938,9 @@ class CrosscheckBackend:
         prompt = render_prompt(
             "adjudicate",
             round=str(ctx.round),
-            disputes="\n\n".join(blocks),
+            brief=ctx.index.brief,
+            disputes="\n\n".join(blocks) or "None: the author accepted every issue.",
+            accepted=_accepted_block(accepted),
             inputs=evidence.full,
             format_spec=hf.format_spec(HandoffKind.ADJUDICATION),
         )
@@ -871,7 +953,7 @@ class CrosscheckBackend:
             to="claude",
             inputs=consumed,
             purpose="adjudication",
-            check=_ids_check("Rulings", hf.parse_rulings, {r.id for r in disputed}, "ruling"),
+            check=_ids_check("Rulings", hf.parse_rulings, disputed_ids | {i.id for i in accepted}, "ruling"),
         )
 
     def _fix(
@@ -884,12 +966,21 @@ class CrosscheckBackend:
         evidence: _Evidence,
         audit: SourceAudit,
         details: Mapping[str, Sequence[str]] | None = None,
-    ) -> tuple[FixReport, float, str]:
-        """Run the fix pass. Returns the report, what the pass cost (an unusable report's call included) and the
-        fixer's model (empty when there was nothing to fix). ``details`` lists every finding of a LINT issue
-        (``lint_details``)."""
+        reserve_usd: float = 0.0,
+    ) -> tuple[FixReport, float, str, str]:
+        """Run the fix pass. Returns the report, what the pass cost (an unusable report's call included), the
+        fixer's model (empty when there was nothing to fix, or no session ran) and a line for the Summary on its
+        continuation after a timeout or on a skip (empty otherwise). ``details`` lists every finding of a LINT issue
+        (``lint_details``).
+
+        The code-mode pass is a ``work_session`` that leaves ``reserve_usd`` (final's reserve and the post-fix re-audit)
+        unspent; a timed-out session gets one continuation. It never stops the run for budget: when the session (or its
+        continuation) cannot get its floor while keeping the reserve, the pass is skipped (``skipped_fix_report``), and
+        when a session cut by the reserve runs out of its cap, every issue counts as not fixed
+        (``exhausted_fix_report``; its changes stay and are checked). Either way the cross-check goes on, and a LOOP
+        then usually goes to final with ``Loop skipped: budget``."""
         if not to_fix:
-            return FixReport(fixed=[], not_fixed=[], summary="Nothing to fix."), 0.0, ""
+            return FixReport(fixed=[], not_fixed=[], summary="Nothing to fix."), 0.0, "", ""
         issues_block = _fix_issue_block(to_fix, responses, rulings, details)
         sources = ""
         if audit.verified_sources and any(i.id.startswith(f"{hf.SOURCE_AUDIT_PREFIX}-") for i in to_fix):
@@ -934,31 +1025,44 @@ class CrosscheckBackend:
             effort="high",
             **extra,
         )
+        ids = [i.id for i in to_fix]
         try:
-            result = ctx.call(role, request, purpose="fixes")
+            if role == "claude_code":
+                result = work_session(ctx, request, purpose="fixes", reserve_usd=reserve_usd)
+            else:
+                result = ctx.call(role, request, purpose="fixes")
+        except _ledger.SessionBudgetTooSmall as exc:
+            note = fix_skipped_note(exc, len(ids))
+            log.warning("cross-check round %d: %s", ctx.round, note)
+            model = ctx.model(role) if exc.charged_usd > 0 else ""
+            return skipped_fix_report(ids), exc.charged_usd, model, note
+        except _ledger.SessionBudgetExhausted as exc:
+            log.warning("fix session ran out of its cut budget, treating every issue as not fixed: %s", exc)
+            return exhausted_fix_report(ids, exc.budget_usd), exc.charged_usd, ctx.model(role), ""
         except StructuredOutputError as exc:
             # Billed and recorded by metered_call; the workspace may already hold fixes. Fail safe instead of
             # failing the run, which would re-pay every critique on resume.
             log.warning("fix report unusable, treating every issue as not fixed: %s", exc)
-            return unreadable_fix_report([i.id for i in to_fix], str(exc)), exc.cost_usd, ctx.model(role)
+            return unreadable_fix_report([i.id for i in to_fix], str(exc)), exc.cost_usd, ctx.model(role), ""
         report = parse_fix_report(result, [i.id for i in to_fix])
         if mode == "prose" and report.document and report.document.strip():
             write_workspace_file(ctx, PROSE_DOCUMENT, report.document.strip() + "\n")
-        return report, result.cost_usd, result.model or ctx.model(role)
+        return report, result.cost_usd, result.model or ctx.model(role), continuation_note(result)
 
 
 # ---------------------------------------------------------------------- pure helpers
 
 
 def issues_to_fix(issues: list[Issue], responses: list[Response], rulings: list[Ruling]) -> list[Issue]:
-    """Pure: accepted issues, plus disputed ones ruled ``fix``. Unanswered issues count as accepted;
-    disputed issues without a ruling count as ``fix`` (fail safe)."""
+    """Pure: accepted issues, plus disputed ones ruled ``fix`` or ``relax`` (a relaxed criterion is still worth
+    improving, as a major issue). Unanswered issues count as accepted; disputed issues without a ruling count as
+    ``fix`` (fail safe)."""
     stance = {r.id: r.stance for r in responses}
     ruling = {r.id: r.ruling for r in rulings}
     return [
         issue
         for issue in issues
-        if stance.get(issue.id, "accept") == "accept" or ruling.get(issue.id, "fix") == "fix"
+        if stance.get(issue.id, "accept") == "accept" or ruling.get(issue.id, "fix") in ("fix", "relax")
     ]
 
 
@@ -979,6 +1083,48 @@ def parse_fix_report(result: CompletionResult, expected_ids: list[str]) -> FixRe
     except (json.JSONDecodeError, ValidationError, TypeError) as exc:
         log.warning("fix report unreadable, treating every issue as not fixed: %s", exc)
         return unreadable_fix_report(expected_ids, str(exc))
+
+
+FIX_SKIPPED_BUDGET = "fix pass skipped: budget"
+"""``NotFixed.reason`` of every issue when the fix pass could not get its floor while keeping final's reserve."""
+
+
+def skipped_fix_report(expected_ids: list[str]) -> FixReport:
+    """The report of a fix pass skipped for budget (``CrosscheckBackend._fix``): nothing counts as fixed."""
+    return FixReport(
+        fixed=[],
+        not_fixed=[NotFixed(id=i, reason=FIX_SKIPPED_BUDGET) for i in expected_ids],
+        summary="",
+    )
+
+
+def exhausted_fix_report(expected_ids: list[str], budget_usd: float) -> FixReport:
+    """The report of a fix session that ran out of the cap the reserve for final had cut: nothing counts as fixed,
+    though the workspace may hold some fixes (the post-fix checks see them)."""
+    reason = f"the fix session ran out of its ${budget_usd:.2f} budget before reporting"
+    return FixReport(
+        fixed=[],
+        not_fixed=[NotFixed(id=i, reason=reason) for i in expected_ids],
+        summary=(
+            f"maf: the fix session stopped at its ${budget_usd:.2f} cap (cut to keep final affordable) before it "
+            "reported; every issue is treated as not fixed."
+        ),
+    )
+
+
+def fix_skipped_note(exc: _ledger.SessionBudgetTooSmall, count: int) -> str:
+    """The Summary line of a fix pass skipped for budget: what the session would have got, and what was kept back."""
+    charged = (
+        f"The first fix session timed out and was charged ${exc.charged_usd:.2f}; its continuation was not started. "
+        if exc.charged_usd > 0
+        else ""
+    )
+    kept = f" and ${exc.reserve_usd:.2f} kept for final" if exc.reserve_usd > 0 else ""
+    return (
+        f"Fix pass skipped: budget. {charged}The run has ${max(0.0, exc.cap_usd - exc.spent_usd):.2f} left; after one "
+        f"turn of headroom (${exc.headroom_usd:.2f}){kept}, a fix session would get ${exc.budget_usd:.2f}, below its "
+        f"${exc.minimum_usd:.2f} minimum. The {count} issue(s) to fix stay open."
+    )
 
 
 def unreadable_fix_report(expected_ids: list[str], detail: str) -> FixReport:
@@ -1188,11 +1334,187 @@ def _raised_by(issue: Issue) -> str:
 
 
 _ACCEPTANCE_ISSUE = re.compile(r"^\W*unmet acceptance criterion\b", re.IGNORECASE)
+_ACCEPTANCE_ID = re.compile(r"^\W*unmet acceptance criterion\W*(?P<id>AC-?\d+)\b", re.IGNORECASE)
 
 
 def is_acceptance_issue(issue: Issue) -> bool:
     """A critic's issue that says an acceptance criterion is not met (text starts ``Unmet acceptance criterion``)."""
     return _ACCEPTANCE_ISSUE.match(issue.text) is not None
+
+
+def acceptance_criterion_id(issue: Issue) -> str | None:
+    """Pure: the ``AC-<n>`` an unmet-criterion issue names right after ``Unmet acceptance criterion``, or None."""
+    match = _ACCEPTANCE_ID.match(issue.text)
+    return f"AC-{match['id'][2:].lstrip('-')}" if match else None
+
+
+# ---------------------------------------------------------------------- relaxed criteria
+
+
+def criteria_lines(criteria: Sequence[Criterion], relaxed: Mapping[str, Relaxation]) -> list[str]:
+    """The critics' acceptance list: ``Criterion.line`` each, a relaxed criterion as ``[soft]`` with its ruling."""
+    lines = []
+    for criterion in hf.relaxed_criteria(list(criteria), dict(relaxed)):
+        rule = relaxed.get(criterion.id)
+        note = f" (relaxed in round {rule.round}: over-specified relative to the brief)" if rule else ""
+        lines.append(criterion.line + note)
+    return lines
+
+
+def relax_issues(issues: Sequence[Issue], relaxed: Mapping[str, Relaxation]) -> list[Issue]:
+    """Pure: ``issues`` with every critical unmet-criterion issue about a relaxed criterion made ``major`` (its text
+    says why). Other issues are unchanged."""
+    out = []
+    for issue in issues:
+        rule = relaxed.get(acceptance_criterion_id(issue) or "") if issue.severity == "critical" else None
+        if rule is None:
+            out.append(issue)
+            continue
+        note = (
+            f" (maf: major, not critical: the adjudicator relaxed {rule.criterion} as over-specified relative to the "
+            f"brief in round {rule.round})"
+        )
+        out.append(issue.model_copy(update={"severity": "major", "text": issue.text + note}))
+    return out
+
+
+def new_relaxations(
+    issues: Sequence[Issue], rulings: Sequence[Ruling], eligible: set[str], rnd: int
+) -> tuple[dict[str, Relaxation], list[str]]:
+    """Pure: ``({criterion: Relaxation}, ignored ids)`` from the ``relax`` rulings. A ruling counts only on a critical
+    unmet-criterion issue whose criterion is in ``eligible`` (hard, not relaxed yet); any other ``relax`` is ignored,
+    and ``issues_to_fix`` treats it like ``fix``. The first ruling for a criterion wins."""
+    by_id = {i.id: i for i in issues}
+    fresh: dict[str, Relaxation] = {}
+    ignored: list[str] = []
+    for ruling in rulings:
+        if ruling.ruling != "relax":
+            continue
+        issue = by_id.get(ruling.id)
+        criterion = acceptance_criterion_id(issue) if issue is not None and issue.severity == "critical" else None
+        if criterion is None or criterion not in eligible:
+            ignored.append(ruling.id)
+            log.warning("relax ruling on %s ignored: not an unmet hard acceptance criterion", ruling.id)
+            continue
+        fresh.setdefault(criterion, Relaxation(criterion, ruling.id, rnd, one_line(ruling.text, 300)))
+    return fresh, ignored
+
+
+def relaxation_status(fresh: Mapping[str, Relaxation], ignored: Sequence[str]) -> str:
+    """One line for the cross-check Summary on this round's relaxations (empty when there were none)."""
+    parts = []
+    if fresh:
+        parts.append(
+            "Relaxed this round (over-specified relative to the brief; now soft, so their issues are major): "
+            + "; ".join(f"{r.criterion} ({r.issue}): {r.reason}" for r in fresh.values())
+            + "."
+        )
+    if ignored:
+        parts.append(
+            f"`relax` ruling(s) on {', '.join(ignored)} ignored: only an unmet hard criterion can be relaxed, so they "
+            "count as `fix`."
+        )
+    return " ".join(parts)
+
+
+def render_relaxed(relaxed: Mapping[str, Relaxation]) -> str:
+    """``## Relaxed Criteria`` of the cross-check note: every criterion relaxed so far, with its ruling."""
+    lead = (
+        "The adjudicator ruled these acceptance criteria over-specified relative to the brief. maf treats them as soft "
+        "from their round on: critics may raise them as major at most, and final reports them without blocking."
+    )
+    return lead + "\n\n" + "\n".join(f"- {r.line}" for r in relaxed.values())
+
+
+def _accepted_block(issues: Sequence[Issue]) -> str:
+    """The adjudication prompt's block of accepted unmet-criterion issues, which may be relaxed (empty if none)."""
+    if not issues:
+        return ""
+    blocks = [
+        f"### {i.id} [{i.severity}] (raised by {_raised_by(i)}; an unmet acceptance criterion the author accepted)"
+        f"\n\n- Critic: {i.text}"
+        for i in issues
+    ]
+    return (
+        "## Unmet acceptance criteria the author accepted\n\n"
+        "The author accepted these, so they will be fixed. Rule each one `fix` (the criterion stands) or `relax` "
+        "(it is over-specified relative to the user's request), with one line each.\n\n" + "\n\n".join(blocks)
+    )
+
+
+# ---------------------------------------------------------------------- loop budget
+
+
+@dataclass(frozen=True)
+class LoopEstimate:
+    """Whether the run can pay for another execution + cross-check round and still reach final (``loop_estimate``)."""
+
+    round_usd: float
+    """What another round is expected to cost."""
+    basis: str
+    """How ``round_usd`` was found."""
+    final_usd: float
+    """Held back for final: the report's worst case, plus (code/mixed) the clean room's budget and turn headroom."""
+    remaining_usd: float
+
+    @property
+    def needed_usd(self) -> float:
+        return self.round_usd + self.final_usd
+
+    @property
+    def affordable(self) -> bool:
+        return self.remaining_usd + _ledger.BUDGET_EPSILON_USD >= self.needed_usd
+
+    def describe(self) -> str:
+        return (
+            f"another round (execution + cross-check) is estimated at ${self.round_usd:.2f} ({self.basis}) and final "
+            f"needs up to ${self.final_usd:.2f}, ${self.needed_usd:.2f} in all; the run has ${self.remaining_usd:.2f} "
+            "left"
+        )
+
+
+def round_costs(entries: Sequence[LedgerEntry]) -> list[float]:
+    """Pure: the spend of each execution + cross-check round in ``entries`` (``maf.stages.base.round_entries``: a
+    failed and resumed stage stays in its round, a timed-out session counts at its worst-case charge), oldest first."""
+    return [sum(e.cost_usd for e in entries_of_round) for entries_of_round in round_entries(entries)]
+
+
+def loop_estimate(ctx: StageContext, mode: ExecutionMode, final_prompt: str) -> LoopEstimate:
+    """Can the run afford another round and still reach final? ``round_usd`` is the spend of the round that just
+    ended (the latest ``round_costs``), at least (code/mixed) the smallest round maf starts: the smallest execution
+    session (``smallest_session_usd``: its floor plus one turn of headroom), this cross-check's calls at their worst
+    case (``crosscheck_overhead``) and the smallest fix session. The reserve for final (``final_reserve_usd``) is the
+    worst case of the final report's call on ``final_prompt`` (``final_prompt_estimate``) plus, for code/mixed runs, the
+    clean room's ``cleanroom_budget_usd`` and its turn headroom. A looped round's execution holds back all but its own
+    part (``round_reserve_usd``), and its fix pass keeps final's reserve, so an affordable estimate reaches final."""
+    costs = round_costs(ctx.ledger.entries)
+    last = costs[-1] if costs else 0.0
+    round_usd, basis = last, f"round {ctx.round}'s spend"
+    final_usd = final_reserve_usd(ctx, mode, final_prompt)
+    if mode != "prose":
+        execution = smallest_session_usd(ctx, "execution")
+        overhead = crosscheck_overhead(ctx.ledger.entries)
+        fixes = smallest_session_usd(ctx, "crosscheck")
+        smallest = execution + overhead + fixes
+        if smallest > round_usd + _ledger.BUDGET_EPSILON_USD:
+            round_usd = smallest
+            basis = (
+                f"the smallest round maf starts: an execution session ${execution:.2f}, the cross-check's calls at "
+                f"their worst case ${overhead:.2f} and a fix session ${fixes:.2f}; round {ctx.round} spent ${last:.2f}"
+            )
+    return LoopEstimate(round_usd, basis, final_usd, ctx.ledger.remaining_usd)
+
+
+def final_prompt_estimate(ctx: StageContext, evidence: _Evidence, sections: Mapping[str, str]) -> str:
+    """Stand-in for the final report's prompt, for its worst case: the brief, the evidence the critics read
+    (criteria, execution note, automated checks), this cross-check note and ``FINAL_PROMPT_ALLOWANCE_CHARS``."""
+    return "\n\n".join(
+        (ctx.index.brief, evidence.context, hf.render_body(dict(sections)), "x" * FINAL_PROMPT_ALLOWANCE_CHARS)
+    )
+
+
+def _capitalized(text: str) -> str:
+    return text[:1].upper() + text[1:]
 
 
 # ---------------------------------------------------------------------- lint
@@ -1817,28 +2139,38 @@ __all__ = [
     "DocumentAudit",
     "FixReport",
     "LintGroup",
+    "LoopEstimate",
     "PostFix",
     "SourceAudit",
     "WorkspaceChanges",
+    "acceptance_criterion_id",
     "audit_findings",
     "audit_issues",
     "collect_artifact_text",
+    "criteria_lines",
     "diff_snapshots",
     "distinct_reference_estimate",
+    "exhausted_fix_report",
+    "fix_skipped_note",
     "issues_to_fix",
     "lint_covered",
     "lint_details",
     "lint_group_issues",
     "lint_groups",
     "lint_workspace",
+    "loop_estimate",
     "markdown_documents",
+    "new_relaxations",
     "parse_audit_report",
     "parse_fix_report",
     "pipeline_link_issues",
     "read_audit_record",
     "reference_estimate",
     "reference_signals",
+    "relax_issues",
+    "round_costs",
     "safe_lint_workspace",
+    "skipped_fix_report",
     "text_digest",
     "unresolved_critical",
     "update_audit_record",

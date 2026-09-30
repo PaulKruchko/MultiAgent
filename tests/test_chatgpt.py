@@ -65,12 +65,22 @@ def test_contrib_units_are_the_default_rendering() -> None:
         assert (CONTRIB / name).read_text(encoding="utf-8") == text, f"re-render contrib/systemd/{name}"
 
 
+def test_mcp_stop_timeout_covers_the_longest_stage(layout: Layout) -> None:
+    """A stop must not SIGKILL a Claude Code session: its spend would never reach the ledger. Three sessions (one, its
+    continuation after a timeout, a repair) plus a margin: 5h at the 90-minute default, and it follows the setting."""
+    assert chatgpt.MCP_STOP_TIMEOUT == chatgpt.mcp_stop_timeout(5400.0) == "5h"
+    assert chatgpt.mcp_stop_timeout(3600.0) == "210min" and chatgpt.mcp_stop_timeout(100.0) == "35min"
+    settings = Settings(claude_code_timeout_s=7200.0)
+    params = chatgpt.default_params(settings, layout, maf_command=("/usr/bin/maf",))
+    assert _directives(chatgpt.render_mcp_unit(params))["TimeoutStopSec"] == "390min"
+
+
 def test_mcp_unit(layout: Layout) -> None:
     unit = _directives(chatgpt.render_mcp_unit(_params(layout, mcp_port=9001)))
     assert unit["ExecStart"] == "%h/MultiAgent/.venv/bin/maf serve --host 127.0.0.1 --port 9001 --uds %t/maf/mcp.sock"
     assert (unit["RuntimeDirectory"], unit["RuntimeDirectoryMode"]) == ("maf", "0700")
     assert unit["EnvironmentFile"] == "%h/.config/maf/maf.env"
-    assert (unit["Restart"], unit["KillMode"], unit["TimeoutStopSec"]) == ("on-failure", "mixed", "2h")
+    assert (unit["Restart"], unit["KillMode"], unit["TimeoutStopSec"]) == ("on-failure", "mixed", "5h")
     assert unit["RestartPreventExitStatus"] == "2"  # a config or usage error must not restart every 5 s forever
     assert (unit["NoNewPrivileges"], unit["UMask"], unit["LimitCORE"]) == ("yes", "0077", "0")
     # These break Claude Code's bubblewrap sandbox in a user unit (verified with bwrap under systemd-run --user).

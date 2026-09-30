@@ -6,10 +6,11 @@ State lives only in run.md (``RunIndex``) and ledger.jsonl, so a crash at any po
 re-running the recorded ``stage`` (stages are idempotent). Transitions (``next_step``)::
 
     ingestion -> strategy -> [review gate if index.review] -> execution -> crosscheck
-    crosscheck --loop_back and round <= max_crosscheck_loops--> execution (round += 1)
-    crosscheck --pass, or loops exhausted--> final -> COMPLETED (unresolved_critical == 0 and criteria_unmet == 0)
-                                                   -> COMPLETED_WITH_ISSUES (unresolved_critical > 0: loops exhausted;
-                                                      or criteria_unmet > 0: acceptance criteria or clean-room not met)
+    crosscheck --loop_back, round <= max_crosscheck_loops and no final yet--> execution (round += 1)
+    crosscheck --pass, loops exhausted or skipped, or an extra round's one pass--> final
+    final -> COMPLETED (unresolved_critical == 0 and criteria_unmet == 0)
+          -> COMPLETED_WITH_ISSUES (unresolved_critical > 0: loops exhausted or skipped for budget;
+             or criteria_unmet > 0: acceptance criteria or clean-room not met)
 
 Review gate: after strategy with ``review=True``, the status becomes AWAITING_REVIEW with ``stage="execution"``.
 ``resume(run_id, note=...)`` re-reads 02-strategy.md (the user may have edited it in Obsidian),
@@ -21,16 +22,23 @@ COMPLETED and COMPLETED_WITH_ISSUES are both terminal: ``run`` and ``resume`` re
 with no model calls, and records it in run.md (``exported_at``, ``export_note``).
 ``resume(run_id, extra_round=True)`` is the one way to continue a COMPLETED_WITH_ISSUES run: it schedules one
 more execution + crosscheck pass (round + 1, reading the last cross-check's unresolved issues) and then final
-again. The loop cap still applies, so a pass that leaves critical issues open goes straight to final.
+again. That cross-check never loops (a cross-check after a final, ``"final" in completed_stages``, counts as capped),
+so a pass that leaves critical issues open goes straight to final, whatever the loop cap or budget would allow.
 
 Error mapping for a stage attempt:
-- ``BudgetExceeded``: BUDGET_EXCEEDED (resumable after raising the budget: ``maf resume --budget``)
+- ``BudgetExceeded``: BUDGET_EXCEEDED (resumable after raising the budget: ``maf resume --budget``). That includes a
+  Claude Code work session refused for want of its minimum budget before it started, and one that ran out of a budget
+  the run's remaining budget had cut (``maf.ledger.SessionBudgetTooSmall``, ``SessionBudgetExhausted``).
 - ``HandoffInvalid`` (after its one repair): FAILED
 - ``ProviderError``: FAILED at once. Stages never swallow a non-retryable one (``StageContext.call`` retries
   only ``retryable`` token-provider errors, never Claude Code), so an infrastructure failure such as a Claude
   Code sandbox that cannot start ends the run before any crosscheck loop can re-pay against it.
 - any other exception: FAILED (``error`` records type and message)
-The ledger totals are mirrored into run.md after every stage and on every failure.
+The ledger totals are mirrored into run.md after every stage and on every failure. A code/mixed run that ends
+FAILED or BUDGET_EXCEEDED after an execution pass wrote files also gets its workspace exported to ``deliverables/``
+(no model calls; ``export_note`` says the deliverables are partial and unverified); an export error is logged and
+never replaces the run's own error. An extra round that stops that way leaves ``deliverables/`` and its note as the
+earlier final exported and gated them.
 """
 
 from __future__ import annotations
@@ -56,7 +64,15 @@ from maf.ledger import BudgetExceeded, Ledger
 from maf.providers import ProviderError, Providers
 from maf.stages.base import StageBackend, StageContext, StageOutput
 from maf.types import STAGE_ORDER, RunStatus, StageName, Tier
-from maf.vault import RunIndex, RunPaths, Vault, atomic_write_text, describe_issues, note_name
+from maf.vault import (
+    PARTIAL_EXPORT_NOTE,
+    RunIndex,
+    RunPaths,
+    Vault,
+    atomic_write_text,
+    describe_issues,
+    note_name,
+)
 
 if TYPE_CHECKING:
     from maf.stages.final import Export
@@ -72,10 +88,23 @@ ProgressFn = Callable[[RunIndex, str], None]
 """Optional observer: called with the current index and a one-line human-readable message."""
 
 ALLOWED_INDEX_UPDATES: frozenset[str] = frozenset(
-    {"mode", "unresolved_critical", "criteria_unmet", "unmet_criteria", "exported_at", "export_note"}
+    {
+        "mode",
+        "unresolved_critical",
+        "relaxed_criteria",
+        "loop_skipped",
+        "criteria_unmet",
+        "unmet_criteria",
+        "exported_at",
+        "export_note",
+    }
 )
-"""``StageOutput.index_updates`` keys the pipeline applies: ``mode`` (ingestion), ``unresolved_critical``
-(crosscheck), and the final stage's acceptance and export fields."""
+"""``StageOutput.index_updates`` keys the pipeline applies: ``mode`` (ingestion), ``unresolved_critical``,
+``relaxed_criteria`` and ``loop_skipped`` (crosscheck), and the final stage's acceptance and export fields."""
+
+PARTIAL_EXPORT_STATUSES = frozenset({RunStatus.FAILED, RunStatus.BUDGET_EXCEEDED})
+"""A code/mixed run that stops with one of these after execution wrote files gets its workspace exported to
+``deliverables/`` (``Pipeline._partial_export``), marked partial and unverified."""
 
 REVIEW_NOTE_REL = Path(".maf") / "review-note.md"
 """Workspace-relative location of the persisted ``resume --note`` text."""
@@ -109,7 +138,9 @@ def next_step(index: RunIndex, finished: StageName, output: StageOutput, max_loo
     """Pure transition after ``finished`` completed with ``output``.
 
     - After strategy with ``index.review``: ``Step("execution", round, AWAITING_REVIEW)``.
-    - After crosscheck with ``loop_back`` and ``index.round <= max_loops``: ``Step("execution", round+1, RUNNING)``.
+    - After crosscheck with ``loop_back``, ``index.round <= max_loops`` and no final run yet: ``Step("execution",
+      round+1, RUNNING)``. A cross-check after a final (``"final" in index.completed_stages``) is the one pass of an
+      extra round (``Pipeline.resume(extra_round=True)``) and never loops.
     - After crosscheck otherwise: ``Step("final", round, RUNNING)``.
     - After final: ``Step(None, round, COMPLETED)``, or ``COMPLETED_WITH_ISSUES`` when ``index.unresolved_critical > 0``
       (final was reached only because the loop cap was hit) or ``index.criteria_unmet > 0`` (acceptance criteria,
@@ -122,7 +153,7 @@ def next_step(index: RunIndex, finished: StageName, output: StageOutput, max_loo
     if finished == "strategy" and index.review:
         return Step("execution", index.round, RunStatus.AWAITING_REVIEW)
     if finished == "crosscheck":
-        if output.loop_back and index.round <= max_loops:
+        if output.loop_back and index.round <= max_loops and "final" not in index.completed_stages:
             return Step("execution", index.round + 1, RunStatus.RUNNING)
         return Step("final", index.round, RunStatus.RUNNING)
     following = STAGE_ORDER[STAGE_ORDER.index(finished) + 1]
@@ -355,9 +386,9 @@ class Pipeline:
         (persisted in ``workspace/.maf/review-note.md``). ``budget_usd`` raises the cap.
 
         COMPLETED and COMPLETED_WITH_ISSUES runs are returned unchanged (nothing is written), except that
-        ``extra_round=True`` on a COMPLETED_WITH_ISSUES run schedules one more execution + crosscheck pass at
-        ``round + 1`` followed by final (see the module docstring). ``extra_round`` on any other status raises
-        ``ValueError``."""
+        ``extra_round=True`` on a COMPLETED_WITH_ISSUES run schedules exactly one more execution + crosscheck pass at
+        ``round + 1`` followed by final, even after a loop skipped for budget (see the module docstring).
+        ``extra_round`` on any other status raises ``ValueError``."""
         if budget_usd is not None and not (math.isfinite(budget_usd) and budget_usd > 0):
             raise ValueError(f"budget must be positive and finite, got {budget_usd}")
         with self._guard(run_id):
@@ -665,8 +696,42 @@ class Pipeline:
         except Exception:  # noqa: BLE001 - never mask the original failure
             log.exception("run %s: mirroring ledger totals failed", index.run_id)
         self.vault.write_index(index)
+        if status in PARTIAL_EXPORT_STATUSES:
+            self._partial_export(index)
         self._emit(progress, index, f"{index.stage} stopped: {status.value}: {error}")
         return index
+
+    def _partial_export(self, index: RunIndex) -> None:
+        """Export the workspace of a stopped code/mixed run to ``deliverables/`` (no model calls), when an execution
+        pass has run and left files to export, and record it in run.md as partial and unverified: no acceptance,
+        clean-room, source-audit or lint gate ran. Called after the stop status is written; any error is logged and
+        leaves run.md as the stop wrote it, so it never masks the failure. A run that already went through final (an
+        extra round stopped) keeps the deliverables and ``export_note`` final exported and gated: its half-done
+        workspace stays in ``workspaces/`` for ``maf resume``."""
+        from maf.stages.final import CODE_MODES, export_excludes, export_run
+
+        if index.mode not in CODE_MODES or ("execution" not in index.completed_stages and index.stage != "execution"):
+            return
+        if "final" in index.completed_stages:
+            log.info(
+                "run %s: extra round stopped %s; deliverables/ keeps final's verified export (%s)",
+                index.run_id, index.status.value, index.export_note or "no export note",
+            )
+            return
+        excludes = export_excludes(self.settings)
+        try:
+            if not self.vault.exportable_files(index.run_id, excludes=excludes):
+                return
+            export = export_run(self.vault, index, excludes=excludes, max_bytes=self.settings.export_max_bytes)
+            note = (
+                f"{PARTIAL_EXPORT_NOTE} after the run stopped {index.status.value} at {index.stage}: "
+                f"{export.describe()}; partial and unverified (no acceptance, clean-room or source-audit gate ran)"
+            )
+            exported = index.model_copy(update={"exported_at": self.clock(), "export_note": note})
+            self.vault.write_index(exported)
+            index.exported_at, index.export_note = exported.exported_at, exported.export_note
+        except Exception:  # noqa: BLE001 - never mask the original failure
+            log.exception("run %s: partial export of the workspace failed", index.run_id)
 
     @staticmethod
     def _done_message(stage: StageName, index: RunIndex) -> str:

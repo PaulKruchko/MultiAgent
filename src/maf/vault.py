@@ -50,9 +50,17 @@ from maf.handoff import Handoff, HandoffKind, dump_frontmatter, load_frontmatter
 from maf.types import AgentName, ExecutionMode, ProviderName, RunStatus, StageName, Tier
 
 
-OPTIONAL_INDEX_KEYS = ("origin", "owner")
-"""``RunIndex`` keys left out of run.md while None (RunIndex forbids unknown keys, so older maf versions could not
-read a run.md that has them)."""
+OPTIONAL_INDEX_KEYS = ("origin", "owner", "loop_skipped", "relaxed_criteria")
+"""``RunIndex`` keys left out of run.md while None or empty (RunIndex forbids unknown keys, so older maf versions
+could not read a run.md that has them)."""
+
+LOOP_SKIPPED_BUDGET = "budget"
+"""``RunIndex.loop_skipped``: the latest cross-check went to final with critical issues open, before the loop cap,
+because the budget could not pay for another round (``maf.stages.crosscheck.loop_estimate``)."""
+
+PARTIAL_EXPORT_NOTE = "partial export"
+"""Opens ``RunIndex.export_note`` when a failed or budget-stopped code/mixed run had its workspace exported without
+the final stage (``maf.pipeline``): the deliverables are partial and unverified."""
 
 
 class RunIndex(BaseModel):
@@ -84,6 +92,13 @@ class RunIndex(BaseModel):
     existed."""
     unmet_criteria: list[str] = Field(default_factory=list)
     """One line per criterion counted in ``criteria_unmet``: ``<id> [partial|unmet]: <criterion>``."""
+    relaxed_criteria: list[str] = Field(default_factory=list)
+    """Acceptance criteria the adjudicator ruled over-specified relative to the brief, one
+    ``maf.handoff.Relaxation.line`` each (``AC-9 (GPT-4, round 2): <justification>``): soft for the rest of the run,
+    so final's gate reports them without counting them. Written by the cross-check; absent from older run.md files."""
+    loop_skipped: Literal["budget"] | None = None
+    """``budget`` when the latest cross-check went to final with critical issues open before the loop cap, because
+    another round was estimated to cost more than the run had left; None otherwise."""
     created: datetime
     updated: datetime
     workspace: str
@@ -556,7 +571,7 @@ class Vault:
         paths = self.paths(index.run_id)
         data = index.model_dump(mode="json")
         for key in OPTIONAL_INDEX_KEYS:
-            if data.get(key) is None:
+            if data.get(key) in (None, []):
                 del data[key]
         data["created"] = index.created
         data["updated"] = index.updated
@@ -645,6 +660,16 @@ class Vault:
             raise
         _fsync_dir(dst.parent)
         return dst
+
+    def exportable_files(self, run_id: str, *, excludes: Sequence[str] | None = None) -> tuple[str, ...]:
+        """The workspace-relative paths ``export_workspace`` would copy (same rules, nothing is copied); empty when
+        the workspace is missing."""
+        workspace = self.paths(run_id).workspace
+        if not workspace.is_dir():
+            return ()
+        patterns = DEFAULT_EXPORT_EXCLUDES if excludes is None else tuple(excludes)
+        plan, _, _, _ = _plan_export(workspace.resolve(), patterns, SANDBOX_PLACEHOLDER_FILES)
+        return tuple(rel for rel, _, _ in plan)
 
     def export_workspace(
         self,
@@ -864,12 +889,20 @@ def _criteria_count(n: int) -> str:
     return f"{n} acceptance criteri{'on' if n == 1 else 'a'}"
 
 
+def unresolved_cause(index: RunIndex) -> str:
+    """Why final ran with critical issues open: ``after the cross-check loop cap``, or, when the loop was skipped for
+    budget (``RunIndex.loop_skipped``), ``after the cross-check (another loop was skipped: over budget)``."""
+    if index.loop_skipped == LOOP_SKIPPED_BUDGET:
+        return "after the cross-check (another loop was skipped: over budget)"
+    return "after the cross-check loop cap"
+
+
 def describe_issues(index: RunIndex) -> str:
     """One line on what keeps a finished run from ``completed``: ``3 unresolved critical issue(s) after the
     cross-check loop cap; 2 acceptance criteria not met (AC-2, clean-room)``. Empty when nothing is open."""
     parts: list[str] = []
     if index.unresolved_critical > 0:
-        parts.append(f"{index.unresolved_critical} unresolved critical issue(s) after the cross-check loop cap")
+        parts.append(f"{index.unresolved_critical} unresolved critical issue(s) {unresolved_cause(index)}")
     if index.criteria_unmet > 0:
         ids = ", ".join(line.split(" ", 1)[0] for line in index.unmet_criteria if line.strip())
         parts.append(f"{_criteria_count(index.criteria_unmet)} not met" + (f" ({ids})" if ids else ""))
@@ -893,9 +926,12 @@ def _issues_callout(index: RunIndex) -> list[str]:
     if critical > 0:
         crosscheck = latest_crosscheck(index)
         where = f"; see `## Unresolved Critical` in {wikilink(crosscheck)}" if crosscheck else ""
+        if index.loop_skipped == LOOP_SKIPPED_BUDGET:
+            reached = "Another cross-check loop was skipped because the budget could not pay for it"
+        else:
+            reached = "The cross-check loop cap was reached"
         lines.append(
-            f"> The cross-check loop cap was reached with {critical} critical issue(s) still open{where}. "
-            f"{final} lists them under Limitations."
+            f"> {reached} with {critical} critical issue(s) still open{where}. {final} lists them under Limitations."
         )
     if unmet > 0:
         lines.append(f"> {_criteria_count(unmet)} not met; see `## Acceptance` in {final}:")
@@ -904,13 +940,28 @@ def _issues_callout(index: RunIndex) -> list[str]:
     return lines
 
 
+def _partial_callout(index: RunIndex) -> list[str]:
+    """The warning that opens ``## Status`` of a failed or budget-stopped run whose workspace was exported without the
+    final stage (``PARTIAL_EXPORT_NOTE``); empty otherwise."""
+    if index.status not in (RunStatus.FAILED, RunStatus.BUDGET_EXCEEDED):
+        return []
+    if not (index.export_note or "").startswith(PARTIAL_EXPORT_NOTE):
+        return []
+    return [
+        "> [!warning] Partial deliverables",
+        f"> `deliverables/` holds the workspace as the run left it when it stopped ({index.status.value}). They are "
+        "partial and unverified: no acceptance, clean-room, source-audit or lint gate checked them.",
+        "",
+    ]
+
+
 def render_run_body(index: RunIndex) -> str:
     """Body of run.md: ``# <run_id>``; ``## Brief`` (quoted); ``## Status`` (opened by a warning callout when the
     status is ``completed_with_issues``, see ``_issues_callout``); ``## Handoffs``
     (wikilink bullets); ``## Cost`` (markdown table Agent | USD with a Total row, then Provider | USD);
     ``## Workspace`` (the path as inline code)."""
     brief = "\n".join(f"> {line}" if line.strip() else ">" for line in index.brief.strip().split("\n"))
-    status = _issues_callout(index) + [
+    status = _issues_callout(index) + _partial_callout(index) + [
         f"- Status: **{index.status.value}**",
         f"- Stage: {index.stage}",
         f"- Round: {index.round}",
@@ -920,6 +971,8 @@ def render_run_body(index: RunIndex) -> str:
         f"- Completed stages: {', '.join(index.completed_stages) or 'none'}",
         f"- Unresolved critical issues: {index.unresolved_critical}",
         f"- Acceptance criteria not met: {index.criteria_unmet}",
+        *([f"- Relaxed criteria: {', '.join(line.split(' ', 1)[0] for line in index.relaxed_criteria)}"]
+          if index.relaxed_criteria else []),
         f"- Budget: ${_money(index.spent_usd)} of ${_money(index.budget_usd)}",
         f"- Created: {index.created.isoformat()}",
         f"- Updated: {index.updated.isoformat()}",

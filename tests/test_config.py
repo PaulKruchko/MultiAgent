@@ -289,7 +289,7 @@ def test_unknown_override_rejected(tmp_path: Path) -> None:
         ("export_max_mb: 0\n", "invalid settings"),
         ("cleanroom_budget_usd: -1\n", "invalid settings"),
         ("source_audit_max_refs: 0\n", "invalid settings"),
-        ("claude_code_bash_timeout_s: 3600\n", "must be below claude_code_timeout_s"),
+        ("claude_code_bash_timeout_s: 5400\n", "must be below claude_code_timeout_s"),
     ],
 )
 def test_bad_config_raises_value_error(tmp_path: Path, text: str, match: str) -> None:
@@ -366,7 +366,7 @@ def test_deliverable_settings_from_yaml_and_overrides(tmp_path: Path) -> None:
 
 
 def test_bash_timeout_defaults_to_a_share_of_the_session_timeout() -> None:
-    assert Settings().bash_timeout_s == 2700.0
+    assert Settings().bash_timeout_s == 4050.0  # 75 % of the 90-minute session timeout
     assert Settings(claude_code_timeout_s=1200).bash_timeout_s == 900.0
     assert Settings(claude_code_bash_timeout_s=1500).bash_timeout_s == 1500.0
 

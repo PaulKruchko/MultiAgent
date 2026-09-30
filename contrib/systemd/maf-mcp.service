@@ -23,10 +23,12 @@ Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=2
 # SIGTERM reaches maf only, not its Claude Code children: maf stops serving at once and the in-flight run stops at
-# its next stage boundary (marked failed, `maf resume` continues it). A stage running Claude Code can take up to an
-# hour or more; after TimeoutStopSec systemd kills the whole group. Use `systemctl --user stop --no-block` to not wait.
+# its next stage boundary (marked failed, `maf resume` continues it). A stage can run three Claude Code sessions back
+# to back (a session, its continuation after a timeout, a repair), each up to claude_code_timeout_s, so TimeoutStopSec
+# covers that: after it systemd kills the whole group, and a session killed that way never reaches the cost ledger.
+# Re-run `maf chatgpt setup` after changing claude_code_timeout_s. `systemctl --user stop --no-block` does not wait.
 KillMode=mixed
-TimeoutStopSec=2h
+TimeoutStopSec=5h
 # Hardening compatible with Claude Code's bubblewrap sandbox, which needs unprivileged user namespaces. Not set on
 # purpose: RestrictNamespaces= (bwrap cannot create namespaces), and ProtectSystem=/ProtectHome=/PrivateTmp=/
 # PrivateDevices=/ProtectKernel*= (in a user unit they imply PrivateUsers=, inside which bwrap fails too),

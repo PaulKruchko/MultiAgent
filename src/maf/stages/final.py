@@ -49,6 +49,11 @@ not ``met``, the run ends ``completed_with_issues`` (soft criteria are reported,
 with a warning callout and the note gets the ``maf/completed-with-issues`` tag. ``index_updates`` carry
 ``criteria_unmet``, ``unmet_criteria``, ``exported_at`` and ``export_note``. ``export_run`` repeats step 1 for
 ``maf export`` (no model calls).
+
+A criterion the cross-check's adjudicator relaxed (``RunIndex.relaxed_criteria``) is judged like any other but counts
+as soft: its ``## Acceptance`` line says so, and ``## Relaxed Criteria`` lists it with its verdict and justification.
+When the last loop was skipped for budget (``RunIndex.loop_skipped``), the prompt and the callout say so instead of
+naming the loop cap.
 """
 
 from __future__ import annotations
@@ -77,7 +82,6 @@ from maf.prompts import render_prompt
 from maf.providers import CompletionRequest, StructuredOutputError
 from maf.providers.claude_code import ClaudeCodeBudgetExhausted
 from maf.stages.base import (
-    DEFAULT_EFFORT,
     WORKSPACE_META_DIR,
     NoteOut,
     StageContext,
@@ -86,13 +90,14 @@ from maf.stages.base import (
     escape_note_tags,
     export_excludes,
     generate_handoff,
+    messages_worst_case,
     one_line,
     render_inputs,
     role_system,
     with_sections,
     write_workspace_file,
 )
-from maf.handoff import Criterion, parse_acceptance_criteria
+from maf.handoff import Criterion, Relaxation, parse_acceptance_criteria
 from maf.stages.crosscheck import (
     AUDIT_RECORD,
     markdown_documents,
@@ -128,6 +133,10 @@ ACCEPTANCE_SECTION = "Acceptance"
 
 CLEANROOM_SECTION = "Clean-room Reproduction"
 """Extra 05-final section (code/mixed) that Python writes from ``CleanroomResult.details``."""
+
+RELAXED_SECTION = "Relaxed Criteria"
+"""Extra 05-final section listing the criteria the adjudicator relaxed (``RunIndex.relaxed_criteria``), each with its
+verdict and justification: reported, not blocking."""
 
 Verdict = Literal["met", "partial", "unmet"]
 VERDICTS: tuple[Verdict, ...] = ("met", "partial", "unmet")
@@ -318,6 +327,9 @@ class CriterionVerdict:
     evidence: str
     hard: bool = True
     """Only hard criteria (and the clean-room gate) decide the run status; soft ones are reported."""
+    relaxed: str = ""
+    """The adjudicator's justification when the criterion was relaxed (``maf.handoff.Relaxation``): hard in the
+    strategy, soft since that ruling."""
 
     @property
     def met(self) -> bool:
@@ -332,12 +344,15 @@ class CriterionVerdict:
     def line(self) -> str:
         """The canonical ``## Acceptance`` item."""
         soft = "" if self.hard else " (soft criterion)"
+        if self.relaxed:
+            soft = f" (relaxed to soft: over-specified relative to the brief; see `## {RELAXED_SECTION}`)"
         return f"- {self.id} [{self.verdict}]: {self.criterion}{soft}\n  - Evidence: {self.evidence}"
 
     @property
     def summary(self) -> str:
         """One line for run.md (``RunIndex.unmet_criteria``) and ``## Limitations``."""
-        return f"{self.id} [{self.verdict}]: {one_line(self.criterion, 200)}"
+        relaxed = " (relaxed)" if self.relaxed else ""
+        return f"{self.id} [{self.verdict}]: {one_line(self.criterion, 200)}{relaxed}"
 
 
 @dataclass(frozen=True)
@@ -432,7 +447,9 @@ class FinalBackend:
         consumed = [strategy_name, exec_name, cross_name]
         notes = {name: ctx.read(name) for name in consumed}
         mode = ctx.index.mode
-        criteria = parse_acceptance_criteria(notes[strategy_name])
+        relaxed = hf.parse_relaxations(ctx.index.relaxed_criteria)
+        criteria = hf.relaxed_criteria(parse_acceptance_criteria(notes[strategy_name]), relaxed)
+        skipped = ctx.index.loop_skipped == _vault.LOOP_SKIPPED_BUDGET
 
         excludes = self.export_excludes if self.export_excludes is not None else export_excludes(ctx.settings)
         export = export_deliverables(
@@ -449,9 +466,9 @@ class FinalBackend:
                 "final",
                 brief=ctx.index.brief,
                 deliverables="\n".join(d.bullet for d in export.deliverables) or "None.",
-                criteria=criteria_block(criteria),
+                criteria=criteria_block(criteria, relaxed),
                 checks=checks_block(cleanroom, gates),
-                unresolved=_unresolved_block(open_critical, cross_name, unresolved),
+                unresolved=_unresolved_block(open_critical, cross_name, unresolved, skipped=skipped),
                 inputs=render_inputs(
                     notes, {strategy_name: (hf.ACCEPTANCE_CRITERIA,), exec_name: without_lint(notes[exec_name])}
                 ),
@@ -475,16 +492,17 @@ class FinalBackend:
             purpose="final",
             check=lambda handoff: acceptance_errors(handoff, criteria),
         )
-        verdicts = acceptance_verdicts(final, criteria) + ([cleanroom.verdict] if cleanroom else []) + gates
+        verdicts = acceptance_verdicts(final, criteria, relaxed) + ([cleanroom.verdict] if cleanroom else []) + gates
         unmet = [v for v in verdicts if v.blocking]
         final = enforce_final_rules(
-            final, list(export.deliverables), consumed, unresolved, verdicts=verdicts, cleanroom=cleanroom
+            final, list(export.deliverables), consumed, unresolved, verdicts=verdicts, cleanroom=cleanroom,
+            relaxed=relaxed,
         )
         if cleanroom is not None and cleanroom.cost_usd > 0:
             cost = final.meta.cost_usd + cleanroom.cost_usd
             final = final.model_copy(update={"meta": final.meta.model_copy(update={"cost_usd": cost})})
         if open_critical > 0 or unmet:
-            final = mark_completed_with_issues(final, open_critical, cross_name, unmet)
+            final = mark_completed_with_issues(final, open_critical, cross_name, unmet, skipped=skipped)
         return StageOutput(
             notes=[NoteOut(_vault.note_name(HandoffKind.FINAL), final)],
             index_updates={
@@ -733,9 +751,12 @@ def acceptance_errors(final: Handoff, criteria: Sequence[Criterion]) -> list[str
     return errors
 
 
-def acceptance_verdicts(final: Handoff, criteria: Sequence[Criterion]) -> list[CriterionVerdict]:
+def acceptance_verdicts(
+    final: Handoff, criteria: Sequence[Criterion], relaxed: dict[str, Relaxation] | None = None
+) -> list[CriterionVerdict]:
     """One verdict per criterion from ``## Acceptance`` (the first line for an id wins). A criterion without a
-    well-formed verdict (only possible when the check was bypassed) counts as ``unmet``."""
+    well-formed verdict (only possible when the check was bypassed) counts as ``unmet``. A criterion in ``relaxed`` is
+    soft (never blocking) and carries its justification."""
     items, _ = _acceptance_items(final.sections.get(ACCEPTANCE_SECTION, ""))
     found: dict[str, tuple[str, str]] = {}
     for ident, verdict, evidence in items:
@@ -743,20 +764,31 @@ def acceptance_verdicts(final: Handoff, criteria: Sequence[Criterion]) -> list[C
     out: list[CriterionVerdict] = []
     for criterion in criteria:
         verdict, evidence = found.get(criterion.id, ("", ""))
+        rule = (relaxed or {}).get(criterion.id)
+        hard, why = (False, rule.reason or "relaxed") if rule is not None else (criterion.hard, "")
         if verdict in VERDICTS:
             given = cast(Verdict, verdict)
-            out.append(CriterionVerdict(criterion.id, criterion.text, given, evidence or "none given", criterion.hard))
+            out.append(CriterionVerdict(criterion.id, criterion.text, given, evidence or "none given", hard, why))
         else:
             missing = "the final report gave no valid verdict for it (recorded by maf)"
-            out.append(CriterionVerdict(criterion.id, criterion.text, "unmet", missing, criterion.hard))
+            out.append(CriterionVerdict(criterion.id, criterion.text, "unmet", missing, hard, why))
     return out
 
 
-def criteria_block(criteria: Sequence[Criterion]) -> str:
-    """The final prompt's acceptance instructions and the criteria (``Criterion.line``)."""
+def criteria_block(criteria: Sequence[Criterion], relaxed: dict[str, Relaxation] | None = None) -> str:
+    """The final prompt's acceptance instructions and the criteria (``Criterion.line``), then the relaxed ones with
+    their rulings."""
     if not criteria:
         return f"## Acceptance criteria\n\n02-strategy lists none, so leave out `## {ACCEPTANCE_SECTION}`."
-    return ACCEPTANCE_INSTRUCTIONS + "\n".join(escape_note_tags(c.line) for c in criteria)
+    text = ACCEPTANCE_INSTRUCTIONS + "\n".join(escape_note_tags(c.line) for c in criteria)
+    if relaxed:
+        text += (
+            "\n\nThe cross-check's adjudicator ruled these criteria over-specified relative to the user's request, so "
+            "they are soft now (hard in 02-strategy): give each its verdict like any other, and report one that is "
+            "not met under `## Limitations` without presenting it as a failure of the request.\n\n"
+            + "\n".join(f"- {escape_note_tags(r.line)}" for r in relaxed.values())
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------------------------- clean room
@@ -775,14 +807,7 @@ WORST_CASE_CLEANROOM = CleanroomResult(
 def final_worst_case(ctx: StageContext, prompt: str) -> float:
     """Worst-case cost of the final report's call with ``prompt`` (``generate_handoff`` sends the same request),
     which the clean-room session must leave affordable."""
-    request = CompletionRequest.simple(
-        ctx.model("claude"),
-        prompt,
-        system=role_system("claude", ctx.settings),
-        max_output_tokens=default_output_tokens(ctx.settings, "claude"),
-        effort=DEFAULT_EFFORT["claude"],
-    )
-    return ctx.providers.for_role("claude").worst_case_cost(request)
+    return messages_worst_case(ctx, prompt, "claude", "final")
 
 
 def cleanroom_budget(remaining_usd: float, reserve_usd: float, headroom_usd: float, cap_usd: float) -> float:
@@ -1210,13 +1235,19 @@ def unresolved_lines(crosscheck: Handoff) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip().startswith("- ")]
 
 
-def _unresolved_block(count: int, crosscheck: str, lines: list[str]) -> str:
+def _loop_end(skipped: bool) -> str:
+    if skipped:
+        return "Another cross-check loop was skipped because the run's budget could not pay for it"
+    return "The cross-check loop cap was reached"
+
+
+def _unresolved_block(count: int, crosscheck: str, lines: list[str], *, skipped: bool = False) -> str:
     if count <= 0:
         return ""
     status = RunStatus.COMPLETED_WITH_ISSUES.value
     text = (
         f"## Unresolved critical issues (run status: {status})\n\n"
-        f"The cross-check loop cap was reached with {count} critical issue(s) still unresolved (see "
+        f"{_loop_end(skipped)} with {count} critical issue(s) still unresolved (see "
         f"[[{crosscheck}]]), so this run ends with status `{status}`, not `completed`. Say so plainly in "
         "`## Summary`, and do not present work these issues affect as verified."
     )
@@ -1227,13 +1258,18 @@ def _unresolved_block(count: int, crosscheck: str, lines: list[str]) -> str:
     return text
 
 
-def status_callout(count: int, crosscheck: str, unmet: Sequence[CriterionVerdict] = ()) -> str:
+def status_callout(
+    count: int, crosscheck: str, unmet: Sequence[CriterionVerdict] = (), *, skipped: bool = False
+) -> str:
     """The warning that opens ``## Summary`` of a ``completed_with_issues`` final note; ``unmet`` are the blocking
-    criteria."""
+    criteria, ``skipped`` means the last loop was skipped for budget rather than stopped by the loop cap."""
     lines = [f"> [!warning] Run status: {RunStatus.COMPLETED_WITH_ISSUES.value}"]
     if count > 0:
+        after = "after the cross-check, whose next loop was skipped for budget" if skipped else (
+            "after the cross-check loop cap"
+        )
         lines.append(
-            f"> {count} critical issue(s) remain unresolved after the cross-check loop cap (see [[{crosscheck}]]); "
+            f"> {count} critical issue(s) remain unresolved {after} (see [[{crosscheck}]]); "
             "they are listed under Limitations."
         )
     if unmet:
@@ -1246,10 +1282,10 @@ def status_callout(count: int, crosscheck: str, unmet: Sequence[CriterionVerdict
 
 
 def mark_completed_with_issues(
-    final: Handoff, count: int, crosscheck: str, unmet: Sequence[CriterionVerdict] = ()
+    final: Handoff, count: int, crosscheck: str, unmet: Sequence[CriterionVerdict] = (), *, skipped: bool = False
 ) -> Handoff:
     """Open ``## Summary`` with ``status_callout`` (unless present) and add ``ISSUES_TAG`` to the frontmatter."""
-    callout = status_callout(count, crosscheck, unmet)
+    callout = status_callout(count, crosscheck, unmet, skipped=skipped)
     summary = final.section("Summary").strip()
     if callout.split("\n", 1)[0] not in summary:
         final = with_sections(final, {"Summary": f"{callout}\n\n{summary}"})
@@ -1270,10 +1306,11 @@ def enforce_final_rules(
     *,
     verdicts: Sequence[CriterionVerdict] = (),
     cleanroom: CleanroomResult | None = None,
+    relaxed: dict[str, Relaxation] | None = None,
 ) -> Handoff:
     """Append whatever the model left out (deliverable links, provenance wikilinks, unresolved issues, unmet
-    criteria), write ``## Acceptance`` canonically from ``verdicts`` and ``## Clean-room Reproduction`` from
-    ``cleanroom``."""
+    criteria), write ``## Acceptance`` canonically from ``verdicts``, ``## Clean-room Reproduction`` from ``cleanroom``
+    and ``## Relaxed Criteria`` from ``relaxed``."""
     updates: dict[str, str] = {}
 
     def extend(section: str, lines: list[str], lead: str) -> None:
@@ -1307,4 +1344,22 @@ def enforce_final_rules(
         updates[ACCEPTANCE_SECTION] = "\n".join(v.line for v in verdicts)
     if cleanroom is not None:
         updates[CLEANROOM_SECTION] = cleanroom.details()
+    if relaxed:
+        updates[RELAXED_SECTION] = relaxed_section(relaxed, verdicts)
     return with_sections(final, updates) if updates else final
+
+
+def relaxed_section(relaxed: dict[str, Relaxation], verdicts: Sequence[CriterionVerdict] = ()) -> str:
+    """``## Relaxed Criteria``: each relaxed criterion with its final verdict (when there is one) and ruling."""
+    given = {v.id: v for v in verdicts}
+    lines = []
+    for rule in relaxed.values():
+        verdict = given.get(rule.criterion)
+        what = f" [{verdict.verdict}]: {one_line(verdict.criterion, 300)}" if verdict is not None else ""
+        by = f" ({rule.issue}, round {rule.round})" if rule.issue else ""
+        lines.append(f"- {rule.criterion}{what}\n  - Relaxed{by}: {rule.reason}")
+    return (
+        "The cross-check's adjudicator ruled these acceptance criteria over-specified relative to the brief, so maf "
+        "treats them as soft: they are reported here and in `## Acceptance`, but do not decide the run status.\n\n"
+        + "\n".join(lines)
+    )

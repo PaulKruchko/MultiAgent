@@ -34,12 +34,13 @@ flowchart TD
     ST --> E[Claude Code or Messages] --> EX[03-execution-rN]
     EX --> C1[3 critiques in parallel] --> C2[Claude rebuttal] --> C3[ChatGPT adjudication]
     C3 --> C4[Claude applies fixes] --> CC[04-crosscheck-rN]
-    CC -->|LOOP and round <= 2| E
-    CC -->|PASS or loops exhausted| X[export deliverables/] --> GT[maf gates: lint, source audit]
+    CC -->|LOOP, round <= 2, not an extra round, and the budget pays another round| E
+    CC -->|PASS, loops exhausted, extra round done or loop skipped: budget| X[export deliverables/] --> GT[maf gates: lint, source audit]
     GT --> CR[code/mixed: Claude Code clean-room rebuild beside the workspace]
     CR --> F[Claude final + acceptance verdicts] --> FIN[05-final]
     FIN -->|unresolved_critical == 0 and criteria_unmet == 0| DONE([COMPLETED])
-    FIN -->|loops exhausted with open criticals, or a hard criterion unmet| ISSUES([COMPLETED_WITH_ISSUES])
+    FIN -->|loops exhausted or skipped with open criticals, or a hard criterion unmet| ISSUES([COMPLETED_WITH_ISSUES])
+    E -.->|stopped: FAILED or BUDGET_EXCEEDED after files were written| PX[partial export to deliverables/, unverified]
 ```
 
 Every model call goes through `ledger.metered_call(ledger, provider, request, stage=...)`, usually
@@ -69,6 +70,12 @@ of it; `output_tokens` includes reasoning/thinking; `search_queries` counts bill
   which scales it with the model, see providers) and `claude_code_bash_timeout_s` (the longest Bash command,
   `BASH_MAX_TIMEOUT_MS`; default None = `bash_timeout_s` = 75 % of `claude_code_timeout_s`; a value must stay below
   `claude_code_timeout_s`).
+- Claude Code session settings: `claude_code_timeout_s` (wall clock of one session, default 5400 s = 90 min, so
+  `bash_timeout_s` is 4050 s; was 3600 s until the 2026-09-29 thesis execution was killed nearly done) and
+  `claude_code_min_session_usd` (default $3.00, `ge=0`): the smallest `--max-budget-usd` a work session (execution,
+  fix pass, continuation) is started with, capped by the session's own budget (`OutputLimits.claude_code_budget_usd`,
+  $8) and by `claude_code_min_session_share` (default 0.25, `0 < share <= 1`) of the run's cap, so a $5 run's floor is
+  $1.25; see `stages.base.session_floor` and `work_session`. The preflight and the clean room keep their own minima.
 - Deliverable and verification settings: `export_exclude` (case-sensitive `fnmatch` patterns of workspace paths that are
   neither exported to `deliverables/` nor linted; a pattern matches any path component or a leading part of the
   workspace-relative POSIX path, as `maf.lint.excluded` does; default `DEFAULT_EXPORT_EXCLUDE`: `.maf`, `.git`,
@@ -85,10 +92,27 @@ of it; `output_tokens` includes reasoning/thinking; `search_queries` counts bill
 ### ledger.py (A)
 - JSON Lines at `runs/<id>/ledger.jsonl`, one `LedgerEntry` per call, append with fsync. `Ledger.load`
   restores the state exactly on resume.
-- `check(worst, what)` raises `BudgetExceeded` iff `spent + worst > cap` (equality is allowed).
+- `check(worst, what)` raises `BudgetExceeded` iff `spent + worst > cap` (equality is allowed). `BudgetExceeded`
+  takes an optional `message`; two subclasses name Claude Code work-session stops (the pipeline maps all three to
+  BUDGET_EXCEEDED): `SessionBudgetTooSmall(cap_usd, spent_usd, what, budget_usd, minimum_usd, headroom_usd,
+  reserve_usd=0, before_usd=0, needed_cap_usd=None)`, raised before spawning, says what is left, the headroom (and a
+  reserve held back for later stages), what the session would get, the minimum, that this session was not started (the
+  stage may have paid for earlier calls), and the cap to resume with: `needed_cap_usd` rounded up to the cent and never
+  below the cap (default `spent + before + reserve + headroom + minimum`; `before_usd`, the sandbox preflight a resumed
+  process pays first, is named in the message), with `shortfall_usd = needed_cap_usd - cap_usd`. It is computed from
+  what is left,
+  not from the clamped budget, so a run with less left than one turn of headroom is hinted the uncovered headroom too.
+  `SessionBudgetExhausted(cap_usd, spent_usd, what, budget_usd, requested_usd, charged_usd=0)`, raised from
+  `ClaudeCodeBudgetExhausted`, says the clamp cut the session's cap from `requested_usd` to `budget_usd`. Both carry
+  `charged_usd`: what the pass's sessions were charged (the exhausted session; plus a timed-out one before a
+  continuation, which `work_session` adds), so a caller that carries on can cost its note.
 - `metered_call`: (1) clamp `request.max_budget_usd` to `remaining_usd`, (2) `worst = provider.worst_case_cost(req)`,
   (3) `check`, (4) `complete`, (5) `record(cost_usd=result.cost_usd, worst_case_usd=worst)`. On `ProviderError`
-  with `cost_usd > 0`, record that spend and re-raise.
+  with `cost_usd > 0`, record that spend and re-raise. The clamp is `clamp_budget(available, headroom, requested)`
+  (pure: `min(requested, max(0, available - headroom))`, everything spendable when `requested` is None);
+  `planned_budget(ledger, provider, request, *, reserve_usd=0) -> (budget, headroom)` is the clamp it would apply right
+  now with `reserve_usd` left out of what is available, and
+  `call_label(provider, request, stage=, purpose=)` the `what` of its errors.
 - Overruns (actual > worst) are recorded, not refused. The next `check` sees them. Thread-safe.
 - `by_agent()` always has the keys `chatgpt`, `gemini`, `claude` (Claude Code spend counts toward `claude`).
 
@@ -104,7 +128,7 @@ of it; `output_tokens` includes reasoning/thinking; `search_queries` counts bill
 | `OpenAIProvider` | `client.responses.create(model, instructions, input, max_output_tokens, reasoning={"effort"}, text={"format": {"type":"json_schema","name","schema","strict":True}}, store=False)` | `text.format` json_schema; `json.loads(response.output_text)` | `usage.input_tokens`, `.input_tokens_details.cached_tokens`, `.input_tokens_details.cache_write_tokens` (required in openai 3.20; billed at the input rate unless the price row has a cache-write rate), `.output_tokens`, `.output_tokens_details.reasoning_tokens` |
 | `GeminiProvider` | `client.models.generate_content(model, contents, config=GenerateContentConfig(system_instruction, max_output_tokens, tools=[Tool(google_search=GoogleSearch())] (+ `Tool(url_context=UrlContext())` with `url_context`), response_mime_type, response_json_schema, thinking_config, automatic_function_calling=AutomaticFunctionCallingConfig(disable=True)))`; files via `client.files.upload(file=, config=UploadFileConfig(mime_type=))` and poll until ACTIVE | `response_json_schema` (fall back to prompt + local validation if the schema cannot be combined with a tool) | in = `prompt_token_count + tool_use_prompt_token_count`; cached = `cached_content_token_count`; out = `candidates_token_count + thoughts_token_count`; queries = `len(grounding_metadata.web_search_queries)` |
 | `ClaudeProvider` | `client.messages.stream(model, max_tokens, system, messages, thinking={"type":"adaptive"}, output_config={"effort", "format"})` then `.get_final_message()` | `output_config.format = {"type":"json_schema","schema"}` | in = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`; cached = `cache_read_input_tokens`; write = `cache_creation_input_tokens`; out = `output_tokens` |
-| `ClaudeCodeProvider` | `claude -p --output-format json --model M --effort E --max-budget-usd B --permission-mode dontAsk --permission-prompts none --allowedTools ... --disallowedTools WebFetch WebSearch --no-session-persistence --setting-sources "" --strict-mcp-config --tools Bash,Read,Edit,Write,Glob,Grep --settings <sandbox json> [--append-system-prompt S] [--json-schema J]` with the prompt on stdin and cwd = workspace | `--json-schema`, read `structured_output` | `cost_usd = total_cost_usd` (authoritative); worst case = `max_budget_usd` |
+| `ClaudeCodeProvider` | `claude -p --output-format json --model M --effort E --max-budget-usd B --permission-mode dontAsk --permission-prompts none --allowedTools ... --disallowedTools WebFetch WebSearch --no-session-persistence --setting-sources "" --strict-mcp-config --tools Bash,Read,Edit,Write,Glob,Grep --settings <sandbox json> [--append-system-prompt S] [--json-schema J]` with the prompt on stdin and cwd = workspace | `--json-schema`, read `structured_output` | `cost_usd = total_cost_usd` (authoritative); worst case = `max_budget_usd` plus one turn; a session killed at `timeout_s` raises `ClaudeCodeTimeout` (a `ProviderError`, not retryable) charged that worst case |
 
 Gemini URL context (google-genai 2.25: `types.UrlContext`, an empty model, sent as `urlContext` in both API modes):
 `CompletionRequest.url_context` (default False) adds the tool, but only together with `web_search`, so a format repair
@@ -113,6 +137,13 @@ usage mapping); `worst_case_cost` adds `URL_CONTEXT_TOKEN_ALLOWANCE` (20 pages o
 read successfully (`url_context_metadata.url_metadata[i]`, status `URL_RETRIEVAL_STATUS_SUCCESS`) join the citations after
 the search sources. Whether gemini-3.8-flash supports the tool cannot be checked offline: a 400 naming `url_context`
 drops the tool for that model (remembered; search stays), before the schema fallback is considered.
+
+Claude Code output format: `--output-format json` prints one result object when the session ends, so a session killed
+at its timeout leaves no cost report. `--output-format stream-json --verbose` would stream every message (assistant
+`usage` included) and end with the same result object: in the 2.1.284 binary the stream writer emits the very message
+`json` mode prints (`L.write(ze)` / `sr(b(wn))`), and the SDK result schema has `total_cost_usd`, `is_error` and
+`structured_output`. It is not used, and timed-out ledger entries carry no `estimated_actual_usd`, until a stream from
+a real session is recorded as a fixture (a paid call; checked 2026-09-29, never by running the CLI).
 
 Claude model rules (opus-5-5 and fable-5-1): thinking cannot be disabled, no sampling params, no prefill,
 no forced `tool_choice`, `stop_reason == "refusal"` raises `ProviderRefusal`, and effort must be set explicitly (Opus 5.5 defaults to `medium`).
@@ -213,7 +244,14 @@ lenient (loose labels, including the level after a closing bold marker, `2. **AC
 checkbox before the label, `- [ ] AC-2 [soft]: ...`, is dropped; unnumbered or unlabeled items become the next free id
 and `hard`; a missing section or `None.` yields none), so hand-edited notes after the review gate still parse; `acceptance_criteria_errors(section)` is the
 strict check and `normalize_acceptance_criteria` the rewrite the strategy stage applies. `validate_body` does not check
-this grammar. The critique prompts, the clean-room prompt and final's acceptance gate all read criteria through
+this grammar. `MAX_HARD_CRITERIA` = 6; `hard_criteria_errors(section, limit=)` (one error naming the hard ids and how
+to calibrate them, when more are hard; unlabeled counts as hard) is the strategy stage's `check=`, so it goes through
+the one repair; `validate_body` and the review gate do not apply it, so older and hand-edited notes stay valid; the
+grammar text (`ACCEPTANCE_CRITERIA_GRAMMAR`, in the format spec and the repair prompt) states the cap.
+`Relaxation(criterion, issue, round, reason)` is a criterion the adjudicator relaxed; `.line` is
+`AC-9 (GPT-4, round 2): <reason>` (`RunIndex.relaxed_criteria`), `parse_relaxations(lines)` reads them back (the first
+line per id wins; a hand-written `AC-<n> ...` line still counts) and `relaxed_criteria(criteria, relaxed)` makes those
+criteria soft. `RULING_RE` accepts `relax`, and `Ruling.ruling` is `fix | wontfix | relax`. The critique prompts, the clean-room prompt and final's acceptance gate all read criteria through
 `parse_acceptance_criteria` (rendered as `Criterion.line`). `maf.stages.strategy` re-exports these names.
 
 | Kind | Note name(s) | Required H2 sections (in order) | Line grammar |
@@ -224,9 +262,9 @@ this grammar. The critique prompts, the clean-room prompt and final's acceptance
 | execution | `03-execution[-rN]` | Summary, Artifacts, Implementation Notes, Verification, Known Limitations (∅) | Artifacts bullets `` - `rel/path` - description `` (code/mixed); extra `## Lint` (Python) when the lint finds critical/major problems |
 | critique | `04a-critique-<agent>[-rN]` | Summary, Issues (∅) | `- [critical\|major\|minor] <GPT\|GEM\|CLA>-<n>: text` |
 | rebuttal | `04b-rebuttal[-rN]` | Summary, Responses (∅) | `- <ID> [accept\|reject\|partial]: text` |
-| adjudication | `04c-adjudication[-rN]` | Summary, Rulings (∅) | `- <ID> [fix\|wontfix]: text` |
-| crosscheck | `04-crosscheck[-rN]` | Summary, Issues (∅), Rulings (∅), Applied Fixes (∅), Unresolved Critical (∅), Verdict | Verdict = `PASS` or `LOOP`; assembled by Python, with extra `## Source Audit` (maf's status line per audit, the auditor's text in a `quote_untrusted` block) and `## Changed Files` sections when those ran |
-| final | `05-final` | Summary, Deliverables, Verification, Provenance, Limitations (∅) | Provenance = wikilink bullets; extra `## Acceptance` (`- AC-<n> [met\|partial\|unmet]: evidence`, enforced by the final stage, plus maf's `clean-room`, `source-audit` and `lint` verdicts) and, code/mixed, `## Clean-room Reproduction` (Python) |
+| adjudication | `04c-adjudication[-rN]` | Summary, Rulings (∅) | `- <ID> [fix\|wontfix\|relax]: text` (`relax`: an unmet hard criterion ruled over-specified relative to the brief) |
+| crosscheck | `04-crosscheck[-rN]` | Summary, Issues (∅), Rulings (∅), Applied Fixes (∅), Unresolved Critical (∅), Verdict | Verdict = `PASS` or `LOOP`; assembled by Python, with extra `## Source Audit` (maf's status line per audit, the auditor's text in a `quote_untrusted` block), `## Relaxed Criteria` (every criterion relaxed so far) and `## Changed Files` sections when those apply |
+| final | `05-final` | Summary, Deliverables, Verification, Provenance, Limitations (∅) | Provenance = wikilink bullets; extra `## Acceptance` (`- AC-<n> [met\|partial\|unmet]: evidence`, enforced by the final stage, plus maf's `clean-room`, `source-audit` and `lint` verdicts), `## Relaxed Criteria` (Python, when any) and, code/mixed, `## Clean-room Reproduction` (Python) |
 
 Round 1 notes have no suffix; round n > 1 appends `-rN`. Valid examples of every kind are in
 `tests/fixtures/handoffs/`. **Repair**: on `HandoffInvalid`, one call with `repair_prompt(kind, bad_body, errors)`.
@@ -260,7 +298,16 @@ print. The `completed_with_issues` callout covers both: the unresolved count (li
 criterion as a bullet (linking `05-final`); `## Status` lists `Acceptance criteria not met: N` and the last export.
 `origin` (`mcp` for runs created by the MCP server, counted by `mcp_daily_budget_usd`) and `owner` (`<boot id>:<pid>`
 of the `maf serve` that queued the run, for orphan recovery) are left out of run.md while None
-(`OPTIONAL_INDEX_KEYS`), since `RunIndex` forbids unknown keys and older maf versions must still read CLI runs.
+(`OPTIONAL_INDEX_KEYS`), since `RunIndex` forbids unknown keys and older maf versions must still read CLI runs. So are
+`relaxed_criteria` (list, one `maf.handoff.Relaxation.line` per relaxed criterion; `## Status` then lists
+`Relaxed criteria: AC-9, ...`) and `loop_skipped` (`budget` when the latest cross-check went to final before the loop
+cap because another round was unaffordable, `LOOP_SKIPPED_BUDGET`), both left out while None or empty.
+`unresolved_cause(index)` words the open criticals: `after the cross-check loop cap`, or with `loop_skipped`
+`after the cross-check (another loop was skipped: over budget)`; `describe_issues`, the run.md callout and the CLI use
+it. `PARTIAL_EXPORT_NOTE` (`partial export`) opens the `export_note` of a failed or budget-stopped run the pipeline
+exported (see pipeline.py); while the status is `failed` or `budget_exceeded`, `## Status` then opens with a
+`> [!warning] Partial deliverables` callout (partial and unverified: no acceptance, clean-room, source-audit or lint
+gate). `exportable_files(run_id, *, excludes=)` lists what `export_workspace` would copy, copying nothing.
 
 `export_workspace(run_id, *, excludes=None, placeholders=None, max_bytes=None, max_files=None) -> ExportResult` makes
 `deliverables/` a copy of the workspace tree (code/mixed runs). Left out: `excludes` (default
@@ -324,6 +371,48 @@ Stage details settled at integration:
 - Token-provider calls get up to 2 retries on `retryable=True` errors, each metered (a partially streamed
   Claude call is billed per attempt). Claude Code is never retried. The one repair call drops `web_search`,
   `url_context`, `attachments` and `max_search_queries`: it only fixes the format.
+- Claude Code work sessions (the code/mixed execution pass and the code-mode fix pass) run through
+  `work_session(ctx, request, *, purpose, minimum_usd=None, continue_on_timeout=True, reserve_usd=0,
+  soft_reserve=False)` (`stages/base.py`; `generate(..., session=True, reserve_usd=)` uses it for the first call with
+  a soft reserve, and for the repair with `minimum_usd=0`, no reserve and no continuation; `session` on another role is
+  a `ValueError`). The floor is `session_floor(settings, cap_usd, session_usd, minimum_usd=None)` (pure: `minimum_usd`,
+  or `min(claude_code_min_session_usd, claude_code_min_session_share * cap)`; at most the session's own budget). Before
+  spawning it takes `ledger.planned_budget`; `reserve_usd` is held back for later stages (the session's
+  `--max-budget-usd` is cut to leave it: `soft_reserve` never below the floor, a hard reserve refuses instead). Below
+  the floor it raises `SessionBudgetTooSmall` (nothing spawned) with `before_usd = preflight_reserve(ctx)` (the
+  preflight's budget, `claude_code_preflight_budget_usd` or `preflight_budget_usd(model)`; 0 for a provider without
+  `preflight`), the hard reserve, and `needed_cap_usd = needed_cap(spent + before + reserve + headroom, fixed, share)`
+  (pure: the smallest cap `c` with `c - committed >= min(fixed, share * c)`, since the floor grows with the cap). A
+  `ClaudeCodeBudgetExhausted` after the clamp or the reserve had cut the budget becomes `SessionBudgetExhausted`; an
+  uncut one propagates (FAILED). A `ClaudeCodeTimeout` (already recorded at
+  its worst case) is followed by one continuation: `continuation_prompt(prompt, reason)` = `CONTINUATION_PREAMBLE`
+  (the previous session was cut off; inspect the workspace; finish only the incomplete parts, do not restart
+  completed work; rerun the reproduction and tests; every command under 10 minutes; then answer as the original task
+  asks) plus the original prompt unchanged, copied to `.maf/<purpose>-r<round>-continuation.md`, ledger purpose
+  `<purpose>-continuation` (`execution-continuation`, `fixes-continuation`), same budget rules; a refused or exhausted
+  continuation's error gets the timed-out charge added to its `charged_usd`. A second
+  timeout raises `ClaudeCodeTimeout` "... session and its one continuation both timed out (...); their work stays in
+  the workspace, and maf resume runs <stage> again" (cost 0: both are in the ledger), so the run ends FAILED. After a
+  continuation the returned result's `cost_usd` includes the timed-out charge (so note costs still add up) and
+  `raw["maf_continuation"]` (`CONTINUED_KEY`) records it; `continuation_note(result)` is the line execution appends to
+  its `## Summary` and the cross-check to its Summary. A `StructuredOutputError` from a continuation is re-raised with
+  both costs. Code/mixed execution calls `ensure_session_budget(ctx, "execution")` (the same check for a session of
+  the default budget, with `preflight_reserve` left out of what is available while the provider's `sandbox_verified`
+  is False) before `ensure_sandbox`, so a refused session pays for no preflight either, and a stage that passes still
+  has its floor after the preflight: resuming with exactly the hinted cap starts the session.
+  `messages_worst_case(ctx, prompt, role, stage)` prices a `generate_handoff` call without making it (final's
+  `final_worst_case` and the cross-check's loop estimate).
+- Round budget helpers (`stages/base.py`): `final_reserve_usd(ctx, mode, prompt)` = the final report's worst case on a
+  stand-in `prompt` plus, code/mixed, `cleanroom_budget_usd` and the clean room's turn headroom;
+  `smallest_session_usd(ctx, stage)` = the floor of a default-budget session plus one turn of headroom;
+  `round_entries(entries)` (pure: a round runs from the first execution entry after a cross-check entry through its
+  cross-check entries; ingestion, strategy and final entries belong to none, so a failed and resumed stage and a
+  timed-out session's worst-case charge stay in their round); `crosscheck_overhead(entries)` (pure: the worst cases of
+  the non-Claude-Code cross-check entries of the last round that has any: audits, critiques, rebuttal, adjudication,
+  their repairs); `round_reserve_usd(ctx, mode, final_prompt)` = `crosscheck_overhead` + `smallest_session_usd(ctx,
+  "crosscheck")` + `final_reserve_usd` on `final_prompt` plus `FINAL_PROMPT_ALLOWANCE_CHARS` (40,000). Execution at
+  round > 1 (the extra round included) passes `round_reserve_usd` (stand-in: the brief, its inputs and fix context) as
+  the session's soft reserve.
 - `export_excludes(settings)` (`stages/base.py`; `maf.stages.final` re-exports it) is the deliverable tree's one
   exclude set, in `maf.lint.excluded` order: `DEFAULT_EXPORT_EXCLUDES` plus `Settings.export_exclude`, then
   `Settings.export_include` as `!` re-includes, then `PROTECTED_EXPORT_EXCLUDES` again. The export, every lint pass and
@@ -332,13 +421,50 @@ Stage details settled at integration:
 - If no issue is raised at all (critics, source audit, lint), the rebuttal is skipped as well as the adjudication
   (Python writes `None.` notes, `from: maf`). An unparsable fix report counts as "nothing fixed", so unfixed criticals
   loop back; its call's cost still goes to the `04-crosscheck` note.
+- The code-mode fix session is a `work_session` with a hard `reserve_usd`: `final_reserve_usd` on
+  `final_prompt_estimate(ctx, evidence, {"Issues": ...})` plus the worst cases of this attempt's `source_audit` entries
+  (the post-fix re-audit). It never stops the run for budget: `SessionBudgetTooSmall` (the first session or its
+  continuation) gives `skipped_fix_report` (every issue `not_fixed` with `FIX_SKIPPED_BUDGET` = `fix pass skipped:
+  budget`) and `fix_skipped_note` in the Summary (`Fix pass skipped: budget. ...`), costed at `charged_usd` (model
+  `none` unless a timed-out session was charged); `SessionBudgetExhausted` gives `exhausted_fix_report` (every issue
+  not fixed; the changes stay and the post-fix checks see them), costed at `charged_usd`. The cross-check then goes
+  on to its verdict and loop check.
 - The prose fix pass uses `PROSE_FIX_REPORT_SCHEMA` (`FIX_REPORT_SCHEMA` plus the full revised `document`).
-- A `LOOP` at `round > max_crosscheck_loops` cannot loop: that `04-crosscheck` has `to: final` and its Summary says the
-  run ends `completed_with_issues`. `loop_back` is still set; the pipeline enforces the cap.
+- A `LOOP` at `round > max_crosscheck_loops`, or in an extra round (`"final" in ctx.index.completed_stages`), cannot
+  loop: that `04-crosscheck` has `to: final` and its Summary says the run ends `completed_with_issues` (`Loop cap
+  reached ...`, or `Extra round (maf resume --extra-round pays for one pass) ...`), with no loop estimate. `loop_back`
+  is still set; the pipeline enforces the cap.
+- A `LOOP` below the cap checks the budget first (`loop_estimate(ctx, mode, final_prompt)`, logged and added to the
+  Summary either way): `round_usd` is the last entry of `round_costs(ledger.entries)` (the cost of each
+  `round_entries` round), and for code/mixed at least the smallest round maf starts: `smallest_session_usd(ctx,
+  "execution")` + `crosscheck_overhead(ledger.entries)` + `smallest_session_usd(ctx, "crosscheck")` (the basis then
+  names all three and the last round's spend); the final reserve is `final_reserve_usd` on `final_prompt_estimate`
+  (brief, the critics' evidence without artifacts, this cross-check note and `FINAL_PROMPT_ALLOWANCE_CHARS`).
+  `LoopEstimate(round_usd, basis, final_usd, remaining_usd)` is affordable when `remaining >= round + final`. Since the
+  looped round's execution keeps back all of it but its own session (`round_reserve_usd`, soft) and every fix session
+  keeps final's reserve (hard), an affordable estimate reaches final even when the next round costs more than the
+  last. When it is not, the Summary says `Loop skipped: budget. <estimate>. The run goes to final and ends
+  completed_with_issues ...; maf resume <id> --extra-round --budget USD pays for another round`, `to` is `final`,
+  `loop_back` is False and `index_updates.loop_skipped` is `budget`; a later cross-check of the run resets it to None.
+- Relaxed criteria: `criteria_lines(criteria, relaxed)` lists a relaxed criterion to critics as `[soft]` with
+  `(relaxed in round N: over-specified relative to the brief)`, and `relax_issues(issues, relaxed)` makes every
+  critical unmet-criterion issue about it major (text annotated), before the rebuttal. `acceptance_criterion_id(issue)`
+  reads the `AC-<n>` after `Unmet acceptance criterion`. Adjudication runs when something is disputed or when a
+  critical unmet-criterion issue of a hard, not yet relaxed criterion was accepted (listed under `## Unmet acceptance
+  criteria the author accepted`, `fix` or `relax`); its prompt also carries the brief. `new_relaxations(issues,
+  rulings, eligible, round)` keeps a `relax` only on such an issue (others are ignored, stated in the Summary, and
+  count as `fix` in `issues_to_fix`); the relaxed issues become major, still go to the fixer (with the ruling), and
+  never count as unresolved critical. `## Relaxed Criteria` (`render_relaxed`) lists every relaxation so far, and
+  `index_updates.relaxed_criteria` carries the merged list when this round added one.
 - With `unresolved_critical > 0`, the final prompt states the run ends `completed_with_issues` (linking the last
   cross-check), and Python opens the 05-final `## Summary` with a `> [!warning] Run status: completed_with_issues`
   callout and adds the `maf/completed-with-issues` tag, besides listing the issues under Limitations. The same callout
   (a line per cause) and tag mark a final with blocking unmet criteria.
+- Final reads `RunIndex.relaxed_criteria`: those criteria are soft (`relaxed_criteria`), `criteria_block` lists them
+  with their rulings, `acceptance_verdicts(final, criteria, relaxed)` gives them `CriterionVerdict.relaxed` (never
+  blocking; the `## Acceptance` line says `relaxed to soft`, `summary` adds `(relaxed)`), and `enforce_final_rules`
+  writes `## Relaxed Criteria` (`relaxed_section`: verdict, criterion and ruling each). With `RunIndex.loop_skipped`
+  the unresolved block and `status_callout` say the loop was skipped for budget instead of naming the loop cap.
 - Final reads the latest execution note without its `## Lint` section (`without_lint`: pre-fix findings; the
   cross-check's fresh lint is in its note). In order: (1) `export_deliverables`: code/mixed runs
   `Vault.export_workspace` with `export_excludes(settings)`
@@ -410,7 +536,14 @@ Stage details settled at integration:
   sensitivity/model-mismatch criterion; for cited sources a hard criterion that every reference passes the source audit
   (with `source_audit` off: that it is in the ingestion's `## Sources` and supports the claim); final records its
   own `source-audit` verdict besides. A section off the grammar is not repaired but rewritten by Python (`normalize_acceptance_criteria`): unlabeled criteria become `hard`,
-  unnumbered or repeated ids get the next free `AC-<n>` (see handoff.py for the parser).
+  unnumbered or repeated ids get the next free `AC-<n>` (see handoff.py for the parser). The prompt calibrates the
+  criteria (`{{max_hard}}`): at most `MAX_HARD_CRITERIA` (6) hard, each directly required by the brief, demonstrable
+  within the run's budget (`{{budget}}` = `budget_note(mode, index.budget_usd, settings)`: the run's whole budget, the
+  loop cap and, unless the mode is prose, what one Claude Code work session may spend) and naming how it is checked;
+  everything else soft; no absolute provenance or coverage
+  demands ("every", "all") unless the brief makes them. The required criteria count toward the six (the sensitivity
+  one is soft unless the brief asks for a robustness analysis). `check_strategy` (`hard_criteria_errors`) sends more
+  hard criteria through the one repair; a second failure stops the run (FAILED).
 - Execution prompts (both modes) carry `DELIVERABLE_RULES`: cite only the ingestion's `## Sources`, attributing only
   what the ingestion shows a source contains; never cite or link pipeline notes or source ids; no meta-commentary about
   revisions or reviews; numbers generated from or asserted against the data, renderers failing on nulls; clean
@@ -505,8 +638,8 @@ Stage details settled at integration:
 | ingestion | brief, `workspace/inputs/*` (as attachments) | `01a-routing` (from triage JSON), `01-ingestion`; `index_updates.mode` |
 | strategy | `01a-routing`, `01-ingestion`, review note | `02-strategy` |
 | execution | `01-ingestion`, `02-strategy` (possibly user-edited), review note; round > 1: previous `04-crosscheck` Unresolved Critical + Rulings; extra round after final: `RunIndex.unmet_criteria`, `05-final` Acceptance + Clean-room Reproduction | `03-execution[-rN]` |
-| crosscheck | `02-strategy` Acceptance Criteria, `03-execution[-rN]` (without `## Lint`), artifact contents (capped), the workspace Markdown deliverables (lint, source audit, before and after the fix pass), `01-ingestion` Sources (source audit, when it runs) | `04a-critique-*`, `04b-rebuttal`, `04c-adjudication`, `04-crosscheck` (all `[-rN]`), `source-audit.json`; `loop_back`, `index_updates.unresolved_critical` |
-| final | `02-strategy` Acceptance Criteria, latest `03-execution` (without `## Lint`), latest `04-crosscheck`, the workspace tree (code/mixed export), `source-audit.json`, `cleanroom.json` | `deliverables/*` (replaced as a whole for code/mixed), `workspaces/.maf-cleanroom/<run_id>/`, `cleanroom.json`, `05-final`; `index_updates.criteria_unmet`, `.unmet_criteria`, `.exported_at`, `.export_note` |
+| crosscheck | `02-strategy` Acceptance Criteria, `03-execution[-rN]` (without `## Lint`), artifact contents (capped), the workspace Markdown deliverables (lint, source audit, before and after the fix pass), `01-ingestion` Sources (source audit, when it runs), `RunIndex.relaxed_criteria`, the ledger (loop estimate) | `04a-critique-*`, `04b-rebuttal`, `04c-adjudication`, `04-crosscheck` (all `[-rN]`), `source-audit.json`; `loop_back`, `index_updates.unresolved_critical` (and `.relaxed_criteria`, `.loop_skipped`) |
+| final | `02-strategy` Acceptance Criteria, latest `03-execution` (without `## Lint`), latest `04-crosscheck`, the workspace tree (code/mixed export), `source-audit.json`, `cleanroom.json`, `RunIndex.relaxed_criteria` and `.loop_skipped` | `deliverables/*` (replaced as a whole for code/mixed), `workspaces/.maf-cleanroom/<run_id>/`, `cleanroom.json`, `05-final`; `index_updates.criteria_unmet`, `.unmet_criteria`, `.exported_at`, `.export_note` |
 
 Roles per step: triage/strategy/adjudication use `chatgpt`; ingestion uses `gemini` (with search, URL context and attachments);
 execution uses `claude_code` (code/mixed) or `claude` (prose); the source audit uses `gemini` (search and URL context);
@@ -521,12 +654,14 @@ Both take an optional `progress=(index, message)` observer (the CLI prints it). 
 COMPLETED_WITH_ISSUES, FAILED, BUDGET_EXCEEDED or AWAITING_REVIEW run unchanged; only a run left RUNNING by a crash
 continues under `run`.
 The pure `next_step(index, finished, output, max_loops)` encodes the transitions:
-ingestion → strategy → (review gate) → execution → crosscheck → (execution again if `loop_back` and
-`round <= max_crosscheck_loops`, which allows up to 2 loops and 3 execution passes) → final → COMPLETED, or
+ingestion → strategy → (review gate) → execution → crosscheck → (execution again if `loop_back`,
+`round <= max_crosscheck_loops`, which allows up to 2 loops and 3 execution passes, and no final has run yet:
+`"final" not in completed_stages`) → final → COMPLETED, or
 COMPLETED_WITH_ISSUES when `index.has_issues`: `unresolved_critical > 0` (final was reached only because the loop cap was
 hit) or `criteria_unmet > 0`. After each stage the pipeline writes the notes, appends them to `index.handoffs`, applies
-the allowed `index_updates` (`ALLOWED_INDEX_UPDATES`: `mode`, `unresolved_critical`, `criteria_unmet`,
-`unmet_criteria`, `exported_at`, `export_note`; after final a missing `criteria_unmet`/`unmet_criteria` means 0/[], so
+the allowed `index_updates` (`ALLOWED_INDEX_UPDATES`: `mode`, `unresolved_critical`, `relaxed_criteria`,
+`loop_skipped`, `criteria_unmet`, `unmet_criteria`, `exported_at`, `export_note`; after final a missing
+`criteria_unmet`/`unmet_criteria` means 0/[], so
 an extra round's execution can still read the previous verdicts from the index), mirrors ledger totals into the index,
 and writes run.md, in that order, so a crash repeats at most the current stage.
 `export(run_id) -> (RunIndex, Export)` rewrites `deliverables/` with `maf.stages.final.export_run` under the run lock
@@ -540,11 +675,22 @@ an `owner` at once when that process is gone (another boot, a dead pid, this pro
 a PENDING run without one after `ORPHAN_GRACE_S` of no change.
 Both completed statuses are terminal: `resume` returns them unchanged and writes nothing (no note, no budget), except
 `resume(extra_round=True)` on a COMPLETED_WITH_ISSUES run, which moves it to execution `round + 1` (05-final leaves
-`handoffs` until final runs again), runs that pass and its cross-check (the loop cap still applies, so normally exactly
-one extra pass), then final. `extra_round` on any other status raises `ValueError`.
-Error mapping: `BudgetExceeded` → BUDGET_EXCEEDED; `HandoffInvalid` → FAILED; `ProviderError` → FAILED at once (a
-non-retryable one such as `SandboxUnavailable` is never retried or swallowed, so no crosscheck loop-back follows it;
-partial spend is already in the ledger); anything else → FAILED with `error` (`"<stage>: <Type>: <message>"`).
+`handoffs` until final runs again), runs that pass and its cross-check (which never loops, since final is in
+`completed_stages`: exactly one extra pass, even after a loop skipped for budget at a round below the cap), then final.
+`extra_round` on any other status raises `ValueError`.
+Error mapping: `BudgetExceeded` → BUDGET_EXCEEDED (its subclasses `SessionBudgetTooSmall` and
+`SessionBudgetExhausted` included: a work session refused for want of its minimum, or out of a clamped budget);
+`HandoffInvalid` → FAILED; `ProviderError` → FAILED at once (a non-retryable one such as `SandboxUnavailable` is never
+retried or swallowed, so no crosscheck loop-back follows it; partial spend is already in the ledger; a second
+`ClaudeCodeTimeout` too); anything else → FAILED with `error` (`"<stage>: <Type>: <message>"`).
+Partial export (`_partial_export`, from `_stop`, after the stop status is written): a code/mixed run stopping FAILED or
+BUDGET_EXCEEDED (`PARTIAL_EXPORT_STATUSES`) at or after execution, whose workspace has files to export
+(`Vault.exportable_files`), gets `maf.stages.final.export_run` (no model calls) and `export_note` =
+`partial export after the run stopped <status> at <stage>: <describe>; partial and unverified (no acceptance,
+clean-room or source-audit gate ran)` with `exported_at`. Any exception there is logged; run.md keeps the stop's
+status and error. The next final (after `resume`) replaces the export and its note. A run with `"final"` in
+`completed_stages` (an extra round stopped) is not exported: `deliverables/`, `exported_at` and `export_note` stay as
+final left them, and the half-done workspace stays in `workspaces/` for `maf resume`.
 
 ### cli.py (E)
 `maf run | resume | status | list | export | serve [--stdio] [--uds PATH] [--env-file PATH] | chatgpt setup|status`,
@@ -566,7 +712,11 @@ more pass: maf resume ID --extra-round)`), failed with `failed: <error> (spent $
 error and a `--budget` hint.
 `maf resume` refuses a completed_with_issues run (exit 2, nothing runs or is written) unless `--extra-round` is given.
 `maf status` shows `unresolved critical: N` when non-zero, `criteria unmet: M` with one indented line per criterion,
-and the last export. `maf export RUN_ID` calls `Pipeline.export` and prints `exported N file(s), SIZE, to <path>` (plus
+`criteria relaxed: K` likewise, `loop skipped: budget`, and the last export. The completed_with_issues line uses
+`unresolved_cause` and, after a budget skip, hints `--extra-round --budget USD`; a failed or budget-exceeded run with a
+partial export adds `partial deliverables (unverified): <deliverables path>` on stderr. A finished run with relaxed
+criteria adds `criteria relaxed to soft as over-specified (not verified as written): AC-3, ...; see ## Relaxed Criteria
+in <05-final.md>` on stderr. `maf export RUN_ID` calls `Pipeline.export` and prints `exported N file(s), SIZE, to <path>` (plus
 left-out placeholders and `ExportResult.excluded_note()`; skipped unsafe entries on stderr): exit 0 on success, 1 when the export is refused (too large,
 no mode, run busy, unreadable file), 2 for an unknown run.
 
@@ -577,11 +727,14 @@ host/port only set the accepted Host header.
 Tools: `start_run` (write, returns `run_id` immediately; `RunManager` runs the pipeline on a single background worker thread),
 `get_run_status`, `get_run_result`, `list_runs` (read-only annotations). Tests use `mcp.Client(server)` in-process.
 `status` is the `RunStatus` value everywhere; `get_run_status` and `get_run_result` also return `unresolved_critical`,
-`criteria_unmet` and `unmet_criteria`, and `get_run_result` returns the 05-final body for both `completed` and
+`criteria_unmet`, `unmet_criteria`, `relaxed_criteria` (scrubbed like `unmet_criteria`) and `loop_skipped`, and
+`get_run_result` returns the 05-final body for both `completed` and
 `completed_with_issues`, plus at most `DELIVERABLES_MAX_LISTED` (200) deliverable paths and `deliverables_total`. The
 server instructions tell ChatGPT that `completed_with_issues` means the result is not verified, from open criticals
 and/or unmet acceptance criteria (`clean-room`: the export did not rebuild from scratch; `source-audit`: a reference
-was not verified; `lint`: the deliverables link pipeline notes).
+was not verified; `lint`: the deliverables link pipeline notes), that `relaxed_criteria` lists hard criteria the
+adjudicator relaxed as over-specified (so even a `completed` run was not verified against them as written; tell the
+user), and what `loop_skipped` `budget` means.
 Transport security (`transport_security`) keeps mcp's DNS-rebinding protection on for every loopback bind. Host must
 be `allowed_hosts(host, port)`: the bind address or `localhost`, with this port, which is what tunnel-client sends.
 Origin must be absent or exactly one of `Settings.mcp_allowed_origins` (default empty; validated as
@@ -600,7 +753,10 @@ when `mcp_max_pending_runs` MCP runs are queued or running (`active_count`), or 
 ### chatgpt.py (E)
 `maf chatgpt setup` renders `maf-mcp.service` (`maf serve [settings sources] --host --port --uds %t/maf/mcp.sock`,
 `RuntimeDirectory=maf` 0700, `EnvironmentFile=~/.config/maf/maf.env`, `RestartPreventExitStatus=2`, `KillMode=mixed`,
-`TimeoutStopSec=2h`, bwrap-compatible hardening) and `maf-tunnel.service` (`tunnel-client run --mcp.server-url
+`TimeoutStopSec` = `mcp_stop_timeout(settings.claude_code_timeout_s)`: `MCP_STOP_SESSIONS` (3) sessions plus
+`MCP_STOP_MARGIN_S` (30 min), rounded up to the minute, `5h` by default, so a stop never SIGKILLs a Claude Code session
+whose spend would then be missing from the ledger; `UnitParams.stop_timeout`; bwrap-compatible hardening) and
+`maf-tunnel.service` (`tunnel-client run --mcp.server-url
 url=http://127.0.0.1:<port>/mcp,unix-socket=%t/maf/mcp.sock`, `EnvironmentFile=~/.config/maf/tunnel.env`, provider keys
 unset, `Requires=`/`After=` maf-mcp, full hardening) into `$XDG_CONFIG_HOME/systemd/user`, writes both env files as 0600
 templates only if they are missing, creates `mcp_inbox` 0700 if missing, and runs `daemon-reload`. It refuses a
@@ -624,7 +780,14 @@ the setup, the security model and the verification record.
 2. Before a call: `spent + worst_case > cap` raises `BudgetExceeded`, so the call never happens and the run stops cleanly as BUDGET_EXCEEDED.
 3. Token providers: worst case = locally estimated input (3 chars/token) × input price + `max_output_tokens` × output price (+ `max_search_queries` × fee; Gemini with `url_context` also adds `URL_CONTEXT_TOKEN_ALLOWANCE` input tokens).
 4. Claude Code: `--max-budget-usd = min(per-call cap, remaining)`, and its worst case equals that value. Actual cost = `total_cost_usd`.
-   With less than `MIN_CLAUDE_CODE_BUDGET_USD` ($0.0001) left, the call is refused with `BudgetExceeded`.
+   With less than `MIN_CLAUDE_CODE_BUDGET_USD` ($0.0001) left, the call is refused with `BudgetExceeded`. A work
+   session (execution, fix pass, continuation) is refused before spawning below its floor (`claude_code_min_session_usd`,
+   at most `claude_code_min_session_share` of the cap; `SessionBudgetTooSmall`), and one that hits a clamped cap ends
+   the run BUDGET_EXCEEDED (`SessionBudgetExhausted`). The fix pass instead carries on: it keeps final's reserve, is
+   skipped when it cannot get its floor, and counts nothing fixed when it runs out of its cut cap.
+   A session killed at its timeout is recorded at its worst case (budget plus one turn) with the `ClaudeCodeTimeout`
+   error; execution and fix sessions then get one continuation, recorded as its own entry
+   (`purpose=<purpose>-continuation`).
 5. Actual cost is always recorded, including partial spend on failures (`LedgerEntry.error` then holds the error text).
    `run.md` shows spend by agent and by provider. The Claude Code sandbox preflight is an ordinary entry
    (`stage=execution`, or `crosscheck` in a process resumed there; `purpose=preflight`). A wrong digest is detected
@@ -663,4 +826,15 @@ the setup, the security model and the verification record.
   execution round 2 after a LOOP); a re-attribution from memory in the fix pass is re-audited and ends the run
   `completed_with_issues` (`source-audit`); a pipeline wikilink is one LINT issue, fixed only when maf's re-lint
   agrees.
+- `tests/test_budget_resilience.py` covers the 2026-09-29 thesis-rerun fixes, unit and end to end: a timeout, then a
+  continuation that completes; two timeouts (FAILED, partial export, CLI line); a budget below the session minimum
+  (BUDGET_EXCEEDED before spawning, resumed to completion); a clamped session that runs out (BUDGET_EXCEEDED, partial
+  export, resumed); an unaffordable LOOP (final, completed_with_issues, budget wording); seven hard criteria (one
+  strategy repair); a relaxed criterion (not blocking, listed in 04-crosscheck and 05-final). The review fixes: the
+  hinted cap starts the session (less left than one turn; a new process resumed with exactly the hint, sandbox
+  preflight included, completes); the $5 MCP default with Opus's headroom starts its execution session; a fix pass
+  that keeps final's reserve, one skipped for it, one out of its cut budget, a refused continuation; a dearer second
+  round still reaches final; `--extra-round` after a budget skip is one pass; a failed extra round keeps final's
+  deliverables. Its `ResilienceScript` extends the e2e `Script`, and `HeadroomFake` gives a fake the real provider's
+  turn headroom.
 - There are no network calls and no subprocess calls to the real `claude`. `-m live` tests are opt-in and require approval (budget: $150 total, ask before $100).

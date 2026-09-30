@@ -37,21 +37,28 @@ Tools (every tool returns in well under ChatGPT's 1-minute limit):
   (``mcp_committed_usd``) above ``settings.mcp_daily_budget_usd``: a remembered ChatGPT approval then still cannot
   queue unbounded spend. ``review`` is always False from MCP (no gate UI).
 - ``get_run_status(run_id) -> {"run_id", "status", "stage", "round", "spent_usd", "budget_usd",
-  "spend_by_agent", "unresolved_critical", "criteria_unmet", "unmet_criteria", "error", "handoffs"}``: read-only.
+  "spend_by_agent", "unresolved_critical", "criteria_unmet", "unmet_criteria", "relaxed_criteria", "loop_skipped",
+  "error", "handoffs"}``: read-only.
 - ``get_run_result(run_id) -> {"run_id", "status", "unresolved_critical", "criteria_unmet", "unmet_criteria",
-  "final_markdown" | None, "deliverables": [paths], "deliverables_total", "vault_path"}``. ``final_markdown`` is the
+  "relaxed_criteria", "loop_skipped", "final_markdown" | None, "deliverables": [paths], "deliverables_total",
+  "vault_path"}``. ``final_markdown`` is the
   05-final.md body (for ``completed`` and ``completed_with_issues`` runs), truncated to ``RESULT_MAX_CHARS`` with a
   marker; ``deliverables`` lists at most ``DELIVERABLES_MAX_LISTED`` of the ``deliverables_total`` files.
 - ``list_runs(limit: int = 20) -> [{"run_id", "status", "stage", "spent_usd", "created"}]``: read-only.
 
-Text fields that carry model or tool output (``final_markdown``, ``error``, ``unmet_criteria``) pass through
+Text fields that carry model or tool output (``final_markdown``, ``error``, ``unmet_criteria``,
+``relaxed_criteria``) pass through
 ``maf.redact.redact`` with the key values of maf's environment, so a key a run leaked into its report (a sandboxed
 command can read more than the workspace) does not reach the ChatGPT conversation.
 
 ``status`` is a ``RunStatus`` value. ``completed_with_issues`` means final ran but the result is not verified: the
-cross-check loop cap was hit with ``unresolved_critical`` critical issues still open, and/or ``criteria_unmet``
+cross-check loop cap was hit (or a loop skipped for budget) with ``unresolved_critical`` critical issues still open,
+and/or ``criteria_unmet``
 acceptance criteria (maf's own checks included: ``clean-room``, ``source-audit``, ``lint``) are not met, one line
-each in ``unmet_criteria``. The final report lists both.
+each in ``unmet_criteria``. The final report lists both. ``relaxed_criteria`` (one line each: ``AC-<n> (<issue>, round
+<r>): <ruling>``) lists hard criteria the adjudicator relaxed to soft as over-specified relative to the brief: a
+``completed`` run with any was not verified against them as written. ``loop_skipped`` is ``"budget"`` when the last
+cross-check went to final with critical issues open because another round was unaffordable, else None.
 """
 
 from __future__ import annotations
@@ -105,12 +112,17 @@ SERVER_INSTRUCTIONS = (
     "across ChatGPT, Gemini and Claude, writing every handoff to an Obsidian vault. start_run returns a "
     "run_id immediately and the run continues in the background, often for many minutes; poll "
     "get_run_status, then call get_run_result once the status is 'completed' or 'completed_with_issues'. "
-    "'completed_with_issues' means the result is not verified: the cross-check loop cap was reached with "
-    "unresolved critical issues (count in unresolved_critical), and/or acceptance criteria were not met "
+    "'completed_with_issues' means the result is not verified: the cross-check loop cap was reached (or another "
+    "loop was skipped because the budget could not pay for it) with unresolved critical issues (count in "
+    "unresolved_critical), and/or acceptance criteria were not met "
     "(count in criteria_unmet, one line each in unmet_criteria; 'clean-room' means the exported deliverables did "
     "not rebuild from scratch, 'source-audit' that a reference was not verified on the web, 'lint' that the "
     "deliverables link pipeline notes). Tell the user so and point to the final report's Acceptance and Limitations. "
-    "'failed' and 'budget_exceeded' carry the reason in error."
+    "relaxed_criteria lists hard acceptance criteria the adjudicator relaxed to soft as over-specified relative to "
+    "the request: even a 'completed' run was not verified against those as written, so tell the user which, and "
+    "why. loop_skipped 'budget' means the last cross-check went to final because another round was unaffordable. "
+    "'failed' and 'budget_exceeded' carry the reason in error; a code run stopped that way may still have partial, "
+    "unverified deliverables."
 )
 
 
@@ -226,6 +238,8 @@ def _status_payload(index: RunIndex) -> dict[str, Any]:
         "unresolved_critical": index.unresolved_critical,
         "criteria_unmet": index.criteria_unmet,
         "unmet_criteria": [_scrub(line) for line in index.unmet_criteria],
+        "relaxed_criteria": [_scrub(line) for line in index.relaxed_criteria],
+        "loop_skipped": index.loop_skipped,
         "error": _scrub(index.error),
         "handoffs": list(index.handoffs),
     }
@@ -258,6 +272,8 @@ def _result_payload(manager: RunManager, index: RunIndex) -> dict[str, Any]:
         "unresolved_critical": index.unresolved_critical,
         "criteria_unmet": index.criteria_unmet,
         "unmet_criteria": [_scrub(line) for line in index.unmet_criteria],
+        "relaxed_criteria": [_scrub(line) for line in index.relaxed_criteria],
+        "loop_skipped": index.loop_skipped,
         "final_markdown": final_markdown,
         "deliverables": deliverables[:DELIVERABLES_MAX_LISTED],
         "deliverables_total": len(deliverables),

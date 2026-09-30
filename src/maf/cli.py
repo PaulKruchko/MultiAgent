@@ -58,7 +58,16 @@ from maf.config import Settings, load_settings
 from maf.handoff import HandoffInvalid, HandoffKind
 from maf.pipeline import Pipeline
 from maf.types import RunStatus
-from maf.vault import ExportError, RunIndex, format_bytes, latest_crosscheck, note_name
+from maf.vault import (
+    LOOP_SKIPPED_BUDGET,
+    PARTIAL_EXPORT_NOTE,
+    ExportError,
+    RunIndex,
+    format_bytes,
+    latest_crosscheck,
+    note_name,
+    unresolved_cause,
+)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -207,9 +216,10 @@ def _report(pipeline: Pipeline, index: RunIndex, out: TextIO, err: TextIO) -> in
     if index.status.finished:
         print(paths.note(note_name(HandoffKind.FINAL)), file=out, flush=True)
     if index.status == RunStatus.COMPLETED_WITH_ISSUES:
+        budget = " --budget USD" if index.loop_skipped == LOOP_SKIPPED_BUDGET else ""
         print(
             f"completed with issues: {_issues_line(index, paths.note)} ({_spend(index)}; one more pass: "
-            f"maf resume {index.run_id} --extra-round)",
+            f"maf resume {index.run_id} --extra-round{budget})",
             file=err,
         )
     elif index.status == RunStatus.AWAITING_REVIEW:
@@ -220,6 +230,15 @@ def _report(pipeline: Pipeline, index: RunIndex, out: TextIO, err: TextIO) -> in
     elif index.status == RunStatus.FAILED:
         error = " ".join((index.error or "unknown error").split())  # one line, even for multi-line provider output
         print(f"failed: {error} ({_spend(index)})", file=err)
+    if index.status.finished and index.relaxed_criteria:
+        ids = ", ".join(line.split(" ", 1)[0] for line in index.relaxed_criteria if line.strip())
+        print(
+            f"criteria relaxed to soft as over-specified (not verified as written): {ids}; see ## Relaxed Criteria in "
+            f"{paths.note(note_name(HandoffKind.FINAL))}",
+            file=err,
+        )
+    if not index.status.finished and (index.export_note or "").startswith(PARTIAL_EXPORT_NOTE):
+        print(f"partial deliverables (unverified): {paths.deliverables}", file=err)
     return exit_code_for(index.status)
 
 
@@ -229,7 +248,7 @@ def _issues_line(index: RunIndex, note_path: Callable[[str], Path]) -> str:
     if index.unresolved_critical > 0 or index.criteria_unmet == 0:
         crosscheck = latest_crosscheck(index)
         where = f"; see {note_path(crosscheck)}" if crosscheck else ""
-        parts.append(f"{index.unresolved_critical} unresolved critical issue(s) after the cross-check loop cap{where}")
+        parts.append(f"{index.unresolved_critical} unresolved critical issue(s) {unresolved_cause(index)}{where}")
     if index.criteria_unmet > 0:
         ids = ", ".join(line.split(" ", 1)[0] for line in index.unmet_criteria if line.strip())
         noun = "criterion" if index.criteria_unmet == 1 else "criteria"
@@ -316,6 +335,11 @@ def _status_lines(index: RunIndex) -> list[str]:
     if index.criteria_unmet:
         lines.append(f"criteria unmet: {index.criteria_unmet}")
         lines += [f"  - {' '.join(line.split())}" for line in index.unmet_criteria]
+    if index.relaxed_criteria:
+        lines.append(f"criteria relaxed: {len(index.relaxed_criteria)}")
+        lines += [f"  - {' '.join(line.split())}" for line in index.relaxed_criteria]
+    if index.loop_skipped:
+        lines.append(f"loop skipped: {index.loop_skipped}")
     if index.spend_by_agent:
         lines.append("by agent: " + ", ".join(f"{a} ${usd:.4f}" for a, usd in sorted(index.spend_by_agent.items())))
     if index.handoffs:
