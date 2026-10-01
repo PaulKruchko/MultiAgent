@@ -1,0 +1,3 @@
+host production build: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 CTRL=1880 sizeof(void*)=8
+host production build: TLSF_ALIGN=16 HDR=16 MIN_BLOCK=32 CTRL=1744 sizeof(void*)=8
+host production build: TLSF_ALIGN=32 HDR=32 MIN_BLOCK=64 CTRL=1632 sizeof(void*)=8

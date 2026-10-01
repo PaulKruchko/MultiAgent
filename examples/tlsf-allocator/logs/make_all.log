@@ -1,0 +1,417 @@
+mkdir -p build
+arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -c src/tlsf.c -o build/tlsf_m3.o
+{ echo '$ arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -c src/tlsf.c -o build/tlsf_m3.o'; \
+  arm-none-eabi-gcc --version | head -1; \
+  echo '$ arm-none-eabi-size build/tlsf_m3.o'; arm-none-eabi-size build/tlsf_m3.o; \
+  echo '$ arm-none-eabi-size -A build/tlsf_m3.o'; arm-none-eabi-size -A build/tlsf_m3.o; \
+  echo '$ arm-none-eabi-nm -u build/tlsf_m3.o  (undefined symbols)'; \
+  arm-none-eabi-nm -u build/tlsf_m3.o; echo '(end of undefined symbols)'; \
+  echo '$ arm-none-eabi-nm -S --size-sort build/tlsf_m3.o'; \
+  arm-none-eabi-nm -S --size-sort build/tlsf_m3.o; \
+  for a in 2 4 5; do \
+    arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -DTLSF_ALIGN_LOG2=$a -c src/tlsf.c -o build/tlsf_m3_a$a.o && \
+    echo "TLSF_ALIGN_LOG2=$a:" && arm-none-eabi-size build/tlsf_m3_a$a.o | tail -1; done; \
+  arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -c src/tlsf.c -S -o build/tlsf_m3.s; \
+  echo 'CLZ/RBIT instructions in generated code:'; grep -cE '\b(clz|rbit)\b' build/tlsf_m3.s; \
+  text=$(arm-none-eabi-size build/tlsf_m3.o | awk 'NR==2{print $1}'); \
+  if [ $text -lt 2048 ]; then echo "SIZE CHECK PASS: text=$text < 2048"; \
+  else echo "SIZE CHECK FAIL: text=$text >= 2048"; exit 1; fi; \
+} 2>&1 | tee logs/size.log; test ${PIPESTATUS[0]} -eq 0
+$ arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -c src/tlsf.c -o build/tlsf_m3.o
+arm-none-eabi-gcc (15:13.2.rel1-2) 13.2.1 20231009
+$ arm-none-eabi-size build/tlsf_m3.o
+   text	   data	    bss	    dec	    hex	filename
+    692	      0	      0	    692	    2b4	build/tlsf_m3.o
+$ arm-none-eabi-size -A build/tlsf_m3.o
+build/tlsf_m3.o  :
+section           size   addr
+.text              692      0
+.data                0      0
+.bss                 0      0
+.comment            39      0
+.ARM.attributes     45      0
+Total              776
+
+
+$ arm-none-eabi-nm -u build/tlsf_m3.o  (undefined symbols)
+(end of undefined symbols)
+$ arm-none-eabi-nm -S --size-sort build/tlsf_m3.o
+00000000 0000000a t call_hook
+00000144 0000000a T tlsf_set_lock
+0000000a 00000028 t mapping
+00000032 0000004a t insert_free
+0000007c 00000056 t remove_free
+000000d2 00000072 T tlsf_init
+00000234 0000007e T tlsf_free
+0000014e 000000e6 T tlsf_malloc
+TLSF_ALIGN_LOG2=2:
+    704	      0	      0	    704	    2c0	build/tlsf_m3_a2.o
+TLSF_ALIGN_LOG2=4:
+    692	      0	      0	    692	    2b4	build/tlsf_m3_a4.o
+TLSF_ALIGN_LOG2=5:
+    696	      0	      0	    696	    2b8	build/tlsf_m3_a5.o
+CLZ/RBIT instructions in generated code:
+5
+SIZE CHECK PASS: text=692 < 2048
+{ for a in 3 4 5; do \
+    cc -std=c99 -O2 -g -Wall -Wextra -Wpedantic -Werror -Isrc -Itests -DTLSF_ALIGN_LOG2=$a tests/host_sizes.c -o build/host_sizes_a$a && \
+    build/host_sizes_a$a || exit 1; done; } 2>&1 | tee logs/host_sizes.log; \
+test ${PIPESTATUS[0]} -eq 0
+host production build: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 CTRL=1880 sizeof(void*)=8
+host production build: TLSF_ALIGN=16 HDR=16 MIN_BLOCK=32 CTRL=1744 sizeof(void*)=8
+host production build: TLSF_ALIGN=32 HDR=32 MIN_BLOCK=64 CTRL=1632 sizeof(void*)=8
+{ echo '$ arm-none-eabi-objdump -d build/tlsf_m3.o > build/tlsf_m3.dis'; \
+  arm-none-eabi-objdump -d build/tlsf_m3.o > build/tlsf_m3.dis && \
+  echo '$ python3 tools/check_branches.py build/tlsf_m3.dis' && \
+  python3 tools/check_branches.py build/tlsf_m3.dis; } 2>&1 | tee logs/audit.log; \
+test ${PIPESTATUS[0]} -eq 0
+$ arm-none-eabi-objdump -d build/tlsf_m3.o > build/tlsf_m3.dis
+$ python3 tools/check_branches.py build/tlsf_m3.dis
+function       insns CFG cycles (loops)     indirect  direct calls
+call_hook          4 none                          1  -
+mapping           16 none                          0  -
+insert_free       30 none                          0  mapping
+remove_free       33 none                          0  mapping
+tlsf_init         43 100->fa,10e->108              0  insert_free
+tlsf_set_lock      3 none                          0  -
+tlsf_malloc       87 none                          0  call_hook,insert_free,mapping,remove_free
+tlsf_free         47 none                          0  call_hook,insert_free,remove_free
+tlsf_malloc: reachable functions ['call_hook', 'insert_free', 'mapping', 'remove_free', 'tlsf_malloc'] (indirect calls = lock hooks via call_hook)
+tlsf_free: reachable functions ['call_hook', 'insert_free', 'mapping', 'remove_free', 'tlsf_free'] (indirect calls = lock hooks via call_hook)
+LOOP/RECURSION AUDIT PASS
+cc -std=c99 -O2 -g -Wall -Wextra -Wpedantic -Werror -Isrc -Itests -DTLSF_STATS tests/test_unit.c src/tlsf.c tests/tlsf_check.c -o build/test_unit
+build/test_unit 2>&1 | tee logs/unit.log; test ${PIPESTATUS[0]} -eq 0
+TLSF unit tests: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 CTRL=1904 FL_COUNT=14 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 7227
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 558, successful fits: 510097, good-fit rejections (block fits but class rounded above): 68608
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       541206       3       1       1         1      1         0
+malloc_fail      86476       2       0       0         0      0         0
+free            539284       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1774559 checks, 0 failures
+UNIT TESTS PASSED
+{ for a in 4 5; do \
+    cc -std=c99 -O2 -g -Wall -Wextra -Wpedantic -Werror -Isrc -Itests -DTLSF_STATS -DTLSF_ALIGN_LOG2=$a tests/test_unit.c \
+      src/tlsf.c tests/tlsf_check.c -o build/test_unit_a$a || exit 1; \
+    build/test_unit_a$a || exit 1; done; } 2>&1 | tee logs/unit_align.log; \
+test ${PIPESTATUS[0]} -eq 0
+TLSF unit tests: TLSF_ALIGN=16 HDR=16 MIN_BLOCK=32 CTRL=1776 FL_COUNT=13 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 13324
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 304, successful fits: 460046, good-fit rejections (block fits but class rounded above): 57728
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       500447       3       1       1         1      1         0
+malloc_fail      72332       2       0       0         0      0         0
+free            499280       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1638656 checks, 0 failures
+UNIT TESTS PASSED
+TLSF unit tests: TLSF_ALIGN=32 HDR=32 MIN_BLOCK=64 CTRL=1664 FL_COUNT=12 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 24412
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 176, successful fits: 432224, good-fit rejections (block fits but class rounded above): 52352
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       489899       3       1       1         1      1         0
+malloc_fail      69260       2       0       0         0      0         0
+free            489132       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1630017 checks, 0 failures
+UNIT TESTS PASSED
+cc -std=c99 -O2 -g -Wall -Wextra -Wpedantic -Werror -Isrc -Itests -DTLSF_STATS tests/test_stress.c src/tlsf.c tests/tlsf_check.c -o build/test_stress
+build/test_stress 200000 logs 2>&1 | tee logs/stress.log; test ${PIPESTATUS[0]} -eq 0
+TLSF stress: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 sizeof(void*)=8
+
+== Part A: seeded randomized integrity stress ==
+stress seed=0xc0ffee heap=65536 ops=200000 allocs=94026 frees=93784 failed_allocs=12190 max_live=281 L_crosschecks=201 -> ok
+stress seed=0x5eed0001 heap=65536 ops=200000 allocs=93756 frees=93505 failed_allocs=12739 max_live=279 L_crosschecks=201 -> ok
+stress seed=0xdeadbeef heap=65536 ops=200000 allocs=93840 frees=93603 failed_allocs=12557 max_live=276 L_crosschecks=201 -> ok
+
+== Part B: fragmentation workloads (ext_frag = 1 - L/F, phys_frag = 1 - largest_free/F) ==
+  small_uniform: sizes U[8,256]
+  mixed: 70% U[16,128], 25% U[129,2048], 5% U[2049,16384]
+  pow2: 2^k, k U[3,12]
+  pressure: U[16,512], 2048 slots on 128 KiB (exhaustion)
+| workload | seed | heap | slots | ops | live requested | used footprint | free payload F | largest alloc L | largest free block | header+rounding overhead | final ext_frag | mean ext_frag | max ext_frag | final phys_frag | mean phys_frag | max phys_frag | failed/attempted allocs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small_uniform | 0x1001 | 262144 | 1024 | 100000 | 66462 | 78464 | 180768 | 163824 | 169240 | 12002 | 0.0937 | 0.0875 | 0.1264 | 0.0638 | 0.0555 | 0.1102 | 0/50253 |
+| mixed | 0x1002 | 262144 | 256 | 100000 | 86999 | 89888 | 169840 | 114672 | 117664 | 2889 | 0.3248 | 0.3811 | 0.7791 | 0.3072 | 0.3669 | 0.7710 | 0/50063 |
+| pow2 | 0x1003 | 262144 | 256 | 100000 | 92944 | 95376 | 164352 | 94192 | 94560 | 2432 | 0.4269 | 0.4376 | 0.6758 | 0.4246 | 0.4254 | 0.6634 | 0/50068 |
+| pressure | 0x1004 | 131072 | 2048 | 100000 | 107749 | 124448 | 3584 | 224 | 224 | 16699 | 0.9375 | 0.9311 | 0.9722 | 0.9375 | 0.9302 | 0.9722 | 31774/66247 |
+
+Operation-count maxima over the whole stress run:
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       467082       3       1       1         1      1         0
+malloc_fail      69863       2       0       0         0      0         0
+free            467082       0       1       2         2      0         2
+
+STRESS PASSED (0 errors)
+{ cc -std=c99 -O2 -g -Wall -Wextra -Wpedantic -Werror -Isrc -Itests -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -fno-omit-frame-pointer -DTLSF_STATS tests/test_unit.c src/tlsf.c tests/tlsf_check.c \
+    -o build/test_unit_asan && build/test_unit_asan && \
+  cc -std=c99 -O2 -g -Wall -Wextra -Wpedantic -Werror -Isrc -Itests -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -fno-omit-frame-pointer -DTLSF_STATS tests/test_stress.c src/tlsf.c tests/tlsf_check.c \
+    -o build/test_stress_asan && build/test_stress_asan 100000 build; \
+} 2>&1 | tee logs/asan.log; test ${PIPESTATUS[0]} -eq 0
+TLSF unit tests: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 CTRL=1904 FL_COUNT=14 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 7227
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 558, successful fits: 510097, good-fit rejections (block fits but class rounded above): 68608
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       541206       3       1       1         1      1         0
+malloc_fail      86476       2       0       0         0      0         0
+free            539284       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1774559 checks, 0 failures
+UNIT TESTS PASSED
+TLSF stress: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 sizeof(void*)=8
+
+== Part A: seeded randomized integrity stress ==
+stress seed=0xc0ffee heap=65536 ops=100000 allocs=46998 frees=46745 failed_allocs=6257 max_live=281 L_crosschecks=101 -> ok
+stress seed=0x5eed0001 heap=65536 ops=100000 allocs=46934 frees=46691 failed_allocs=6375 max_live=279 L_crosschecks=101 -> ok
+stress seed=0xdeadbeef heap=65536 ops=100000 allocs=46967 frees=46725 failed_allocs=6308 max_live=276 L_crosschecks=101 -> ok
+
+== Part B: fragmentation workloads (ext_frag = 1 - L/F, phys_frag = 1 - largest_free/F) ==
+  small_uniform: sizes U[8,256]
+  mixed: 70% U[16,128], 25% U[129,2048], 5% U[2049,16384]
+  pow2: 2^k, k U[3,12]
+  pressure: U[16,512], 2048 slots on 128 KiB (exhaustion)
+| workload | seed | heap | slots | ops | live requested | used footprint | free payload F | largest alloc L | largest free block | header+rounding overhead | final ext_frag | mean ext_frag | max ext_frag | final phys_frag | mean phys_frag | max phys_frag | failed/attempted allocs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small_uniform | 0x1001 | 262144 | 1024 | 100000 | 66462 | 78464 | 180768 | 163824 | 169240 | 12002 | 0.0937 | 0.0875 | 0.1264 | 0.0638 | 0.0555 | 0.1102 | 0/50253 |
+| mixed | 0x1002 | 262144 | 256 | 100000 | 86999 | 89888 | 169840 | 114672 | 117664 | 2889 | 0.3248 | 0.3811 | 0.7791 | 0.3072 | 0.3669 | 0.7710 | 0/50063 |
+| pow2 | 0x1003 | 262144 | 256 | 100000 | 92944 | 95376 | 164352 | 94192 | 94560 | 2432 | 0.4269 | 0.4376 | 0.6758 | 0.4246 | 0.4254 | 0.6634 | 0/50068 |
+| pressure | 0x1004 | 131072 | 2048 | 100000 | 107749 | 124448 | 3584 | 224 | 224 | 16699 | 0.9375 | 0.9311 | 0.9722 | 0.9375 | 0.9302 | 0.9722 | 31774/66247 |
+
+Operation-count maxima over the whole stress run:
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       326059       3       1       1         1      1         0
+malloc_fail      51017       2       0       0         0      0         0
+free            326059       0       1       2         2      0         2
+
+STRESS PASSED (0 errors)
+cc -std=gnu99 -O2 -g -Wall -Wextra -Isrc -Itests -Ifreertos -IFreeRTOS-Kernel/include -IFreeRTOS-Kernel/portable/ThirdParty/GCC/Posix -IFreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/utils freertos/main.c \
+  src/tlsf.c tests/tlsf_check.c FreeRTOS-Kernel/tasks.c FreeRTOS-Kernel/queue.c FreeRTOS-Kernel/list.c FreeRTOS-Kernel/timers.c FreeRTOS-Kernel/event_groups.c FreeRTOS-Kernel/portable/MemMang/heap_3.c FreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/port.c FreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/utils/wait_for_event.c -pthread -o build/freertos_test
+timeout 120 build/freertos_test 2>&1 | tee logs/freertos.log; test ${PIPESTATUS[0]} -eq 0
+kernel V11.1.0+, port ThirdParty/GCC/Posix, 4 workers x 50000 iterations, heap 65536 bytes, elapsed 167 ticks
+worker 0: allocs=25005 frees=25005 failed_allocs=16 max_live_bytes=23309 errors=0
+worker 1: allocs=25007 frees=25007 failed_allocs=7 max_live_bytes=22239 errors=0
+worker 2: allocs=25006 frees=25006 failed_allocs=6 max_live_bytes=24445 errors=0
+worker 3: allocs=25005 frees=25005 failed_allocs=12 max_live_bytes=23589 errors=0
+lock hooks: lock=200087 unlock=200087 contended=231 overlaps=0
+concurrent heap inspections: 8, errors: 0
+final heap: inspector=0 free_blocks=1 used_blocks=0 free_payload=63624 (initial 63624)
+FREERTOS TEST PASS
+cc -std=gnu99 -O2 -g -Wall -Wextra -DNEGATIVE_CONTROL -Isrc -Itests -Ifreertos -IFreeRTOS-Kernel/include -IFreeRTOS-Kernel/portable/ThirdParty/GCC/Posix -IFreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/utils \
+  freertos/main.c src/tlsf.c tests/tlsf_check.c FreeRTOS-Kernel/tasks.c FreeRTOS-Kernel/queue.c FreeRTOS-Kernel/list.c FreeRTOS-Kernel/timers.c FreeRTOS-Kernel/event_groups.c FreeRTOS-Kernel/portable/MemMang/heap_3.c FreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/port.c FreeRTOS-Kernel/portable/ThirdParty/GCC/Posix/utils/wait_for_event.c -pthread -o build/freertos_negative
+{ timeout 120 build/freertos_negative > build/freertos_negative.out 2>&1; rc=$?; \
+  cat build/freertos_negative.out; echo "exit code: $rc"; \
+  if [ $rc -ne 0 ] && grep -Eq 'overlaps=[1-9]' build/freertos_negative.out; then \
+    echo "NEGATIVE CONTROL OK: failing run with overlapping allocator entries reported"; \
+  else echo "NEGATIVE CONTROL NOT TRIGGERED (need exit!=0 and overlaps>0)"; exit 1; fi; \
+} 2>&1 | tee logs/freertos_negative.log; test ${PIPESTATUS[0]} -eq 0
+NEGATIVE CONTROL: caught signal 11, lock hooks: lock=19468 unlock=19467 overlaps=768
+exit code: 139
+NEGATIVE CONTROL OK: failing run with overlapping allocator entries reported
+arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -g -Isrc -Itests -Ibaremetal -nostdlib -Wl,-T,baremetal/lm3s6965.ld -Wl,--gc-sections -ffunction-sections -Wl,-Map,build/baremetal.map baremetal/startup.c baremetal/semihost.c baremetal/main.c src/tlsf.c tests/tlsf_check.c -lgcc -o build/baremetal.elf
+( echo '$ qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal.elf'; qemu-system-arm --version | head -1; arm-none-eabi-size build/baremetal.elf; timeout 60 qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal.elf; rc=$?; echo "qemu exit code: $rc"; exit $rc ) 2>&1 | tee logs/baremetal.log; \
+test ${PIPESTATUS[0]} -eq 0 && grep -q '^BAREMETAL PASS' logs/baremetal.log
+$ qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal.elf
+QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)
+   text	   data	    bss	    dec	    hex	filename
+   9236	      0	  46216	  55452	   d89c	build/baremetal.elf
+Timer with period zero, disabling
+TLSF bare-metal test, Cortex-M3 (lm3s6965evb), TLSF_ALIGN=8 HDR=8 MIN_BLOCK=16 CTRL=968 sizeof(void*)=4
+[ RUN  ] t_init
+[  OK  ] t_init
+[ RUN  ] t_alignment
+[  OK  ] t_alignment
+[ RUN  ] t_split_coalesce
+[  OK  ] t_split_coalesce
+[ RUN  ] t_exhaustion
+  size 1: 1475 allocations until exhaustion, fully recovered
+  size 200: 113 allocations until exhaustion, fully recovered
+[  OK  ] t_exhaustion
+[ RUN  ] t_independent
+[  OK  ] t_independent
+[ RUN  ] t_fit_invariant
+  successful fits 6168, good-fit rejections 896
+[  OK  ] t_fit_invariant
+[ RUN  ] t_stress
+  seed 0xC0FFEE, 16 KiB heap: ops=30000 allocs=14982 failed_allocs=89
+[  OK  ] t_stress
+75096 checks, 0 failures
+BAREMETAL PASS
+qemu exit code: 0
+arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -g -Isrc -Itests -Ibaremetal -nostdlib -Wl,-T,baremetal/lm3s6965.ld -Wl,--gc-sections -ffunction-sections -Wl,-Map,build/baremetal_a4.map baremetal/startup.c baremetal/semihost.c baremetal/main.c src/tlsf.c tests/tlsf_check.c -lgcc -o build/baremetal_a4.elf -DTLSF_ALIGN_LOG2=2
+( echo '$ qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal_a4.elf'; qemu-system-arm --version | head -1; arm-none-eabi-size build/baremetal_a4.elf; timeout 60 qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal_a4.elf; rc=$?; echo "qemu exit code: $rc"; exit $rc ) 2>&1 | tee logs/baremetal_a4.log; \
+test ${PIPESTATUS[0]} -eq 0 && grep -q '^BAREMETAL PASS' logs/baremetal_a4.log
+$ qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal_a4.elf
+QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)
+   text	   data	    bss	    dec	    hex	filename
+   9252	      0	  46216	  55468	   d8ac	build/baremetal_a4.elf
+Timer with period zero, disabling
+TLSF bare-metal test, Cortex-M3 (lm3s6965evb), TLSF_ALIGN=4 HDR=8 MIN_BLOCK=16 CTRL=1036 sizeof(void*)=4
+[ RUN  ] t_init
+[  OK  ] t_init
+[ RUN  ] t_alignment
+[  OK  ] t_alignment
+[ RUN  ] t_split_coalesce
+[  OK  ] t_split_coalesce
+[ RUN  ] t_exhaustion
+  size 1: 1470 allocations until exhaustion, fully recovered
+  size 200: 113 allocations until exhaustion, fully recovered
+[  OK  ] t_exhaustion
+[ RUN  ] t_independent
+[  OK  ] t_independent
+[ RUN  ] t_fit_invariant
+  successful fits 11856, good-fit rejections 2240
+[  OK  ] t_fit_invariant
+[ RUN  ] t_stress
+  seed 0xC0FFEE, 16 KiB heap: ops=30000 allocs=14974 failed_allocs=101
+[  OK  ] t_stress
+85257 checks, 0 failures
+BAREMETAL PASS
+qemu exit code: 0
+arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -g -Isrc -Itests -Ibaremetal -nostdlib -Wl,-T,baremetal/lm3s6965.ld -Wl,--gc-sections -ffunction-sections -Wl,-Map,build/baremetal_neg.map baremetal/startup.c baremetal/semihost.c baremetal/main.c src/tlsf.c tests/tlsf_check.c -lgcc -o build/baremetal_neg.elf -DFORCE_FAIL
+{ ( echo '$ qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal_neg.elf'; qemu-system-arm --version | head -1; arm-none-eabi-size build/baremetal_neg.elf; timeout 60 qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal_neg.elf; rc=$?; echo "qemu exit code: $rc"; exit $rc ); rc=$?; \
+  if [ $rc -eq 1 ]; then echo "BAREMETAL NEGATIVE: QEMU exit code 1 as expected"; \
+  else echo "BAREMETAL NEGATIVE: unexpected QEMU exit code $rc"; exit 1; fi; \
+} 2>&1 | tee logs/baremetal_negative.log; \
+test ${PIPESTATUS[0]} -eq 0 && grep -q '^BAREMETAL FAIL' logs/baremetal_negative.log
+$ qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal_neg.elf
+QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)
+   text	   data	    bss	    dec	    hex	filename
+   9400	      0	  46216	  55616	   d940	build/baremetal_neg.elf
+Timer with period zero, disabling
+TLSF bare-metal test, Cortex-M3 (lm3s6965evb), TLSF_ALIGN=8 HDR=8 MIN_BLOCK=16 CTRL=968 sizeof(void*)=4
+[ RUN  ] t_init
+[  OK  ] t_init
+[ RUN  ] t_alignment
+[  OK  ] t_alignment
+[ RUN  ] t_split_coalesce
+[  OK  ] t_split_coalesce
+[ RUN  ] t_exhaustion
+  size 1: 1475 allocations until exhaustion, fully recovered
+  size 200: 113 allocations until exhaustion, fully recovered
+[  OK  ] t_exhaustion
+[ RUN  ] t_independent
+[  OK  ] t_independent
+[ RUN  ] t_fit_invariant
+  successful fits 6168, good-fit rejections 896
+[  OK  ] t_fit_invariant
+[ RUN  ] t_stress
+  seed 0xC0FFEE, 16 KiB heap: ops=30000 allocs=14982 failed_allocs=89
+[  OK  ] t_stress
+[ RUN  ] t_force_fail
+  CHECK FAILED line 330: TLSF_ALIGN == 0
+[ FAIL ] t_force_fail
+75097 checks, 1 failures
+BAREMETAL FAIL
+qemu exit code: 1
+BAREMETAL NEGATIVE: QEMU exit code 1 as expected
+python3 tools/plot.py logs docs 2>&1 | tee logs/plots.log; test ${PIPESTATUS[0]} -eq 0
+wrote docs/fragmentation.png
+wrote docs/opcounts.png
+measured maxima: {'malloc_ok': [3, 1, 1, 1, 1, 0], 'malloc_fail': [2, 0, 0, 0, 0, 0], 'free': [0, 1, 2, 2, 0, 2]}

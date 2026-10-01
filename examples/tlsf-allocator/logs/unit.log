@@ -1,0 +1,36 @@
+TLSF unit tests: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 CTRL=1904 FL_COUNT=14 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 7227
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 558, successful fits: 510097, good-fit rejections (block fits but class rounded above): 68608
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       541206       3       1       1         1      1         0
+malloc_fail      86476       2       0       0         0      0         0
+free            539284       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1774559 checks, 0 failures
+UNIT TESTS PASSED

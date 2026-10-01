@@ -1,0 +1,62 @@
+TLSF unit tests: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 CTRL=1904 FL_COUNT=14 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 7227
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 558, successful fits: 510097, good-fit rejections (block fits but class rounded above): 68608
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       541206       3       1       1         1      1         0
+malloc_fail      86476       2       0       0         0      0         0
+free            539284       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1774559 checks, 0 failures
+UNIT TESTS PASSED
+TLSF stress: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 sizeof(void*)=8
+
+== Part A: seeded randomized integrity stress ==
+stress seed=0xc0ffee heap=65536 ops=100000 allocs=46998 frees=46745 failed_allocs=6257 max_live=281 L_crosschecks=101 -> ok
+stress seed=0x5eed0001 heap=65536 ops=100000 allocs=46934 frees=46691 failed_allocs=6375 max_live=279 L_crosschecks=101 -> ok
+stress seed=0xdeadbeef heap=65536 ops=100000 allocs=46967 frees=46725 failed_allocs=6308 max_live=276 L_crosschecks=101 -> ok
+
+== Part B: fragmentation workloads (ext_frag = 1 - L/F, phys_frag = 1 - largest_free/F) ==
+  small_uniform: sizes U[8,256]
+  mixed: 70% U[16,128], 25% U[129,2048], 5% U[2049,16384]
+  pow2: 2^k, k U[3,12]
+  pressure: U[16,512], 2048 slots on 128 KiB (exhaustion)
+| workload | seed | heap | slots | ops | live requested | used footprint | free payload F | largest alloc L | largest free block | header+rounding overhead | final ext_frag | mean ext_frag | max ext_frag | final phys_frag | mean phys_frag | max phys_frag | failed/attempted allocs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small_uniform | 0x1001 | 262144 | 1024 | 100000 | 66462 | 78464 | 180768 | 163824 | 169240 | 12002 | 0.0937 | 0.0875 | 0.1264 | 0.0638 | 0.0555 | 0.1102 | 0/50253 |
+| mixed | 0x1002 | 262144 | 256 | 100000 | 86999 | 89888 | 169840 | 114672 | 117664 | 2889 | 0.3248 | 0.3811 | 0.7791 | 0.3072 | 0.3669 | 0.7710 | 0/50063 |
+| pow2 | 0x1003 | 262144 | 256 | 100000 | 92944 | 95376 | 164352 | 94192 | 94560 | 2432 | 0.4269 | 0.4376 | 0.6758 | 0.4246 | 0.4254 | 0.6634 | 0/50068 |
+| pressure | 0x1004 | 131072 | 2048 | 100000 | 107749 | 124448 | 3584 | 224 | 224 | 16699 | 0.9375 | 0.9311 | 0.9722 | 0.9375 | 0.9302 | 0.9722 | 31774/66247 |
+
+Operation-count maxima over the whole stress run:
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       326059       3       1       1         1      1         0
+malloc_fail      51017       2       0       0         0      0         0
+free            326059       0       1       2         2      0         2
+
+STRESS PASSED (0 errors)

@@ -1,0 +1,31 @@
+$ qemu-system-arm -M lm3s6965evb -nographic -monitor none -serial none -semihosting-config enable=on,target=native -kernel build/baremetal_neg.elf
+QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)
+   text	   data	    bss	    dec	    hex	filename
+   9400	      0	  46216	  55616	   d940	build/baremetal_neg.elf
+Timer with period zero, disabling
+TLSF bare-metal test, Cortex-M3 (lm3s6965evb), TLSF_ALIGN=8 HDR=8 MIN_BLOCK=16 CTRL=968 sizeof(void*)=4
+[ RUN  ] t_init
+[  OK  ] t_init
+[ RUN  ] t_alignment
+[  OK  ] t_alignment
+[ RUN  ] t_split_coalesce
+[  OK  ] t_split_coalesce
+[ RUN  ] t_exhaustion
+  size 1: 1475 allocations until exhaustion, fully recovered
+  size 200: 113 allocations until exhaustion, fully recovered
+[  OK  ] t_exhaustion
+[ RUN  ] t_independent
+[  OK  ] t_independent
+[ RUN  ] t_fit_invariant
+  successful fits 6168, good-fit rejections 896
+[  OK  ] t_fit_invariant
+[ RUN  ] t_stress
+  seed 0xC0FFEE, 16 KiB heap: ops=30000 allocs=14982 failed_allocs=89
+[  OK  ] t_stress
+[ RUN  ] t_force_fail
+  CHECK FAILED line 330: TLSF_ALIGN == 0
+[ FAIL ] t_force_fail
+75097 checks, 1 failures
+BAREMETAL FAIL
+qemu exit code: 1
+BAREMETAL NEGATIVE: QEMU exit code 1 as expected

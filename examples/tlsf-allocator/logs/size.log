@@ -1,0 +1,36 @@
+$ arm-none-eabi-gcc -std=c99 -mcpu=cortex-m3 -mthumb -Os -ffreestanding -Wall -Wextra -Wpedantic -Werror -c src/tlsf.c -o build/tlsf_m3.o
+arm-none-eabi-gcc (15:13.2.rel1-2) 13.2.1 20231009
+$ arm-none-eabi-size build/tlsf_m3.o
+   text	   data	    bss	    dec	    hex	filename
+    692	      0	      0	    692	    2b4	build/tlsf_m3.o
+$ arm-none-eabi-size -A build/tlsf_m3.o
+build/tlsf_m3.o  :
+section           size   addr
+.text              692      0
+.data                0      0
+.bss                 0      0
+.comment            39      0
+.ARM.attributes     45      0
+Total              776
+
+
+$ arm-none-eabi-nm -u build/tlsf_m3.o  (undefined symbols)
+(end of undefined symbols)
+$ arm-none-eabi-nm -S --size-sort build/tlsf_m3.o
+00000000 0000000a t call_hook
+00000144 0000000a T tlsf_set_lock
+0000000a 00000028 t mapping
+00000032 0000004a t insert_free
+0000007c 00000056 t remove_free
+000000d2 00000072 T tlsf_init
+00000234 0000007e T tlsf_free
+0000014e 000000e6 T tlsf_malloc
+TLSF_ALIGN_LOG2=2:
+    704	      0	      0	    704	    2c0	build/tlsf_m3_a2.o
+TLSF_ALIGN_LOG2=4:
+    692	      0	      0	    692	    2b4	build/tlsf_m3_a4.o
+TLSF_ALIGN_LOG2=5:
+    696	      0	      0	    696	    2b8	build/tlsf_m3_a5.o
+CLZ/RBIT instructions in generated code:
+5
+SIZE CHECK PASS: text=692 < 2048

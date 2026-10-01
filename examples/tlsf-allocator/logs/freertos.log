@@ -1,0 +1,9 @@
+kernel V11.1.0+, port ThirdParty/GCC/Posix, 4 workers x 50000 iterations, heap 65536 bytes, elapsed 167 ticks
+worker 0: allocs=25005 frees=25005 failed_allocs=16 max_live_bytes=23309 errors=0
+worker 1: allocs=25007 frees=25007 failed_allocs=7 max_live_bytes=22239 errors=0
+worker 2: allocs=25006 frees=25006 failed_allocs=6 max_live_bytes=24445 errors=0
+worker 3: allocs=25005 frees=25005 failed_allocs=12 max_live_bytes=23589 errors=0
+lock hooks: lock=200087 unlock=200087 contended=231 overlaps=0
+concurrent heap inspections: 8, errors: 0
+final heap: inspector=0 free_blocks=1 used_blocks=0 free_payload=63624 (initial 63624)
+FREERTOS TEST PASS

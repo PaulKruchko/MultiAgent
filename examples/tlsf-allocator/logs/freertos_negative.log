@@ -1,0 +1,3 @@
+NEGATIVE CONTROL: caught signal 11, lock hooks: lock=19468 unlock=19467 overlaps=768
+exit code: 139
+NEGATIVE CONTROL OK: failing run with overlapping allocator entries reported

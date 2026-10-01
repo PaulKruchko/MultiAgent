@@ -1,0 +1,14 @@
+$ arm-none-eabi-objdump -d build/tlsf_m3.o > build/tlsf_m3.dis
+$ python3 tools/check_branches.py build/tlsf_m3.dis
+function       insns CFG cycles (loops)     indirect  direct calls
+call_hook          4 none                          1  -
+mapping           16 none                          0  -
+insert_free       30 none                          0  mapping
+remove_free       33 none                          0  mapping
+tlsf_init         43 100->fa,10e->108              0  insert_free
+tlsf_set_lock      3 none                          0  -
+tlsf_malloc       87 none                          0  call_hook,insert_free,mapping,remove_free
+tlsf_free         47 none                          0  call_hook,insert_free,remove_free
+tlsf_malloc: reachable functions ['call_hook', 'insert_free', 'mapping', 'remove_free', 'tlsf_malloc'] (indirect calls = lock hooks via call_hook)
+tlsf_free: reachable functions ['call_hook', 'insert_free', 'mapping', 'remove_free', 'tlsf_free'] (indirect calls = lock hooks via call_hook)
+LOOP/RECURSION AUDIT PASS
