@@ -9,6 +9,7 @@ import re
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -17,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from maf import __version__, chatgpt, mcp_server
+from maf import __version__, chatgpt, config, mcp_server
 from maf.chatgpt import Layout, UnitParams
 from maf.config import Settings
 from maf.mcp_server import RunManager, build_server
@@ -131,6 +132,72 @@ def test_mcp_unit_carries_the_settings_sources(layout: Layout, tmp_path: Path) -
         chatgpt.settings_sources(config=None, vault=None, workspaces=None, environ={"MAF_BUDGET_USD": "lots"})
 
 
+def _installed_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """maf as a non-editable install: no source checkout, so its default workspaces and inbox follow XDG_DATA_HOME."""
+    package = tmp_path / "lib" / "site-packages" / "maf"
+    package.mkdir(parents=True)
+    monkeypatch.setattr(config, "PACKAGE_DIR", package)
+    assert config.source_checkout() is None
+
+
+def _unit_environment(unit: str) -> dict[str, str]:
+    return dict(line.removeprefix("Environment=").split("=", 1)
+                for line in unit.splitlines() if line.startswith("Environment="))
+
+
+def test_an_installed_copy_passes_its_xdg_data_home_to_the_unit(
+    layout: Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The systemd user manager has no XDG_DATA_HOME: without it in the unit, the service of an installed copy would use
+    ~/.local/share/maf while setup created the inbox (and the CLI keeps workspaces) under the shell's value."""
+    _installed_copy(monkeypatch, tmp_path)
+    data = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", f"{data}/")
+    settings = Settings(vault_path=tmp_path / "vault")
+    assert settings.mcp_inbox == data / "maf" / "inbox"
+    args, environment = chatgpt.settings_sources(config=None, vault=None, workspaces=None, environ=os.environ)
+    assert (args, environment) == ((), (("XDG_DATA_HOME", str(data)),))
+    params = chatgpt.default_params(settings, layout, maf_command=("/opt/maf/bin/maf",), serve_args=args,
+                                    environment=environment)
+    unit_env = _unit_environment(chatgpt.render_mcp_unit(params))
+    assert unit_env["XDG_DATA_HOME"] == str(data)
+    # What the service computes from the unit's environment alone is what setup and the CLI use.
+    assert config.data_home(unit_env) / "inbox" == settings.mcp_inbox
+    assert config.data_home(unit_env) / "workspaces" == settings.workspaces_path
+
+    assert chatgpt.setup(settings, layout=layout, params=params, reload=False, out=io.StringIO()) == 0
+    assert settings.mcp_inbox is not None and settings.mcp_inbox.is_dir()
+    assert chatgpt.installed_serve_sources(layout) == {"XDG_DATA_HOME": str(data)}
+    before = (layout.unit_dir / chatgpt.MCP_UNIT).read_text()
+
+    monkeypatch.delenv("XDG_DATA_HOME")  # another shell, or a script, without it: refused, not silently moved
+    rerun = chatgpt.default_params(Settings(vault_path=tmp_path / "vault"), layout, maf_command=("/opt/maf/bin/maf",),
+                                   environment=chatgpt.settings_sources(config=None, vault=None, workspaces=None,
+                                                                        environ=os.environ)[1])
+    assert rerun.environment == ()
+    with pytest.raises(ValueError, match=rf"runs with XDG_DATA_HOME={re.escape(str(data))}, which this setup was not "
+                                         r"given: .*MAF_\* and XDG_DATA_HOME variables"):
+        chatgpt.setup(settings, layout=layout, params=rerun, reload=False, out=io.StringIO())
+    assert (layout.unit_dir / chatgpt.MCP_UNIT).read_text() == before
+
+    monkeypatch.setattr(config, "PACKAGE_DIR", Path(chatgpt.__file__).resolve().parent)  # setup run from a checkout
+    assert chatgpt.setup(settings, layout=layout, params=rerun, reload=False, out=io.StringIO()) == 0
+    assert "XDG_DATA_HOME" not in _unit_environment((layout.unit_dir / chatgpt.MCP_UNIT).read_text())
+
+
+@pytest.mark.parametrize("xdg", ["", "relative/data"])
+def test_xdg_data_home_reaches_the_unit_only_when_the_defaults_use_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, xdg: str
+) -> None:
+    """A checkout keeps its data in the checkout whatever XDG_DATA_HOME says, and the XDG spec ignores an empty or
+    relative value: none of them goes into the unit."""
+    sources = {"config": None, "vault": None, "workspaces": None}
+    assert config.source_checkout() is not None  # the tests run from this checkout
+    assert chatgpt.settings_sources(**sources, environ={"XDG_DATA_HOME": str(tmp_path)}) == ((), ())
+    _installed_copy(monkeypatch, tmp_path)
+    assert chatgpt.settings_sources(**sources, environ={"XDG_DATA_HOME": xdg}) == ((), ())
+
+
 @pytest.mark.parametrize("bad", ["/home/u/My Projects/maf", "/opt/$HOME/maf", "/opt/100%/maf", '/opt/"q"/maf'])
 def test_unit_words_that_need_escaping_are_refused(layout: Layout, bad: str) -> None:
     with pytest.raises(ValueError, match="systemd unit"):
@@ -140,6 +207,22 @@ def test_unit_words_that_need_escaping_are_refused(layout: Layout, bad: str) -> 
 def test_default_maf_command_is_the_venv_script() -> None:
     command = chatgpt.default_maf_command()
     assert command[0].endswith("/maf") or command[1:] == ("-m", "maf.cli")
+
+
+def test_setup_units_follow_the_venv_maf_runs_from(
+    layout: Layout, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No checkout location is assumed: the unit runs the maf next to the running interpreter, here a checkout outside
+    ``~/MultiAgent``; without that script it runs ``python -m maf.cli`` with the same interpreter."""
+    venv_bin = layout.home / "src" / "maf-checkout" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    monkeypatch.setattr(sys, "executable", str(venv_bin / "python3"))
+    (venv_bin / "maf").touch()
+    unit = _directives(chatgpt.render_mcp_unit(chatgpt.default_params(settings, layout)))
+    assert unit["ExecStart"].startswith("%h/src/maf-checkout/.venv/bin/maf serve ")
+    (venv_bin / "maf").unlink()
+    unit = _directives(chatgpt.render_mcp_unit(chatgpt.default_params(settings, layout)))
+    assert unit["ExecStart"].startswith("%h/src/maf-checkout/.venv/bin/python3 -m maf.cli serve ")
 
 
 def test_layout_respects_xdg_config_home(tmp_path: Path) -> None:

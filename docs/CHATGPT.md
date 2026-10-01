@@ -112,7 +112,8 @@ What stands between the internet and your machine:
    (`maf resume RUN_ID --budget USD` continues a run ChatGPT started) or raise `mcp_max_budget_usd`.
 
 5. **Input files only from the inbox.** `files` must be absolute paths that resolve inside `mcp_inbox`
-   (`~/MultiAgent/inbox` by default; `null` disables files over MCP). maf refuses:
+   (`<checkout>/inbox` by default, so `~/MultiAgent/inbox` for a clone there; `null` disables files over MCP). maf
+   refuses:
    - relative paths and missing files;
    - symlinks that resolve outside the inbox;
    - hidden files and directories;
@@ -121,9 +122,10 @@ What stands between the internet and your machine:
 
    Every refusal is the same message, `not an allowed inbox file: <the path you gave>`. The confinement check runs
    before any existence check, so a caller learns nothing about files outside the inbox: not whether they exist, not
-   where a symlink points. The details go to maf's debug log only. The default inbox is inside the repo checkout;
-   `.gitignore` keeps it out of commits, and `maf chatgpt setup` creates it with mode 0700. The review gate is off for
-   MCP runs.
+   where a symlink points. The details go to maf's debug log only. The default inbox is inside the source checkout
+   maf runs from, where `.gitignore` keeps it out of commits (an installed, non-editable copy uses
+   `$XDG_DATA_HOME/maf/inbox`, else `~/.local/share/maf/inbox`), and `maf chatgpt setup` creates it with mode 0700. The review gate is off for MCP
+   runs.
 6. **Strict run ids.** A `run_id` becomes a path component, so only `[A-Za-z0-9._-]` is accepted, and `..` is
    refused.
 7. **DNS-rebinding protection pinned to exactly what tunnel-client sends.** tunnel-client sends
@@ -193,8 +195,11 @@ The limits below were measured on this host (Ubuntu 24.04, systemd 255,
 
 ### Prerequisites
 
-- maf works from the CLI (`.venv/bin/maf list`), and this repo is at `~/MultiAgent`. Otherwise `maf chatgpt setup`
-  writes the real paths into the units.
+- maf works from the CLI (`.venv/bin/maf list` in your checkout). The checkout can be anywhere: `maf chatgpt setup`
+  writes the `maf` of the venv it runs from into the units, and the service's defaults (workspaces, inbox, Python)
+  follow that checkout, as the CLI's do. A non-editable install has no checkout: its workspaces and inbox default to
+  `$XDG_DATA_HOME/maf/` (else `~/.local/share/maf/`), and since the systemd user manager does not have your shell's
+  `XDG_DATA_HOME`, setup writes an absolute one into the unit as `Environment=XDG_DATA_HOME=...`.
 - A ChatGPT plan with Developer mode on the web. OpenAI's developer docs list Pro, Plus, Business, Enterprise and Edu.
   Some Help Center wording reportedly limits full (write) MCP to Business/Enterprise/Edu. If `start_run` is missing
   or blocked on a personal plan, that is the reason.
@@ -254,10 +259,14 @@ reaches the running units.
    `~/.config/systemd/user/`, with the port from your config, and runs `systemctl --user daemon-reload`. Settings
    sources you give setup reach the service: `maf --config FILE chatgpt setup` (or `MAF_CONFIG`, and likewise
    `--vault`/`MAF_VAULT`, `--workspaces`/`MAF_WORKSPACES`) puts them into the unit's `ExecStart`, and
-   `MAF_BUDGET_USD` into an `Environment=` line. A re-run that leaves out a source the installed unit has is refused
-   rather than silently pointing the service at other settings (the wizard passes the unit's own sources on). A
+   `MAF_BUDGET_USD` into an `Environment=` line, as well as `XDG_DATA_HOME` when maf is a non-editable install (its
+   default workspaces and inbox live there; a checkout's do not). A re-run that leaves out a source the installed unit
+   has is refused rather than silently pointing the service at other settings (the wizard passes the unit's own
+   sources on; a re-run from a checkout may drop `XDG_DATA_HOME`, which it does not use). A
    re-run keeps the installed tunnel-client path and health port unless you pass `--tunnel-client`/`--health-port`. If a changed unit is running, setup says so: it keeps the old
-   definition until restarted. `contrib/systemd/` holds the same units for the default layout. Customize with
+   definition until restarted. `ExecStart` runs the `maf` next to the Python that ran setup (your checkout's venv),
+   so run setup with the checkout you want served. `contrib/systemd/` holds the same units rendered for an example
+   checkout at `~/MultiAgent`. Customize with
    `systemctl --user edit <unit>`, because a drop-in survives re-running setup.
 3. **Platform, tunnel.** Open <https://platform.openai.com/settings/organization/tunnels>.
    - If it says "Tunnels access required", an org owner grants you Tunnels Read + Manage (to create) and Read + Use
@@ -383,12 +392,13 @@ all. Instead, tunnel-client gets only `tunnel.env`, and maf loads `maf.env` itse
 file that group or others can read, and drops tunnel-client's `CONTROL_PLANE_*` variables from its own environment):
 
 ```bash
+cd ~/MultiAgent                                       # your checkout: tunnel-client spawns its venv's maf
 systemctl --user stop --no-block maf-tunnel maf-mcp   # one tunnel-client per tunnel id, and one maf serve per vault
 (
   set -a; . ~/.config/maf/tunnel.env; set +a          # CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY
   exec env -u OPENAI_API_KEY -u OPENAI_ADMIN_KEY -u GEMINI_API_KEY -u GOOGLE_API_KEY -u ANTHROPIC_API_KEY \
     ~/.local/bin/tunnel-client run \
-    --mcp.command "$HOME/MultiAgent/.venv/bin/maf serve --stdio --env-file $HOME/.config/maf/maf.env" \
+    --mcp.command "$PWD/.venv/bin/maf serve --stdio --env-file $HOME/.config/maf/maf.env" \
     --health.listen-addr 127.0.0.1:8766
 )
 ```
@@ -465,7 +475,8 @@ provider keys in the environment, no `start_run` that could spend):
   `/run/user/<uid>`.
 - `tunnel-client doctor` with the unit's flags fails exactly `mcp_server_reachable,oauth_metadata` (it ignores
   `unix-socket=`), which the wizard reports as expected.
-- The rendered units, with `--config` and `MAF_BUDGET_USD`, pass `systemd-analyze --user verify`.
+- The rendered units, with `--config` and `MAF_BUDGET_USD`, pass `systemd-analyze --user verify` (re-checked on
+  2026-10-01 with the `Environment=XDG_DATA_HOME=` line a non-editable install gets).
 
 Assumed, or checkable only with your accounts:
 

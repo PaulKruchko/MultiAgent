@@ -235,8 +235,9 @@ unit_config() {
   printf '%s' "${config:-$CONFIG_DIR/config.yaml}"
 }
 
-# Settings sources for `maf chatgpt setup`: the installed unit's --config/--vault/--workspaces and MAF_BUDGET_USD,
-# unless this shell sets the matching MAF_* variable. setup refuses to drop a source the unit has.
+# Settings sources for `maf chatgpt setup`: the installed unit's --config/--vault/--workspaces, MAF_BUDGET_USD and
+# XDG_DATA_HOME (an installed maf's data directory), unless this shell sets the matching variable. setup refuses to drop
+# a source the unit has.
 SETUP_ARGS=()
 setup_sources() {
   local option variable value
@@ -246,8 +247,10 @@ setup_sources() {
     value="$(unit_option "--$option")"
     [[ -z "${!variable:-}" && -n "$value" ]] && SETUP_ARGS+=("--$option" "$value")
   done
-  value="$(grep -oE '^Environment=MAF_BUDGET_USD=[^ ]+' "$UNIT_DIR/maf-mcp.service" 2>/dev/null | cut -d= -f3 || true)"
-  if [[ -z "${MAF_BUDGET_USD:-}" && -n "$value" ]]; then export MAF_BUDGET_USD="$value"; fi
+  for variable in MAF_BUDGET_USD XDG_DATA_HOME; do
+    value="$(grep -oE "^Environment=$variable=[^ ]+" "$UNIT_DIR/maf-mcp.service" 2>/dev/null | cut -d= -f3- || true)"
+    if [[ -z "${!variable:-}" && -n "$value" ]]; then export "$variable=$value"; fi
+  done
   return 0
 }
 

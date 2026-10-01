@@ -33,7 +33,9 @@ Sandbox: the subprocess cwd is ``workspaces/<run_id>/``. Writes outside it are p
 
 File tools are allowed only with a workspace scope (``Read(./**)``, ``Edit(./**)``, ``Write(./**)``;
 ``check_scoped_tools`` rejects bare rules), and ``SENSITIVE_READ_PATHS`` are denied to both the file tools
-(``permissions.deny``) and sandboxed Bash (``sandbox.filesystem.denyRead``).
+(``permissions.deny``) and sandboxed Bash (``sandbox.filesystem.denyRead``). The tool and ``TMPDIR`` length rules live
+in ``maf.sandbox``, so settings apply the same ones when they load (``Settings.claude_code_tools`` and
+``claude_code_tmp_base``), before a run spends anything.
 
 The subprocess env is built from an allowlist (``PATH``, ``HOME``, locale...), so credentials and ``CLAUDECODE``
 (nested-session detection) never reach it. ``ANTHROPIC_API_KEY`` is NOT in the env either (sandboxed Bash
@@ -67,7 +69,6 @@ import json
 import math
 import os
 import re
-import secrets
 import shlex
 import shutil
 import signal
@@ -92,14 +93,18 @@ from maf.providers.base import (
     token_worst_case,
 )
 from maf.providers.claude_provider import DEFAULT_EFFORT, usage_from_message
+from maf.sandbox import (
+    CLI_CHILD_TMPDIR_MAX_BYTES,
+    DEFAULT_TMP_BASE,
+    check_scoped_tools,
+    max_tmpdir_bytes,
+    scratch_tmpdir,
+)
 from maf.types import AgentName, ProviderName
 
 PROVIDER: ProviderName = "claude_code"
 DISALLOWED_TOOLS: tuple[str, ...] = ("WebFetch", "WebSearch")
 STDERR_TAIL_CHARS = 2_000
-
-PATH_SCOPED_TOOLS = frozenset({"Read", "Edit", "Write", "MultiEdit", "NotebookEdit"})
-"""File tools whose allow rules must carry a path scope: a bare rule matches every path on the machine."""
 
 ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ")
 """Inherited variables passed to the CLI (plus ``LC_*``). Everything else, such as
@@ -160,17 +165,6 @@ host, and runs passed the sandbox preflight)."""
 
 DEFAULT_TURN_CONTEXT_TOKENS = 200_000
 DEFAULT_TURN_OUTPUT_TOKENS = 64_000
-
-DEFAULT_TMP_BASE = Path("/tmp")
-TMPDIR_RANDOM_BYTES = 6
-"""``TMPDIR`` is ``<tmp_base>/maf-<12 random hex>``: 21 bytes under ``/tmp``."""
-CLI_CHILD_TMPDIR_MAX_BYTES = 44
-"""Claude Code 2.1.284 (``HXn`` in the binary) exports ``TMPDIR=<TMPDIR>/claude-<uid>`` to sandboxed commands, sized
-to at most 44 bytes so their own sockets keep 63 of the 108 ``sun_path`` bytes. A longer one is still used (without
-``CLAUDE_CODE_TMPDIR`` the CLI's fallback is the same directory), so ``check_tmpdir`` enforces the budget. It binds
-before the runtime's own sockets do: they add at most 35 bytes to ``TMPDIR`` (``claude-socks-<16 hex>.sock``;
-``srt-obs-*/s<8 hex>.sock`` and ``srt-mux-<pid>-<n>.sock`` are shorter), and ``cc-socks``/daemon sockets move to
-``/tmp`` on their own."""
 
 SANDBOX_FAILURE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bsandbox (?:is required but |has |had )?failed to initiali[sz]e", re.IGNORECASE),
@@ -347,28 +341,9 @@ def builtin_tools(allowed: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def check_scoped_tools(tools: Sequence[str]) -> None:
-    """``ValueError`` for a bare ``Read``/``Edit``/``Write``-style allow rule (it would grant every path)."""
-    bare = [t for t in tools if t.strip() in PATH_SCOPED_TOOLS]
-    if bare:
-        raise ValueError(f"file tool rules need a path scope such as 'Edit(./**)': {', '.join(bare)}")
-
-
 def format_budget(usd: float) -> str:
     """Round *down* to 1/100 cent so the CLI cap never exceeds the ledger's clamp."""
     return f"{math.floor(usd * 10_000) / 10_000:.4f}"
-
-
-def scratch_tmpdir(base: Path = DEFAULT_TMP_BASE) -> Path:
-    """A new random ``<base>/maf-<12 hex>`` path (not created). Not derived from the workspace: the ``--settings``
-    argv shows the name to every local user, and a predictable one could be created first by someone else."""
-    return base / f"maf-{secrets.token_hex(TMPDIR_RANDOM_BYTES)}"
-
-
-def max_tmpdir_bytes(uid: int | None = None) -> int:
-    """Longest ``TMPDIR`` (in bytes) whose ``<TMPDIR>/claude-<uid>`` fits ``CLI_CHILD_TMPDIR_MAX_BYTES``: 32 for a
-    4-digit uid. ``uid`` defaults to ``os.getuid()``."""
-    return CLI_CHILD_TMPDIR_MAX_BYTES - len(f"/claude-{os.getuid() if uid is None else uid}")
 
 
 def check_tmpdir(tmpdir: Path) -> None:

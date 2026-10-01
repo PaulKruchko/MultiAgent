@@ -3,14 +3,16 @@
 Owner: orchestration.
 
 Two systemd user units (docs/CHATGPT.md explains the whole setup):
-- ``maf-mcp.service``: ``maf serve --host 127.0.0.1 --port <mcp_port> --uds %t/maf/mcp.sock`` from the project venv,
-  plus ``--config``/``--vault``/``--workspaces`` and ``MAF_BUDGET_USD`` when setup was given them. It serves HTTP on a
-  0600 Unix socket in ``RuntimeDirectory=maf`` (``$XDG_RUNTIME_DIR/maf``, 0700), not on a TCP port: a loopback port is
-  open to every local user and to containers on the host network, a socket in the owner's runtime directory only to
-  the owner. Provider keys come from ``~/.config/maf/maf.env`` (services do not read ``~/.bashrc``). SIGTERM goes to
-  maf only (``KillMode=mixed``): it stops serving at once and the in-flight run stops at its next stage boundary, for
-  up to ``TimeoutStopSec`` (``mcp_stop_timeout``: the longest stage, derived from ``claude_code_timeout_s``). Exit 2
-  (usage or configuration error) is not restarted.
+- ``maf-mcp.service``: ``maf serve --host 127.0.0.1 --port <mcp_port> --uds %t/maf/mcp.sock`` with the ``maf`` of the
+  venv setup runs from (``default_maf_command``, wherever the checkout is), plus ``--config``/``--vault``/
+  ``--workspaces`` and ``MAF_BUDGET_USD`` when setup was given them, and for an installed copy (no source checkout)
+  an absolute ``XDG_DATA_HOME``, under which its default workspaces and inbox live (``settings_sources``). It serves
+  HTTP on a 0600 Unix socket in ``RuntimeDirectory=maf`` (``$XDG_RUNTIME_DIR/maf``, 0700), not on a TCP port: a
+  loopback port is open to every local user and to containers on the host network, a socket in the owner's runtime
+  directory only to the owner. Provider keys come from ``~/.config/maf/maf.env`` (services do not read ``~/.bashrc``).
+  SIGTERM goes to maf only (``KillMode=mixed``): it stops serving at once and the in-flight run stops at its next stage
+  boundary, for up to ``TimeoutStopSec`` (``mcp_stop_timeout``: the longest stage, derived from
+  ``claude_code_timeout_s``). Exit 2 (usage or configuration error) is not restarted.
 - ``maf-tunnel.service``: ``tunnel-client run`` with the upstream ``url=http://127.0.0.1:<mcp_port>/mcp,
   unix-socket=%t/maf/mcp.sock`` (tunnel-client dials the socket and sends ``Host: 127.0.0.1:<mcp_port>``), the tunnel
   id and runtime key from ``~/.config/maf/tunnel.env``. ``Requires=``/``After=`` maf-mcp, so tunnel restarts never touch
@@ -52,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from maf.config import Settings
+from maf.config import Settings, source_checkout, xdg_data_home
 from maf.redact import KEY_VARIABLES as KEY_VARIABLES  # re-exported: removed from tunnel-client's environment
 from maf.redact import LOG_PATTERNS, known_secrets
 from maf.redact import redact as _redact
@@ -98,6 +100,10 @@ MCP_SOCKET_UNIT_PATH = f"%t/{RUNTIME_SUBDIR}/{MCP_SOCKET_NAME}"
 """The MCP socket as both units name it (``%t`` is ``$XDG_RUNTIME_DIR`` in a user unit)."""
 MAF_ENV_VARIABLES = ("MAF_BUDGET_USD",)
 """Settings environment variables without a ``maf serve`` flag; setup copies them into the unit as ``Environment=``."""
+DATA_HOME_VARIABLE = "XDG_DATA_HOME"
+"""Where an installed copy of maf (no source checkout) keeps its default ``workspaces_path`` and ``mcp_inbox``
+(``maf.config.data_home``). The systemd user manager normally has no ``XDG_DATA_HOME``, so setup copies an absolute one
+into the unit as ``Environment=`` (``settings_sources``), or the service and the CLI would use different trees."""
 
 _UNIT_WORD_RE = re.compile(r"[A-Za-z0-9_@%+=:,./\[\]-]+")
 _SPECIFIER_PREFIXES = ("%h", "%t")
@@ -173,7 +179,7 @@ class UnitParams:
     serve_args: tuple[str, ...] = ()
     """Extra ``maf serve`` arguments naming where settings come from (``settings_sources``), e.g. ``--config <path>``."""
     environment: tuple[tuple[str, str], ...] = ()
-    """``Environment=`` pairs for maf-mcp (``MAF_BUDGET_USD``; ``settings_sources``)."""
+    """``Environment=`` pairs for maf-mcp (``MAF_BUDGET_USD``, ``XDG_DATA_HOME``; ``settings_sources``)."""
     stop_timeout: str = MCP_STOP_TIMEOUT
     """maf-mcp ``TimeoutStopSec`` (``mcp_stop_timeout`` of the settings' ``claude_code_timeout_s``)."""
 
@@ -245,7 +251,9 @@ def settings_sources(
 ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     """``(serve_args, environment)`` that make the unit's ``maf serve`` read the settings this setup read: the
     ``--config``/``--vault``/``--workspaces`` options, else ``MAF_CONFIG``/``MAF_VAULT``/``MAF_WORKSPACES`` (as absolute
-    paths), and ``MAF_BUDGET_USD``. Nothing when none is set, so the default unit names no config at all."""
+    paths), and ``MAF_BUDGET_USD``. When maf runs without a source checkout (``maf.config.source_checkout``), also an
+    absolute ``XDG_DATA_HOME`` (``DATA_HOME_VARIABLE``): the default ``workspaces_path`` and ``mcp_inbox`` follow it
+    there, and a checkout's defaults do not. Nothing when none is set, so the default unit names no config at all."""
     args: list[str] = []
     for option, given, variable in (("--config", config, "MAF_CONFIG"), ("--vault", vault, "MAF_VAULT"),
                                     ("--workspaces", workspaces, "MAF_WORKSPACES")):
@@ -260,11 +268,15 @@ def settings_sources(
                 environment.append((variable, f"{float(value):g}"))
             except ValueError:
                 raise ValueError(f"{variable} must be a number, got {value!r}") from None
+    if source_checkout() is None and (data := xdg_data_home(environ)) is not None:
+        environment.append((DATA_HOME_VARIABLE, str(data)))
     return tuple(args), tuple(environment)
 
 
 def contrib_params() -> UnitParams:
-    """The default layout ``contrib/systemd/`` is rendered for: repo at ``~/MultiAgent``, port 8765."""
+    """The example layout ``contrib/systemd/`` is rendered for: a checkout at ``~/MultiAgent``, port 8765. ``setup``
+    renders the installed units from the running maf instead (``default_params``: ``default_maf_command`` and the
+    settings), so a checkout anywhere else gets its own paths."""
     home = CONTRIB_HOME
     return UnitParams(
         maf_command=(str(home / "MultiAgent" / ".venv" / "bin" / "maf"),),
@@ -508,7 +520,8 @@ def setup(
     if dropped := dropped_sources(layout, params):
         raise ValueError(
             f"the installed {MCP_UNIT} runs with {', '.join(dropped)}, which this setup was not given: pass the same "
-            "(global options before `chatgpt`, or MAF_* variables), or other values to change them"
+            f"(global options before `chatgpt`, or MAF_* and {DATA_HOME_VARIABLE} variables), or other values to "
+            "change them"
         )
     units = render_units(params)  # may raise ValueError before anything is written
 
@@ -727,7 +740,7 @@ SOURCE_OPTIONS = ("--config", "--vault", "--workspaces")
 
 def installed_serve_sources(layout: Layout) -> dict[str, str]:
     """The settings sources the installed maf-mcp.service runs with: ``{"--config": path, ...,
-    "MAF_BUDGET_USD": value}`` (paths with ``%h`` expanded), or ``{}``."""
+    "MAF_BUDGET_USD": value, "XDG_DATA_HOME": path}`` (``ExecStart`` paths with ``%h`` expanded), or ``{}``."""
     unit = layout.unit_dir / MCP_UNIT
     words = _exec_start(unit)
     found = {opt: str(layout.expand(value)) for opt in SOURCE_OPTIONS if (value := _option(words, opt)) is not None}
@@ -735,7 +748,7 @@ def installed_serve_sources(layout: Layout) -> dict[str, str]:
         text = unit.read_text(encoding="utf-8")
     except OSError:
         return found
-    for variable in MAF_ENV_VARIABLES:
+    for variable in (*MAF_ENV_VARIABLES, DATA_HOME_VARIABLE):
         if match := re.search(rf"^Environment={variable}=(\S+)$", text, re.MULTILINE):
             found[variable] = match.group(1)
     return found
@@ -743,9 +756,13 @@ def installed_serve_sources(layout: Layout) -> dict[str, str]:
 
 def dropped_sources(layout: Layout, params: UnitParams) -> list[str]:
     """Settings sources of the installed maf-mcp.service that ``params`` leave out. Re-rendering without them would
-    silently point the service at other settings (another config, vault or budget)."""
+    silently point the service at other settings (another config, vault or budget, or for an installed copy other
+    default workspaces and inbox). The unit's ``XDG_DATA_HOME`` only counts while maf has no source checkout: a
+    checkout's defaults ignore it, so setup run from one may drop it."""
     given = {params.serve_args[i]: params.serve_args[i + 1] for i in range(0, len(params.serve_args) - 1, 2)}
     given |= dict(params.environment)
+    if source_checkout() is not None:
+        given.setdefault(DATA_HOME_VARIABLE, "")
     return [f"{key} {value}" if key.startswith("--") else f"{key}={value}"
             for key, value in installed_serve_sources(layout).items() if key not in given]
 

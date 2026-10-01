@@ -5,27 +5,63 @@ Owner: core (config + ledger).
 Settings resolve in this order (later wins): built-in defaults, then
 ``~/.config/maf/config.yaml`` (or ``$MAF_CONFIG``), then environment variables
 (``MAF_VAULT``, ``MAF_WORKSPACES``, ``MAF_BUDGET_USD``), then explicit keyword overrides (CLI flags).
+
+Settings are checked when they load, before a run spends anything: unknown keys (nested blocks included), model IDs
+without a price today, a ``claude_code_tmp_base`` too long for the sandbox's sockets and unscoped file-tool rules are
+all errors. A missing ``python_executable`` is only a warning (``python_executable_warning``).
+
+The defaults follow the installation: ``python_executable`` is the interpreter running maf, and ``workspaces/`` and
+``inbox/`` live in the source checkout maf runs from (``source_checkout``; a clone at ``~/MultiAgent`` keeps
+``~/MultiAgent/workspaces``), or under ``$XDG_DATA_HOME/maf`` (``~/.local/share/maf``) for an installed copy.
 """
 
 from __future__ import annotations
 
+import difflib
+import logging
 import math
 import os
 import re
+import sys
+import tomllib
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import date
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
-from maf.types import AgentName, StageName, Tier, Usage
+from maf.sandbox import DEFAULT_TMP_BASE, check_scoped_tools, check_tmp_base
+from maf.types import STAGE_ORDER, AgentName, StageName, Tier, Usage
+
+log = logging.getLogger(__name__)
 
 ModelRole = Literal["chatgpt", "gemini", "claude", "claude_code"]
 """The four model slots. ``claude`` = Messages API, ``claude_code`` = headless ``claude -p``."""
 
+MODEL_ROLES: tuple[ModelRole, ...] = get_args(ModelRole)
 
-class ModelPins(BaseModel):
+
+class StrictModel(BaseModel):
+    """A config block that refuses unknown keys, naming them and the allowed ones: a typo such as
+    ``output_limits: {claude_code_budget: 20}`` would otherwise be dropped and its default used without a word."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _known_keys(cls, data: Any) -> Any:
+        if isinstance(data, Mapping):
+            unknown = sorted(str(key) for key in data if key not in cls.model_fields)
+            if unknown:
+                raise ValueError(
+                    f"unknown key(s): {', '.join(unknown)} (allowed keys: {', '.join(cls.model_fields)})"
+                )
+        return data
+
+
+class ModelPins(StrictModel):
     """One model ID per role for a tier."""
 
     chatgpt: str
@@ -53,7 +89,7 @@ TIER_MODELS: dict[Tier, ModelPins] = {
 }
 
 
-class ModelPrice(BaseModel):
+class ModelPrice(StrictModel):
     """USD per million tokens for one model, valid from ``effective_from`` until superseded.
 
     ``verified=False`` marks placeholder numbers that must be checked against the
@@ -182,8 +218,8 @@ def price_for(model: str, on: date, table: tuple[ModelPrice, ...] = PRICE_TABLE)
     return max(candidates, key=lambda p: p.effective_from)
 
 
-class OutputLimits(BaseModel):
-    """Default ``max_output_tokens`` per role. Worst-case budget checks use these."""
+class OutputLimits(StrictModel):
+    """Default ``max_output_tokens`` per role. Worst-case budget checks use these. Unknown keys are refused."""
 
     chatgpt: int = 16_000
     gemini: int = 32_000
@@ -203,26 +239,7 @@ DEFAULT_CLAUDE_CODE_TOOLS: tuple[str, ...] = (
 )
 """Allowed tools for Claude Code in the workspace: edit, build, test, QEMU. No web tools. File tools are
 scoped to the workspace (``./**`` is relative to Claude Code's cwd); a bare ``Read``/``Edit``/``Write`` rule
-would match every path and is rejected by ``ClaudeCodeProvider``."""
-
-DEFAULT_EXPORT_EXCLUDE: tuple[str, ...] = (
-    ".maf",
-    ".git",
-    "FreeRTOS-Kernel",
-    "__pycache__",
-    "*.pyc",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".venv",
-    "venv",
-    "node_modules",
-    ".DS_Store",
-)
-"""Workspace paths never exported to ``deliverables/``: pipeline metadata, caches, the provisioned FreeRTOS kernel.
-The export always adds ``maf.vault.DEFAULT_EXPORT_EXCLUDES`` (so ``inputs/``, ``.claude/`` and build output are not
-exported either; the clean-room check copies ``inputs/`` and the kernel back in), and lint and the source audit skip
-the same paths (``maf.stages.base.export_excludes``)."""
+would match every path and is rejected when settings load (``maf.sandbox.check_scoped_tools``)."""
 
 
 _ORIGIN_RE = re.compile(r"https?://(\[[0-9a-f:.]+\]|[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*)(:[0-9]{1,5})?")
@@ -236,14 +253,67 @@ DEFAULT_MCP_MAX_BUDGET_USD = 5.0
 DEFAULT_MCP_DAILY_BUDGET_USD = 25.0
 """Default ``Settings.mcp_daily_budget_usd`` (rolling 24 hours, MCP runs only)."""
 
+PACKAGE_DIR = Path(__file__).resolve().parent
+"""This package's directory: ``<checkout>/src/maf`` when maf runs from a source checkout (an editable install
+included), ``.../site-packages/maf`` when it is installed."""
+PROJECT_NAME = "maf"
+
+
+def source_checkout(package_dir: Path | None = None) -> Path | None:
+    """The source checkout maf runs from: ``<root>`` when the package directory (default ``PACKAGE_DIR``) is
+    ``<root>/src/maf`` and ``<root>/pyproject.toml`` names the project ``maf``; None for an installed copy."""
+    package = PACKAGE_DIR if package_dir is None else package_dir
+    if package.name != PROJECT_NAME or package.parent.name != "src":
+        return None
+    root = package.parent.parent
+    try:
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8")).get("project")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    name = project.get("name") if isinstance(project, dict) else None
+    return root if isinstance(name, str) and re.sub(r"[-_.]+", "-", name).lower() == PROJECT_NAME else None
+
+
+def xdg_data_home(environ: Mapping[str, str] | None = None) -> Path | None:
+    """``$XDG_DATA_HOME`` when it is an absolute path (the XDG spec ignores a relative one), else None."""
+    environ = os.environ if environ is None else environ
+    xdg = environ.get("XDG_DATA_HOME", "").strip()
+    return Path(xdg) if xdg and Path(xdg).is_absolute() else None
+
+
+def data_home(environ: Mapping[str, str] | None = None) -> Path:
+    """``$XDG_DATA_HOME/maf`` (``xdg_data_home``), else ``~/.local/share/maf``. ``maf chatgpt setup`` copies an
+    absolute ``XDG_DATA_HOME`` into the maf-mcp unit when maf has no source checkout
+    (``maf.chatgpt.settings_sources``), since the systemd user manager does not have the shell's value."""
+    return (xdg_data_home(environ) or Path.home() / ".local" / "share") / PROJECT_NAME
+
+
+def default_data_root() -> Path:
+    """Parent of the default ``workspaces/`` and ``inbox/``: the source checkout maf runs from (``source_checkout``),
+    else ``data_home()``. A clone at ``~/MultiAgent`` run from its venv keeps the original ``~/MultiAgent/workspaces``
+    and ``~/MultiAgent/inbox``."""
+    return source_checkout() or data_home()
+
+
+def default_python_executable() -> Path:
+    """The interpreter running maf (``sys.executable``, not resolved, so a venv's ``bin/`` stays its parent)."""
+    return Path(sys.executable) if sys.executable else Path("/usr/bin/python3")
+
 
 class Settings(BaseModel):
     """Fully resolved run-independent configuration."""
 
+    model_config = ConfigDict(extra="forbid")
+
     vault_path: Path = Field(default_factory=lambda: Path.home() / "Obsidian" / "MultiAgent")
-    workspaces_path: Path = Field(default_factory=lambda: Path.home() / "MultiAgent" / "workspaces")
-    python_executable: Path = Field(default_factory=lambda: Path.home() / "MultiAgent" / ".venv" / "bin" / "python")
-    """Interpreter Claude Code should use for simulations (numpy/scipy/matplotlib live here)."""
+    workspaces_path: Path = Field(default_factory=lambda: default_data_root() / "workspaces")
+    """Build trees, one per run. Default ``<checkout>/workspaces`` when maf runs from a source checkout, else
+    ``$XDG_DATA_HOME/maf/workspaces`` (``default_data_root``). A run's workspace is ``<workspaces_path>/<run_id>``, so
+    moving this setting moves where existing runs are looked for."""
+    python_executable: Path = Field(default_factory=default_python_executable)
+    """Interpreter Claude Code should use for simulations (numpy/scipy/matplotlib live here): its ``bin/`` goes first on
+    Claude Code's ``PATH``. Default: the interpreter running maf, so the venv maf is installed in. A missing one is
+    logged as a warning (``python_executable_warning``), not an error."""
     claude_executable: Path = Field(default_factory=lambda: Path.home() / ".local" / "bin" / "claude")
 
     budget_usd: float = Field(default=25.0, gt=0, allow_inf_nan=False)
@@ -281,10 +351,11 @@ class Settings(BaseModel):
     claude_code_turn_output_tokens: int = Field(default=64_000, gt=0)
     """Size of one Claude Code model turn. The CLI checks ``--max-budget-usd`` between turns, so the price of
     one such turn is held back from the clamp to keep the run cap hard."""
-    claude_code_tmp_base: Path = Path("/tmp")
+    claude_code_tmp_base: Path = DEFAULT_TMP_BASE
     """Parent of Claude Code's private ``TMPDIR`` (``<base>/maf-<12 random hex>``, one per provider instance). Sockets
     live under ``TMPDIR``, and Claude Code gives sandboxed commands ``TMPDIR=<TMPDIR>/claude-<uid>``, which must fit in
-    44 bytes. So the base may be at most 15 bytes for a 4-digit uid (``max_tmpdir_bytes``, checked before each call)."""
+    44 bytes. So the base may be at most 15 bytes for a 4-digit uid (``maf.sandbox.check_tmp_base`` when settings load,
+    ``max_tmpdir_bytes`` again before each call)."""
     claude_code_preflight_budget_usd: float | None = Field(default=None, gt=0)
     """``--max-budget-usd`` of the sandbox preflight that execution runs before the first code/mixed-mode call. None
     scales it with the model's price (``maf.providers.claude_code.preflight_budget_usd``: about $0.44 on
@@ -297,12 +368,13 @@ class Settings(BaseModel):
     """Local FreeRTOS-Kernel clone, copied into ``<workspace>/FreeRTOS-Kernel`` before code-mode execution
     (Claude Code has no network). None or a missing directory means no kernel is provisioned."""
 
-    export_exclude: tuple[str, ...] = DEFAULT_EXPORT_EXCLUDE
-    """Case-sensitive ``fnmatch`` patterns of workspace paths that are neither exported to ``deliverables/`` nor
-    linted nor audited, on top of ``maf.vault.DEFAULT_EXPORT_EXCLUDES``. A pattern matches any component of the
-    workspace-relative POSIX path or a leading part of it (``maf.lint.excluded``): ``.git`` and ``*.pyc`` match at any
-    depth, ``build/tmp`` only at the workspace root. Empty, absolute and ``!`` patterns are refused (re-including is
-    ``export_include``)."""
+    export_exclude: tuple[str, ...] = ()
+    """Extra case-sensitive ``fnmatch`` patterns of workspace paths that are neither exported to ``deliverables/`` nor
+    linted nor audited. They add to the built-in list, ``maf.vault.DEFAULT_EXPORT_EXCLUDES`` (pipeline state, version
+    control, the kernel, ``inputs/``, build output, caches, virtualenvs), which always applies: setting this never
+    re-exports anything (``export_include`` does that). A pattern matches any component of the workspace-relative
+    POSIX path or a leading part of it (``maf.lint.excluded``): ``.git`` and ``*.pyc`` match at any depth, ``build/tmp``
+    only at the workspace root. Empty, absolute and ``!`` patterns are refused."""
     export_include: tuple[str, ...] = ()
     """Patterns (same form) of workspace paths to ship although an exclude pattern matches them, such as a hand-written
     ``build/toolchain.cmake`` (``build/*.cmake``) or ``build/package/*``. Applied after ``export_exclude`` and the
@@ -324,9 +396,10 @@ class Settings(BaseModel):
     mcp_port: int = 8765
     """``maf serve`` listens on ``http://<mcp_host>:<mcp_port>/mcp``. Under ``maf serve --uds`` (the systemd unit) it
     listens on the Unix socket instead, and these only name the Host header clients must send."""
-    mcp_inbox: Path | None = Field(default_factory=lambda: Path.home() / "MultiAgent" / "inbox")
+    mcp_inbox: Path | None = Field(default_factory=lambda: default_data_root() / "inbox")
     """``start_run`` over MCP only accepts input files inside this directory. None means no files over MCP. The default
-    is inside the repo checkout, where ``.gitignore`` keeps it out of commits; ``maf chatgpt setup`` creates it 0700."""
+    is ``<checkout>/inbox`` when maf runs from a source checkout, where ``.gitignore`` keeps it out of commits, else
+    ``$XDG_DATA_HOME/maf/inbox`` (``default_data_root``); ``maf chatgpt setup`` creates it 0700."""
     mcp_max_budget_usd: float | None = Field(default=DEFAULT_MCP_MAX_BUDGET_USD, gt=0, allow_inf_nan=False)
     """Highest ``budget_usd`` an MCP client may request, and the budget of a ``start_run`` that names none (unless
     ``budget_usd`` is lower). ``null`` means ``budget_usd``. Only the CLI can go higher."""
@@ -348,11 +421,32 @@ class Settings(BaseModel):
         check_workspaces_outside_vault(self.vault_path, self.workspaces_path)
         return self
 
+    @model_validator(mode="after")
+    def _models_priced(self) -> Settings:
+        """Every model these settings can call has a price today (``price_for``), or nothing runs: an unpriced model
+        would otherwise fail its stage after earlier stages were paid for."""
+        today = date.today()
+        problems: list[str] = []
+        for where, model in self.configured_models():
+            try:
+                price_for(model, today)
+            except UnknownModelPrice as exc:
+                problems.append(f"{where}: {exc.args[0]}")
+        if problems:
+            known = sorted({p.model for p in PRICE_TABLE if p.effective_from <= today})
+            raise ValueError(f"{'; '.join(problems)}. Known model IDs on {today.isoformat()}: {', '.join(known)}")
+        return self
+
     @field_validator("claude_code_tmp_base")
     @classmethod
-    def _absolute_tmp_base(cls, value: Path) -> Path:
-        if not value.is_absolute():
-            raise ValueError(f"claude_code_tmp_base must be an absolute path, got {str(value)!r}")
+    def _short_absolute_tmp_base(cls, value: Path) -> Path:
+        check_tmp_base(value)
+        return value
+
+    @field_validator("claude_code_tools")
+    @classmethod
+    def _scoped_file_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        check_scoped_tools(value)
         return value
 
     @field_validator("mcp_allowed_origins")
@@ -410,6 +504,33 @@ class Settings(BaseModel):
                 return override
         return TIER_MODELS[self.tier].for_role(role)
 
+    def configured_models(self) -> Iterator[tuple[str, str]]:
+        """``(where, model)`` for every model ID ``model_for`` can return: the selected tier's pins
+        (``tier default: claude``), then each non-empty ``stage_model_overrides`` entry
+        (``stage_model_overrides.final.claude``)."""
+        pins = TIER_MODELS[self.tier]
+        for role in MODEL_ROLES:
+            yield f"tier {self.tier}: {role}", pins.for_role(role)
+        for stage in STAGE_ORDER:
+            for role, model in self.stage_model_overrides.get(stage, {}).items():
+                if model:
+                    yield f"stage_model_overrides.{stage}.{role}", model
+
+
+def python_executable_warning(settings: Settings) -> str | None:
+    """Why Claude Code would run without the configured interpreter, or None when ``python_executable`` exists.
+    ``load_settings`` logs it and the CLI prints it (``maf: warning: ...``, ``maf run`` included): a missing venv is not
+    an error (help, tests and prose runs need none), but code runs would silently get the system python and its
+    packages."""
+    python = settings.python_executable
+    if python.exists():
+        return None
+    return (
+        f"python_executable {python} does not exist, so Claude Code runs without that venv first on its PATH "
+        "(simulations get the system python3 and its packages); set python_executable in the config to the venv's "
+        "python, or recreate the venv"
+    )
+
 
 def check_workspaces_outside_vault(vault_path: Path, workspaces_path: Path) -> None:
     """``ValueError`` if the workspaces root is the vault or inside it: build trees and simulation data
@@ -444,8 +565,21 @@ _PATH_FIELDS = (
 )
 
 
+def describe_unknown_keys(unknown: list[str], known: Iterable[str]) -> str:
+    """``unknown`` joined by ``, ``, each with the closest ``known`` key when one is close enough
+    (``claude_code_timout_s (did you mean claude_code_timeout_s?)``): the top level has too many keys to list them all,
+    as the nested blocks' message does (``StrictModel``)."""
+    known = list(known)
+    described = []
+    for key in unknown:
+        close = difflib.get_close_matches(key, known, n=1)
+        described.append(f"{key} (did you mean {close[0]}?)" if close else key)
+    return ", ".join(described)
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
-    """Parse the config file. Missing -> ``{}``; unreadable, malformed or non-mapping -> ``ValueError``."""
+    """Parse the config file. Missing -> ``{}``; unreadable, malformed or non-mapping -> ``ValueError``, and so are
+    unknown top-level keys (``describe_unknown_keys`` suggests the closest known key for each)."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -462,7 +596,9 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         raise ValueError(f"config file {path} must contain a mapping, got {type(data).__name__}")
     unknown = sorted(str(k) for k in data if k not in Settings.model_fields)
     if unknown:
-        raise ValueError(f"unknown key(s) in config file {path}: {', '.join(unknown)}")
+        raise ValueError(
+            f"unknown key(s) in config file {path}: {describe_unknown_keys(unknown, Settings.model_fields)}"
+        )
     return data
 
 
@@ -484,7 +620,9 @@ def load_settings(config_path: Path | None = None, **overrides: object) -> Setti
     """Build ``Settings`` from defaults, the optional YAML file, env vars, then ``overrides``.
 
     ``overrides`` with value ``None`` are ignored, so CLI code can pass unset flags straight through.
-    A missing config file is not an error; a malformed one raises ``ValueError``.
+    A missing config file is not an error; a malformed or invalid one raises ``ValueError`` (unknown keys, nested ones
+    included; unpriced models; a too-long ``claude_code_tmp_base``; unscoped file-tool rules). A missing
+    ``python_executable`` is logged as a warning (``python_executable_warning``).
     Unknown override names raise ``TypeError``. Path values have ``~`` expanded.
     """
     unknown = sorted(k for k in overrides if k not in Settings.model_fields)
@@ -499,6 +637,9 @@ def load_settings(config_path: Path | None = None, **overrides: object) -> Setti
         if isinstance(data.get(key), (str, Path)):
             data[key] = Path(data[key]).expanduser()
     try:
-        return Settings.model_validate(data)
+        settings = Settings.model_validate(data)
     except ValidationError as exc:
         raise ValueError(f"invalid settings (from {path}, MAF_* env vars and overrides): {exc}") from exc
+    if (warning := python_executable_warning(settings)) is not None:
+        log.warning("%s", warning)
+    return settings

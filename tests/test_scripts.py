@@ -225,7 +225,8 @@ def test_wizard_rerun_restarts_only_what_changed_and_edits_the_units_config(tmp_
                                     'https://chatgpt.com"\n')
     _stub(shim / "xdg-open", "exit 0\n")
     maf = tmp_path / "maf"
-    _stub(maf, log)
+    sees = f'echo "setup sees XDG_DATA_HOME=${{XDG_DATA_HOME:-}}" >> {calls}'
+    _stub(maf, log + f'case "$*" in *"chatgpt setup"*) {sees};; esac\n')
     _stub(home / ".local" / "bin" / "tunnel-client",
           log + 'case "$1" in doctor) echo "CHECK mcp_server_reachable FAIL dial tcp: refused"; '
                 'echo "FAILED_CHECKS mcp_server_reachable,oauth_metadata"; exit 2;; esac\n')
@@ -233,8 +234,11 @@ def test_wizard_rerun_restarts_only_what_changed_and_edits_the_units_config(tmp_
     units.mkdir(parents=True)
     (units / "maf-tunnel.service").write_text((ROOT / "contrib" / "systemd" / "maf-tunnel.service").read_text())
     custom = tmp_path / "chatgpt.yaml"
+    data = tmp_path / "data"  # an installed maf's XDG_DATA_HOME, which this shell does not set
+    unbuffered = "Environment=PYTHONUNBUFFERED=1\n"
     (units / "maf-mcp.service").write_text(
         (ROOT / "contrib" / "systemd" / "maf-mcp.service").read_text().replace(" serve ", f" serve --config {custom} ")
+        .replace(unbuffered, f"{unbuffered}Environment=XDG_DATA_HOME={data}\n")
     )
     config = home / ".config" / "maf"
     config.mkdir(parents=True)
@@ -266,6 +270,7 @@ def test_wizard_rerun_restarts_only_what_changed_and_edits_the_units_config(tmp_
     assert custom.read_text() == 'mcp_allowed_origins: ["https://chatgpt.com"]\n'
     assert not (config / "config.yaml").exists()
     assert f"maf --config {custom} chatgpt setup" in recorded  # the unit's settings sources are passed on
+    assert f"setup sees XDG_DATA_HOME={data}" in recorded
 
 
 def test_wizard_refuses_without_a_terminal(tmp_path: Path) -> None:

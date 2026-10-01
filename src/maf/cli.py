@@ -2,7 +2,7 @@
 
 Owner: orchestration.
 
-    maf run "<brief>" [--file PATH ...] [--budget USD] [--tier default|max] [--review] [--no-wait]
+    maf run "<brief>" [--file PATH ...] [--budget USD] [--tier default|max] [--review|--no-review] [--no-wait]
     maf resume RUN_ID [--note TEXT] [--budget USD] [--extra-round]
     maf status RUN_ID [--json]
     maf list [--json] [--limit N]
@@ -11,10 +11,16 @@ Owner: orchestration.
     maf chatgpt setup [--no-reload] [--tunnel-client PATH] [--health-port N]
     maf chatgpt status [--lines N]
 
-Global options: ``--vault PATH``, ``--workspaces PATH``, ``--config PATH``.
+Global options: ``--vault PATH``, ``--workspaces PATH``, ``--config PATH``; ``maf --version`` prints the version.
+``--review``/``--no-review`` on ``run`` override the config's ``review`` for that run (unset: the config decides).
+Settings problems that are not errors (``maf.config.python_executable_warning``) are printed to stderr as
+``maf: warning: ...`` lines by every command that loads settings, before it runs.
 Exit codes of ``run``/``resume`` follow the run's status: 0 completed (also awaiting review, or started with
 ``--no-wait``); 2 completed_with_issues; 1 failed or budget exceeded. Usage errors (bad arguments, unknown run,
-bad config) also exit 2, before any run starts; the output tells them apart.
+bad config) also exit 2, before any run starts; the output tells them apart. So does a run whose run.md records its
+workspace under another root than ``workspaces_path`` gives, with nothing at the new place
+(``maf.pipeline.WorkspaceMoved``): ``resume`` and ``export`` refuse it before writing anything, naming both paths and
+the ``--workspaces`` to pass, and ``status`` prints the same as a ``maf: warning:`` line.
 ``run`` prints the run_id first, then progress lines per stage, then the path of 05-final.md on stdout.
 A completed_with_issues run (unresolved critical issues after the loop cap, or acceptance criteria not met, maf's
 own checks included: clean-room reproduction, source audit, deliverable lint) then ends with one stderr line naming the counts and the notes to read; failed and
@@ -23,7 +29,7 @@ budget-exceeded runs end with the error on stderr.
 runs one more execution + cross-check pass and then final again.
 ``export`` rewrites the run's ``deliverables/`` from its workspace with the final stage's export (no model calls,
 any status), names what the exclude patterns left out, and notes it in run.md: exit 0 when exported, 1 when the export is refused (too large, run busy, no
-workspace), 2 for an unknown run.
+workspace), 2 for an unknown run or a workspace recorded under another root.
 ``run --no-wait`` creates the run, starts ``maf resume RUN_ID`` as a detached process (output in
 ``workspace/.maf/run.log``) and returns immediately.
 ``serve`` logs to stderr (the journal under systemd); ``--stdio`` serves MCP over stdin/stdout instead of HTTP, and
@@ -34,9 +40,9 @@ exits 2 for usage and configuration errors (the unit does not restart on 2) and 
 ``chatgpt setup`` installs the systemd user units and 0600 env templates for the ChatGPT app, ``chatgpt status``
 checks them (``maf.chatgpt``): exit 0 when ready, 1 when not, 2 for usage errors. Neither builds a pipeline. ``setup``
 writes the config, vault and workspaces it was given (global options or ``MAF_CONFIG``/``MAF_VAULT``/
-``MAF_WORKSPACES``/``MAF_BUDGET_USD``) into the maf-mcp unit, so the service reads the same settings (a re-run that
-leaves out a source the installed unit has is a usage error), and keeps the installed unit's tunnel-client path and
-health port unless ``--tunnel-client``/``--health-port`` override them.
+``MAF_WORKSPACES``/``MAF_BUDGET_USD``, and an installed copy's ``XDG_DATA_HOME``) into the maf-mcp unit, so the service
+reads the same settings (a re-run that leaves out a source the installed unit has is a usage error), and keeps the
+installed unit's tunnel-client path and health port unless ``--tunnel-client``/``--health-port`` override them.
 """
 
 from __future__ import annotations
@@ -54,9 +60,10 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TextIO
 
+from maf import __version__
 from maf.config import Settings, load_settings
 from maf.handoff import HandoffInvalid, HandoffKind
-from maf.pipeline import Pipeline
+from maf.pipeline import Pipeline, WorkspaceMoved
 from maf.types import RunStatus
 from maf.vault import (
     LOOP_SKIPPED_BUDGET,
@@ -121,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="maf",
         description="Multi-agent pipeline coordinating ChatGPT, Gemini and Claude over an Obsidian vault.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     _global_options(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     common = argparse.ArgumentParser(add_help=False)
@@ -132,7 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="input file for ingestion (repeatable)")
     run.add_argument("--budget", type=_positive_float, metavar="USD", help="per-run spend cap")
     run.add_argument("--tier", choices=("default", "max"), help="model tier")
-    run.add_argument("--review", action="store_true", default=None, help="pause after strategy for review")
+    run.add_argument("--review", action=argparse.BooleanOptionalAction, default=None,
+                     help="pause after strategy so you can edit 02-strategy (--no-review: run straight through even if "
+                          "the config says review: true; default: the config's review)")
     run.add_argument("--no-wait", action="store_true", help="start in the background and return immediately")
 
     resume = sub.add_parser("resume", parents=[common], help="continue a paused, failed or crashed run")
@@ -144,11 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", parents=[common], help="show one run")
     status.add_argument("run_id")
-    status.add_argument("--json", action="store_true", help="print run.md frontmatter as JSON")
+    status.add_argument("--json", action="store_true",
+                        help="print the run's run.md frontmatter (every field, as maf stores it) as one JSON object")
 
     list_ = sub.add_parser("list", parents=[common], help="list runs, newest first")
-    list_.add_argument("--json", action="store_true")
-    list_.add_argument("--limit", type=_positive_int, default=20, metavar="N")
+    list_.add_argument("--json", action="store_true",
+                       help="print a JSON array of {run_id, status, stage, spent_usd, created} objects, not a table")
+    list_.add_argument("--limit", type=_positive_int, default=20, metavar="N",
+                       help="show at most N runs, newest first (default: %(default)s)")
 
     export = sub.add_parser("export", parents=[common], help="re-export a run's deliverables from its workspace")
     export.add_argument("run_id")
@@ -195,12 +208,29 @@ def make_pipeline(settings: Settings) -> Pipeline:
     return Pipeline(settings)
 
 
-def _settings_from(args: argparse.Namespace) -> Settings:
-    return load_settings(
-        getattr(args, "config", None),
-        vault_path=getattr(args, "vault", None),
-        workspaces_path=getattr(args, "workspaces", None),
-    )
+def _settings_from(args: argparse.Namespace) -> tuple[Settings, list[str]]:
+    """Settings from the global options, and the warnings ``load_settings`` logged while loading them (such as
+    ``python_executable_warning``). They are held back from logging, whose fallback would print them bare on stderr,
+    so ``main`` prints each once as a ``maf: warning:`` line."""
+    warnings: list[str] = []
+
+    def hold_back(record: logging.LogRecord) -> bool:
+        if record.levelno < logging.WARNING:
+            return True
+        warnings.append(record.getMessage())
+        return False
+
+    config_log = logging.getLogger("maf.config")
+    config_log.addFilter(hold_back)
+    try:
+        settings = load_settings(
+            getattr(args, "config", None),
+            vault_path=getattr(args, "vault", None),
+            workspaces_path=getattr(args, "workspaces", None),
+        )
+    finally:
+        config_log.removeFilter(hold_back)
+    return settings, warnings
 
 
 def _print_progress(index: RunIndex, message: str) -> None:
@@ -359,6 +389,10 @@ def _cmd_status(args: argparse.Namespace, pipeline: Pipeline) -> int:
     except FileNotFoundError:
         print(f"maf: no such run: {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
+    try:
+        pipeline.check_workspace(index)
+    except WorkspaceMoved as exc:  # resume and export would refuse the run: say so next to the recorded path
+        print(f"maf: warning: {exc}", file=sys.stderr)
     if args.json:
         print(json.dumps(index.model_dump(mode="json"), indent=2))
     else:
@@ -398,6 +432,9 @@ def _cmd_export(args: argparse.Namespace, pipeline: Pipeline) -> int:
         return EXIT_USAGE
     try:
         _index, export = pipeline.export(args.run_id)
+    except WorkspaceMoved as exc:
+        print(f"maf: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     except (ExportError, HandoffInvalid, RuntimeError, OSError) as exc:
         print(f"maf: export failed: {' '.join(str(exc).split())}", file=sys.stderr)
         return EXIT_FAILED
@@ -530,10 +567,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exc:  # argparse exits 2 on usage errors and 0 on --help
         return exc.code if isinstance(exc.code, int) else EXIT_USAGE
     try:
-        settings = _settings_from(args)
+        settings, warnings = _settings_from(args)
     except ValueError as exc:
         print(f"maf: bad configuration: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    for warning in warnings:
+        print(f"maf: warning: {warning}", file=sys.stderr, flush=True)
     if args.command in _SETTINGS_COMMANDS:
         return _SETTINGS_COMMANDS[args.command](args, settings)
     try:

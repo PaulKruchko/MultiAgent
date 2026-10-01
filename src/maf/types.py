@@ -34,7 +34,10 @@ class RunStatus(StrEnum):
     AWAITING_REVIEW = "awaiting_review"
     COMPLETED = "completed"
     COMPLETED_WITH_ISSUES = "completed_with_issues"
-    """Final ran, but only because the cross-check loop cap was hit: ``unresolved_critical > 0``."""
+    """Final ran, but the result is not verified. Either critical issues stayed unresolved after the cross-check loop
+    cap or a loop skipped for budget (``unresolved_critical > 0``), or acceptance criteria are not met
+    (``criteria_unmet > 0``), maf's own gates included: acceptance, clean-room reproduction, source audit and
+    deliverable lint. Either is enough (``maf.vault.RunIndex.has_issues``)."""
     FAILED = "failed"
     BUDGET_EXCEEDED = "budget_exceeded"
 

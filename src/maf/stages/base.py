@@ -549,11 +549,12 @@ def continuation_note(result: CompletionResult) -> str:
 
 def export_excludes(settings: Settings) -> tuple[str, ...]:
     """Exclude patterns of the deliverable tree, in ``maf.lint.excluded`` order: ``maf.vault.DEFAULT_EXPORT_EXCLUDES``
-    and ``Settings.export_exclude``, then ``Settings.export_include`` as ``!`` re-includes, then
-    ``maf.vault.PROTECTED_EXPORT_EXCLUDES`` again, so no re-include reaches pipeline state or the user's inputs. It is
-    what a code/mixed export leaves out of ``deliverables/``, and so what the execution and cross-check lint and the
-    source audit skip. Lint and audit see exactly what ships: a link into ``inputs/`` or ``FreeRTOS-Kernel/`` does not
-    resolve in the export, so it is broken."""
+    (always) plus the extra ``Settings.export_exclude`` patterns (which add, never replace), then
+    ``Settings.export_include`` as ``!`` re-includes, then ``maf.vault.PROTECTED_EXPORT_EXCLUDES`` again, so no
+    re-include reaches pipeline state or the user's inputs. It is what a code/mixed export leaves out of
+    ``deliverables/``, and so what the execution and cross-check lint and the source audit skip. Lint and audit see
+    exactly what ships: a link into ``inputs/`` or ``FreeRTOS-Kernel/`` does not resolve in the export, so it is
+    broken."""
     excludes = dict.fromkeys((*_vault.DEFAULT_EXPORT_EXCLUDES, *settings.export_exclude))
     if not settings.export_include:
         return tuple(excludes)

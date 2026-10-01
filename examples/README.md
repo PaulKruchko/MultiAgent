@@ -40,11 +40,12 @@ A separate post-run check added about 85M adversarial fuzz operations and found 
 
 ### Running it outside a maf workspace
 
-That README was written inside the run's workspace. It assumes a kernel at `./FreeRTOS-Kernel` and says "from the workspace root". In this repo:
+That README was written inside the run's workspace. It assumes a kernel at `./FreeRTOS-Kernel` and says "from the workspace root". From the root of your checkout:
 
 ```bash
+repo=$PWD
 rm -rf /tmp/tlsf && cp -r examples/tlsf-allocator /tmp/tlsf && cd /tmp/tlsf     # make rewrites logs/ and docs/*.png
-make -j8 all FRTOS="$HOME/.local/share/maf/FreeRTOS-Kernel" PY="$HOME/MultiAgent/.venv/bin/python"
+make -j8 all FRTOS="$HOME/.local/share/maf/FreeRTOS-Kernel" PY="$repo/.venv/bin/python"
 ```
 
 - **`FRTOS=`** points at a FreeRTOS-Kernel clone, which is not shipped. Development used commit `8be86d4a24fd` (V11.1.0+).

@@ -25,6 +25,11 @@ more execution + crosscheck pass (round + 1, reading the last cross-check's unre
 again. That cross-check never loops (a cross-check after a final, ``"final" in completed_stages``, counts as capped),
 so a pass that leaves critical issues open goes straight to final, whatever the loop cap or budget would allow.
 
+Before ``run``, ``resume`` or ``export`` touches a run, ``check_workspace`` compares the workspace run.md records with
+``<workspaces_path>/<run_id>`` under the current settings: when they differ and nothing is at the latter (the setting
+changed, or its default moved with the installation), ``WorkspaceMoved`` is raised before anything is written or any
+provider is built, so no paid session starts in a fresh empty tree.
+
 Error mapping for a stage attempt:
 - ``BudgetExceeded``: BUDGET_EXCEEDED (resumable after raising the budget: ``maf resume --budget``). That includes a
   Claude Code work session refused for want of its minimum budget before it started, and one that ran out of a budget
@@ -190,6 +195,28 @@ def not_an_inbox_file(given: str | Path) -> ValueError:
     """The one refusal a remote caller gets for any input file problem: it echoes only the caller's own string, so
     it tells nothing about files outside the inbox (whether they exist, where a symlink points)."""
     return ValueError(f"not an allowed inbox file: {given}")
+
+
+class WorkspaceMoved(ValueError):
+    """A run's workspace is recorded in run.md (``RunIndex.workspace``) under another root than the current
+    ``workspaces_path`` gives (``<workspaces_path>/<run_id>``), and nothing is at the new place: the setting changed, or
+    its default moved with the installation (``maf.config.default_data_root``). A ``ValueError``, so the CLI reports
+    it as a usage error (exit 2)."""
+
+
+def check_workspace(index: RunIndex, workspace: Path) -> None:
+    """``WorkspaceMoved`` when ``index`` records a workspace other than ``workspace`` (where the current settings put
+    it) and ``workspace`` does not exist. Continuing would build providers for, and run paid sessions in, a fresh empty
+    tree without ``inputs/`` or the earlier work (Claude Code creates its workspace). A missing workspace at the
+    recorded place, a tree moved along with ``workspaces_path`` and a run recorded without a workspace pass."""
+    recorded = index.workspace.strip()
+    if not recorded or Path(recorded) == workspace or workspace.exists():
+        return
+    raise WorkspaceMoved(
+        f"run {index.run_id} has its workspace at {recorded} (run.md), but workspaces_path {workspace.parent} puts it "
+        f"at {workspace}, which does not exist; nothing was changed. Pass --workspaces {Path(recorded).parent} or set "
+        "workspaces_path to it in the config (the default follows where maf is installed)"
+    )
 
 
 def boot_id() -> str:
@@ -358,12 +385,19 @@ class Pipeline:
     def review_note_path(self, run_id: str) -> Path:
         return self.vault.paths(run_id).workspace / REVIEW_NOTE_REL
 
+    def check_workspace(self, index: RunIndex) -> None:
+        """``check_workspace`` of ``index`` against its workspace under these settings: ``WorkspaceMoved`` when run.md
+        records it under another root and nothing is at this one. ``run``, ``resume`` and ``export`` call it before
+        they write anything; ``maf status`` prints it as a warning."""
+        check_workspace(index, self.vault.paths(index.run_id).workspace)
+
     # ------------------------------------------------------------------ run and resume
 
     def run(self, run_id: str, *, progress: ProgressFn | None = None) -> RunIndex:
         """Advance ``run_id`` from its recorded stage until COMPLETED, COMPLETED_WITH_ISSUES, AWAITING_REVIEW,
         FAILED or BUDGET_EXCEEDED. Returns the final index. Never raises for stage errors (they are recorded);
-        raises only for a missing run, or ``RuntimeError`` if another thread or process is advancing the run.
+        raises only for a missing run, ``RuntimeError`` if another thread or process is advancing the run, or
+        ``WorkspaceMoved`` (before anything is written) when run.md records the workspace under another root.
 
         A run in any of those statuses is returned unchanged: continuing one is an explicit decision, made
         with ``resume``. A run left RUNNING by a crashed process is continued from its recorded stage."""
@@ -371,6 +405,7 @@ class Pipeline:
             index = self.vault.read_index(run_id)
             if index.status not in (RunStatus.PENDING, RunStatus.RUNNING):
                 return index
+            self.check_workspace(index)
             return self._advance(index, progress)
 
     def resume(
@@ -388,7 +423,9 @@ class Pipeline:
         COMPLETED and COMPLETED_WITH_ISSUES runs are returned unchanged (nothing is written), except that
         ``extra_round=True`` on a COMPLETED_WITH_ISSUES run schedules exactly one more execution + crosscheck pass at
         ``round + 1`` followed by final, even after a loop skipped for budget (see the module docstring).
-        ``extra_round`` on any other status raises ``ValueError``."""
+        ``extra_round`` on any other status raises ``ValueError``. A run whose run.md records its workspace under
+        another root, with nothing at this one, raises ``WorkspaceMoved`` before anything is written (run.md, the
+        note) or any provider is built."""
         if budget_usd is not None and not (math.isfinite(budget_usd) and budget_usd > 0):
             raise ValueError(f"budget must be positive and finite, got {budget_usd}")
         with self._guard(run_id):
@@ -400,6 +437,7 @@ class Pipeline:
                 )
             if index.status.finished and not extra_round:
                 return index
+            self.check_workspace(index)
             if budget_usd is not None:
                 index.budget_usd = budget_usd
             if note is not None:
@@ -427,11 +465,13 @@ class Pipeline:
         (``maf.stages.final.export_run``, excludes ``export_excludes(settings)``, cap ``settings.export_max_bytes``) and
         record it in run.md (``exported_at``, ``export_note`` ``maf export: ...``). The status is unchanged and no model
         is called. Raises ``FileNotFoundError`` for an unknown run, ``RuntimeError`` if the run is being advanced,
+        ``WorkspaceMoved`` when run.md records the workspace under another root and nothing is at this one,
         ``maf.vault.ExportError`` (``ExportTooLarge`` included) when the export is refused, leaving run.md as it was."""
         from maf.stages.final import export_excludes, export_run
 
         with self._guard(run_id):
             index = self.vault.read_index(run_id)
+            self.check_workspace(index)
             export = export_run(
                 self.vault, index, excludes=export_excludes(self.settings), max_bytes=self.settings.export_max_bytes
             )

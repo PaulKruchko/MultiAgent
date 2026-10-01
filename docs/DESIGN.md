@@ -35,7 +35,7 @@ sequence.
 ```
 01 Ingestion      ChatGPT triages the request → writes routing brief → Gemini ingests/searches/parses → structured ingestion report
 02 Strategy       ChatGPT consumes ingestion report → broad options/angles → chosen strategy + execution brief
-   [optional human gate with --review: user picks/edits direction]
+   [optional human gate with --review or config review: true (--no-review skips it for one run): user picks/edits direction]
 03 Execution      Claude (Code for code, Messages for prose) consumes ingestion + strategy → definitive artifacts
 04 Cross-check    All three critique independently (## Issues with severity) → one rebuttal round →
                   Claude applies accepted fixes; ChatGPT adjudicates disputes.
@@ -103,7 +103,8 @@ sequence.
 ## Shared memory: the Obsidian vault
 
 - The vault is at `~/Obsidian/MultiAgent`, configurable. The snap uses classic
-  confinement, so any path works.
+  confinement, so any path works. Settings are validated when they load (unknown
+  keys, unpriced models, sandbox limits), before a run spends anything.
 - Each run gets its own folder: `runs/<YYYY-MM-DD>-<slug>/`, containing:
   - `run.md`: run index. Frontmatter holds status, stage and spend. The body has
     links to every handoff and a per-agent cost table.
@@ -114,15 +115,24 @@ sequence.
     source). For code and mixed runs this is the whole workspace tree, without
     pipeline state (`.maf/`, `.claude/`), the provisioned FreeRTOS kernel, the
     user's `inputs/`, build output (in-source objects and binaries too) and
-    empty sandbox placeholder files, capped at 200 MB. `export_include` brings
-    back a hand-written file an exclude pattern catches. It is replaced as a whole, and `maf export <run_id>` redoes it
+    empty sandbox placeholder files, capped at 200 MB. The config's
+    `export_exclude` adds patterns to these built-in excludes (it never replaces
+    them), and `export_include` brings back a hand-written file an exclude
+    pattern catches. `deliverables/` is replaced as a whole, and `maf export <run_id>` redoes it
     from the workspace without model calls. A code or mixed run that stops
     `failed` or `budget_exceeded` after execution wrote files gets the same
     export, marked in run.md as partial and unverified, unless an earlier final
     already exported it (an extra round stopped): then `deliverables/` keeps
     final's verified export.
 - Large code trees and simulation data are **outside** the vault, in
-  `workspaces/<run_id>/`, and handoffs link to them.
+  `workspaces/<run_id>/`, and handoffs link to them. `workspaces/` defaults to
+  the source checkout maf runs from (`~/MultiAgent/workspaces` for a clone
+  there), or `~/.local/share/maf/workspaces` for an installed copy; the ChatGPT
+  inbox sits next to it. Claude Code gets the venv maf runs from. run.md records
+  each run's workspace path; when the current `workspaces_path` puts it
+  elsewhere and nothing is there, `resume`/`export` refuse the run (exit 2,
+  before any provider is built), so a moved default never starts a paid session
+  in an empty tree.
 - Writes are atomic: write to a temporary file, then `os.replace`. The framework
   writes the files directly and does not use the REST plugin.
 - Only the property keys `tags`, `aliases` and `cssclasses` are used; Obsidian

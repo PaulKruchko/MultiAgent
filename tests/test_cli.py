@@ -146,6 +146,35 @@ def test_help_exits_0(capsys: pytest.CaptureFixture[str]) -> None:
     assert "resume" in capsys.readouterr().out
 
 
+def test_version_prints_the_package_version(capsys: pytest.CaptureFixture[str]) -> None:
+    import maf
+
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == f"maf {maf.__version__}"
+
+
+def test_parser_review_and_no_review() -> None:
+    p = cli.build_parser()
+    assert p.parse_args(["run", "b", "--review"]).review is True
+    assert p.parse_args(["run", "b", "--no-review"]).review is False
+    assert p.parse_args(["run", "b"]).review is None  # unset: the config's review decides
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["list", "--help"], ["--json", "spent_usd", "--limit N", "(default: 20)"]),
+        (["status", "--help"], ["--json", "run.md frontmatter", "JSON object"]),
+        (["run", "--help"], ["--review, --no-review", "config"]),
+    ],
+)
+def test_option_help_strings(argv: list[str], expected: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(argv) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    for text in expected:
+        assert text in out, text
+
+
 @pytest.mark.parametrize(
     ("status", "code"),
     [
@@ -174,6 +203,46 @@ def test_bad_config_file_exits_2(env: Env, tmp_path: Path, capsys: pytest.Captur
     assert "configuration" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("text", "named"),
+    [
+        ("output_limits: {claude_code_budget: 20}\n", "claude_code_budget (allowed keys: chatgpt, gemini, claude"),
+        ("stage_model_overrides: {final: {claude: claude-sonnet-9}}\n", "unknown model 'claude-sonnet-9'"),
+        ("claude_code_tmp_base: /var/tmp/a-much-too-long-base\n", "is too long"),
+        ("claude_code_tools: [Read]\n", "need a path scope"),
+    ],
+)
+def test_invalid_config_fails_before_any_run_is_created(
+    env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str], text: str, named: str
+) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(text, encoding="utf-8")
+    assert cli.main(["--config", str(cfg), *env.argv("run", "x")]) == cli.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "bad configuration" in err and named in err
+    assert env.settings is None and not env.vault.exists() and not env.workspaces.exists()
+
+
+def test_missing_python_executable_is_one_warning_line_and_the_run_goes_on(
+    env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "old-venv" / "bin" / "python"
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"python_executable: {missing}\n", encoding="utf-8")
+    assert cli.main(["--config", str(cfg), *env.argv("run", "x")]) == 0
+    captured = capsys.readouterr()
+    warnings = [line for line in captured.err.splitlines() if "does not exist" in line]
+    assert warnings == [f"maf: warning: python_executable {missing} does not exist, so Claude Code runs without that "
+                        "venv first on its PATH (simulations get the system python3 and its packages); set "
+                        "python_executable in the config to the venv's python, or recreate the venv"]
+    assert env.pipeline().status(captured.out.splitlines()[0]).status == RunStatus.COMPLETED
+
+
+def test_no_warning_with_the_default_python_executable(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(env.argv("list")) == 0
+    assert "warning" not in capsys.readouterr().err
+
+
 def test_global_paths_reach_settings(env: Env) -> None:
     assert cli.main(env.argv("list")) == 0
     assert env.settings is not None
@@ -200,6 +269,20 @@ def test_run_with_review_pauses_and_exits_0(env: Env, capsys: pytest.CaptureFixt
     assert cli.main(env.argv("run", "x", "--review")) == 0
     out = capsys.readouterr().out
     assert "awaiting review" in out and "maf resume" in out
+
+
+def test_no_review_overrides_review_true_in_the_config(
+    env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("review: true\n", encoding="utf-8")
+    assert cli.main(["--config", str(cfg), *env.argv("run", "paused by the config")]) == 0
+    paused = capsys.readouterr().out.splitlines()[0]
+    assert env.pipeline().status(paused).status == RunStatus.AWAITING_REVIEW
+    assert cli.main(["--config", str(cfg), *env.argv("run", "straight through", "--no-review")]) == 0
+    straight = capsys.readouterr().out.splitlines()[0]
+    index = env.pipeline().status(straight)
+    assert (index.status, index.review) == (RunStatus.COMPLETED, False)
 
 
 def test_run_failure_exits_1(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
@@ -348,6 +431,39 @@ def test_run_no_wait_launches_detached_resume(env: Env, monkeypatch: pytest.Monk
 
 
 # --------------------------------------------------------------------------- resume, status, list, serve
+
+
+def test_a_workspace_recorded_under_another_root_is_a_usage_error_and_a_status_warning(
+    env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without the --workspaces the run was made with (or after the default moved with the installation), resume and
+    export stop with exit 2 before anything runs or is written, and status warns next to the recorded path."""
+    env.backends["execution"].error = RuntimeError("crash")
+    assert cli.main(env.argv("run", "x")) == cli.EXIT_FAILED
+    run_id = capsys.readouterr().out.splitlines()[0]
+    run_md = env.vault / "runs" / run_id / "run.md"
+    before = run_md.read_text(encoding="utf-8")
+    calls = {name: b.calls for name, b in env.backends.items()}
+    other = ["--vault", str(env.vault), "--workspaces", str(tmp_path / "other")]
+    hint = f"Pass --workspaces {env.workspaces}"
+
+    assert cli.main([*other, "resume", run_id, "--budget", "9", "--note", "go"]) == cli.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert err.startswith(f"maf: run {run_id} has its workspace at {env.workspaces / run_id} (run.md)")
+    assert str(tmp_path / "other" / run_id) in err and hint in err
+    assert cli.main([*other, "export", run_id]) == cli.EXIT_USAGE
+    assert hint in capsys.readouterr().err
+    assert run_md.read_text(encoding="utf-8") == before
+    assert {name: b.calls for name, b in env.backends.items()} == calls
+    assert not (tmp_path / "other").exists()
+
+    assert cli.main([*other, "status", run_id]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    assert captured.err.startswith("maf: warning: run ") and hint in captured.err
+    assert f"workspace: {env.workspaces / run_id}" in captured.out
+    assert cli.main(env.argv("status", run_id)) == cli.EXIT_OK
+    assert capsys.readouterr().err == ""
+    assert cli.main(env.argv("resume", run_id)) == cli.EXIT_OK  # with the recorded root it continues
 
 
 def test_resume_unknown_run_exits_2(env: Env, capsys: pytest.CaptureFixture[str]) -> None:

@@ -11,14 +11,16 @@ DESIGN.md wins and this document is fixed. Code lives in `src/maf/`, and tests i
 | architect (frozen) | `types.py`, `prompts/__init__.py`, `tests/conftest.py`, `tests/test_skeleton.py`, `tests/fixtures/handoffs/*` | shared vocabulary, prompt loader, fakes, sample handoffs |
 | **A: core** | `config.py`, `ledger.py` | settings, model pins/tiers, dated prices, budget ledger, `metered_call` |
 | **B: vault+handoff** | `vault.py`, `handoff.py` | run folder layout, atomic writes, run.md, wikilinks, handoff schemas |
-| **C: providers** | `providers/*.py`, `tests/fixtures/providers/*` | OpenAI / Gemini / Anthropic / Claude Code adapters |
+| **C: providers** | `providers/*.py`, `sandbox.py`, `tests/fixtures/providers/*` | OpenAI / Gemini / Anthropic / Claude Code adapters, the Claude Code sandbox rules settings share |
 | **D: stages** | `stages/*.py`, `prompts/*.md`, `prompts/roles/*.md`, `lint.py` | the five stage backends and their prompts, the deliverable linter |
 | **E: orchestration** | `pipeline.py`, `cli.py`, `mcp_server.py`, `chatgpt.py`, `redact.py`, `scripts/*.sh`, `contrib/systemd/*` | state machine, CLI, MCP server, ChatGPT tunnel units and setup, API-key masking |
 
 Each owner also owns `tests/test_<module>*.py` for its files. The dependency direction is strictly
 `types <- config <- ledger/providers.base <- handoff <- vault <- stages <- pipeline <- cli/mcp_server`
 (`chatgpt` depends on `config` and `redact` only, and imports `mcp_server` lazily for its loopback check; `redact`
-imports nothing from `maf`, and stages, `chatgpt` and `mcp_server` use it).
+imports nothing from `maf`, and stages, `chatgpt` and `mcp_server` use it). `sandbox` imports nothing from `maf`
+either: `config` checks `claude_code_tmp_base` and `claude_code_tools` with its rules at load, and
+`providers.claude_code` applies the same functions per call, without config importing the providers package.
 `ledger` imports provider types only under `TYPE_CHECKING`. `lint` imports nothing from `maf` (standard library only).
 
 ## 2. Data flow
@@ -65,24 +67,47 @@ of it; `output_tokens` includes reasoning/thinking; `search_queries` counts bill
   run, owner A must verify them on the official pricing pages** (fetching docs is free).
 - `ModelPrice.cost(usage)` = `(in - cached - write)*input + cached*cached_input + write*(cache_write or input) + out*output`, all per 1e6, `+ search_queries*search_query_usd`.
 - `load_settings(path, **overrides)`: defaults, then YAML, then env (`MAF_VAULT`, `MAF_WORKSPACES`, `MAF_BUDGET_USD`), then non-None overrides.
+- Load-time validation (a `ValueError`, so CLI exit 2 before any run exists): unknown top-level keys (`_read_yaml`,
+  `Settings` itself is `extra="forbid"`; `describe_unknown_keys` adds the closest known key with `difflib`, e.g.
+  `claude_code_timout_s (did you mean claude_code_timeout_s?)`, since about 45 keys are too many to list), and unknown
+  keys in nested blocks: `OutputLimits`, `ModelPins` and
+  `ModelPrice` derive from `StrictModel`, which names the unknown and the allowed keys
+  (`output_limits: {claude_code_budget: 20}` fails). `Settings.configured_models()` yields every model `model_for` can
+  return (the selected tier's pins, each non-empty `stage_model_overrides` entry), and each must have a `price_for` on
+  `date.today()`, else the error names it (`stage_model_overrides.final.claude: unknown model 'claude-sonnet-9'`) and
+  lists the known model IDs. `claude_code_tmp_base` goes through `maf.sandbox.check_tmp_base` and `claude_code_tools`
+  through `maf.sandbox.check_scoped_tools` (below).
+- `python_executable_warning(settings)`: a message when `python_executable` does not exist, else None.
+  `load_settings` logs it (`maf.config` logger, WARNING) and the CLI prints it as `maf: warning: ...`; it is not an
+  error, because help, tests and prose runs need no venv.
+- Defaults that follow the installation: `python_executable` = `sys.executable` (not resolved, so a venv's `bin/` stays
+  its parent); `workspaces_path` = `default_data_root() / "workspaces"` and `mcp_inbox` =
+  `default_data_root() / "inbox"`, where `default_data_root()` is `source_checkout()` (the `<root>` of a
+  `PACKAGE_DIR` = `<root>/src/maf` whose `<root>/pyproject.toml` names project `maf`, as in an editable install) or
+  else `data_home()` (`$XDG_DATA_HOME/maf` for an absolute `XDG_DATA_HOME`, `xdg_data_home()`, else
+  `~/.local/share/maf`). A checkout at
+  `~/MultiAgent` thus keeps the paths the earlier hard-coded defaults gave (`~/MultiAgent/workspaces`,
+  `~/MultiAgent/inbox`), so existing runs' workspaces (`<workspaces_path>/<run_id>`, recorded in run.md) still
+  resolve.
 - Claude Code sandbox settings: `claude_code_tmp_base` (absolute, default `/tmp`; parent of the provider's
-  `TMPDIR`, see providers), `claude_code_preflight_budget_usd` (the preflight's `--max-budget-usd`; default None,
-  which scales it with the model, see providers) and `claude_code_bash_timeout_s` (the longest Bash command,
-  `BASH_MAX_TIMEOUT_MS`; default None = `bash_timeout_s` = 75 % of `claude_code_timeout_s`; a value must stay below
-  `claude_code_timeout_s`).
+  `TMPDIR`, see providers; refused at load when its `TMPDIR` would exceed `max_tmpdir_bytes()`),
+  `claude_code_preflight_budget_usd` (the preflight's `--max-budget-usd`; default None, which scales it with the
+  model, see providers) and `claude_code_bash_timeout_s` (the longest Bash command, `BASH_MAX_TIMEOUT_MS`; default
+  None = `bash_timeout_s` = 75 % of `claude_code_timeout_s`; a value must stay below `claude_code_timeout_s`).
 - Claude Code session settings: `claude_code_timeout_s` (wall clock of one session, default 5400 s = 90 min, so
   `bash_timeout_s` is 4050 s; was 3600 s until the 2026-09-29 thesis execution was killed nearly done) and
   `claude_code_min_session_usd` (default $3.00, `ge=0`): the smallest `--max-budget-usd` a work session (execution,
   fix pass, continuation) is started with, capped by the session's own budget (`OutputLimits.claude_code_budget_usd`,
   $8) and by `claude_code_min_session_share` (default 0.25, `0 < share <= 1`) of the run's cap, so a $5 run's floor is
   $1.25; see `stages.base.session_floor` and `work_session`. The preflight and the clean room keep their own minima.
-- Deliverable and verification settings: `export_exclude` (case-sensitive `fnmatch` patterns of workspace paths that are
-  neither exported to `deliverables/` nor linted; a pattern matches any path component or a leading part of the
-  workspace-relative POSIX path, as `maf.lint.excluded` does; default `DEFAULT_EXPORT_EXCLUDE`: `.maf`, `.git`,
-  `FreeRTOS-Kernel`, caches, virtualenvs, `node_modules`; `maf.stages.base.export_excludes(settings)` adds
-  `maf.vault.DEFAULT_EXPORT_EXCLUDES`, so `inputs/`, `.claude/` and build output are not exported either, see vault.py;
-  the execution and cross-check lint and the source audit use the same `export_excludes`, so they check exactly what
-  ships; empty, absolute and `!` patterns are refused), `export_include` (patterns of the same form re-included after
+- Deliverable and verification settings: `export_exclude` (extra case-sensitive `fnmatch` patterns of workspace paths
+  that are neither exported to `deliverables/` nor linted; a pattern matches any path component or a leading part of
+  the workspace-relative POSIX path, as `maf.lint.excluded` does; default empty, because the patterns add to
+  `maf.vault.DEFAULT_EXPORT_EXCLUDES`, which `maf.stages.base.export_excludes(settings)` always applies, so pipeline
+  state, `inputs/`, `.claude/`, the kernel, build output, caches and virtualenvs are never exported, see vault.py;
+  setting it cannot re-export a default, `export_include` does that; the execution and cross-check lint and the source
+  audit use the same `export_excludes`, so they check exactly what ships; empty, absolute and `!` patterns are
+  refused), `export_include` (patterns of the same form re-included after
   the excludes, as a gitignore's `!` lines, e.g. `build/*.cmake`, but never `maf.vault.PROTECTED_EXPORT_EXCLUDES`;
   default none),
   `export_max_mb` (cap on the exported tree in MiB, default 200; `export_max_bytes`), `cleanroom_budget_usd` (the
@@ -166,8 +191,10 @@ Claude Code sandbox (verified live 2026-09-28):
   get `TMPDIR=<TMPDIR>/claude-<uid>`, budgeted at 44 bytes (`CLI_CHILD_TMPDIR_MAX_BYTES`) so their own sockets fit,
   while the runtime's sockets add at most 35 bytes to `TMPDIR`. So a `TMPDIR` longer than
   `max_tmpdir_bytes() = 44 - len("/claude-<uid>")` (32 bytes for a 4-digit uid, which allows a `claude_code_tmp_base`
-  of at most 15 bytes) is refused before spawning (`ProviderError`, cost 0, not retryable). `MPLCONFIGDIR` stays in
-  `<workspace>/.maf/mpl`.
+  of at most 15 bytes) is refused before spawning (`ProviderError`, cost 0, not retryable). The rule lives in
+  `maf.sandbox` (`max_tmpdir_bytes`, `tmpdir_bytes`, `check_tmp_base`, with `scratch_tmpdir` and
+  `check_scoped_tools`), and settings apply it when they load, so a too-long `claude_code_tmp_base` fails before a
+  run starts. `MPLCONFIGDIR` stays in `<workspace>/.maf/mpl`.
 - `BASH_MAX_TIMEOUT_MS` (from `bash_timeout_s`, `Settings.bash_timeout_s`) raises the longest Bash timeout: 2.1.284 caps
   it at 10 minutes otherwise (`l=600000` in the binary, overridden only by that variable), so a long reproduction
   never reached `; echo $? > REPRO_EXIT`. The per-command default stays 2 minutes (`BASH_DEFAULT_TIMEOUT_MS`), except
@@ -667,6 +694,13 @@ and writes run.md, in that order, so a crash repeats at most the current stage.
 `export(run_id) -> (RunIndex, Export)` rewrites `deliverables/` with `maf.stages.final.export_run` under the run lock
 (`RuntimeError` while the run is advanced elsewhere) at any status, with no model calls, and sets `exported_at`,
 `export_note` (`maf export: ...`) and `updated`; a refused export (`ExportError`) writes nothing.
+Workspace guard: `run`, `resume` (after its no-op and `extra_round` checks) and `export` call
+`Pipeline.check_workspace(index)` under the run lock before writing anything. It raises `WorkspaceMoved` (a
+`ValueError`) when `index.workspace` is non-empty, differs from `vault.paths(run_id).workspace` (the current
+`<workspaces_path>/<run_id>`) and that path does not exist: `workspaces_path` changed, or its default moved with the
+installation (`default_data_root`). The message names both paths and `--workspaces <recorded parent>`. Without it a
+resume would build providers for the new path and Claude Code would create it empty (no `inputs/`, no earlier build)
+and run paid sessions there. A workspace moved along with the setting, or missing at the recorded path, passes.
 `create(..., input_root=, origin=, owner=)`: with `input_root` (MCP) every input-file problem raises the same
 `ValueError` (`not_an_inbox_file`: `not an allowed inbox file: <as given>`), and confinement is checked before
 existence, so a remote caller learns nothing about files outside the inbox. `fail_orphans()` marks FAILED, under the
@@ -694,17 +728,24 @@ final left them, and the half-done workspace stays in `workspaces/` for `maf res
 
 ### cli.py (E)
 `maf run | resume | status | list | export | serve [--stdio] [--uds PATH] [--env-file PATH] | chatgpt setup|status`,
-with the global `--vault --workspaces --config`. `chatgpt` needs settings but never builds a pipeline (no vault or
+with the global `--vault --workspaces --config`, and `maf --version` (`maf <maf.__version__>`). `run --review` /
+`--no-review` (`BooleanOptionalAction`, default None) set the run's `review`, overriding `Settings.review`; unset, the
+config decides. Warnings `load_settings` logs (`python_executable_warning`) are held back from logging's bare fallback
+output by a filter on the `maf.config` logger and printed once as `maf: warning: ...` on stderr by every command that
+loads settings (so the maf-mcp journal has them too). `chatgpt` needs settings but never builds a pipeline (no vault or
 workspace folders are created); it exits 0 when ready or done, 1 when not ready, and 2 for usage errors. `chatgpt
 setup` writes the given `--config`/`--vault`/`--workspaces` (or `MAF_CONFIG`/`MAF_VAULT`/`MAF_WORKSPACES`, as absolute
-paths) into maf-mcp's `ExecStart` and `MAF_BUDGET_USD` into an `Environment=` line (`chatgpt.settings_sources`),
-refuses to drop a source the installed unit has (`dropped_sources`), and keeps the installed tunnel-client path and
-health port unless overridden. `serve --stdio` refuses
+paths) into maf-mcp's `ExecStart` and `MAF_BUDGET_USD` into an `Environment=` line (`chatgpt.settings_sources`), plus
+an absolute `XDG_DATA_HOME` when maf has no source checkout (`DATA_HOME_VARIABLE`: an installed copy's default
+workspaces and inbox live under it, and the user manager lacks the shell's value), refuses to drop a source the
+installed unit has (`dropped_sources`; the unit's `XDG_DATA_HOME` only counts while setup runs without a checkout), and
+keeps the installed tunnel-client path and health port unless overridden. `serve --stdio` refuses
 `--host`/`--port`/`--uds`; `--env-file` loads a 0600 `KEY=value` file into maf's environment; `serve` drops
 `CONTROL_PLANE_*` from it, exits 2 for usage/config errors and 1 when it cannot listen. Exit codes of `run`/`resume`
 follow the run status: 0 completed (also awaiting review, or started with `--no-wait`), 2 completed_with_issues,
 1 failed or budget exceeded. Usage errors (bad arguments, unknown run, bad config, `--extra-round` on a run that is not
-completed_with_issues) also exit 2, before anything runs; the output tells them apart. A finished run prints the
+completed_with_issues, a `WorkspaceMoved` run) also exit 2, before anything runs; the output tells them apart.
+`maf status` prints a `WorkspaceMoved` message as `maf: warning: ...` on stderr and exits 0. A finished run prints the
 05-final path as the last stdout line; completed_with_issues then ends with one stderr line
 (`completed with issues: N unresolved critical issue(s) after the cross-check loop cap; see <04-crosscheck-rN.md>`
 and/or `M acceptance criteria not met (AC-2, clean-room); see <05-final.md>`, joined by `; `, then `(spent ...; one
@@ -718,7 +759,7 @@ partial export adds `partial deliverables (unverified): <deliverables path>` on 
 criteria adds `criteria relaxed to soft as over-specified (not verified as written): AC-3, ...; see ## Relaxed Criteria
 in <05-final.md>` on stderr. `maf export RUN_ID` calls `Pipeline.export` and prints `exported N file(s), SIZE, to <path>` (plus
 left-out placeholders and `ExportResult.excluded_note()`; skipped unsafe entries on stderr): exit 0 on success, 1 when the export is refused (too large,
-no mode, run busy, unreadable file), 2 for an unknown run.
+no mode, run busy, unreadable file), 2 for an unknown run or a `WorkspaceMoved` one.
 
 ### mcp_server.py (E)
 mcp 2.x `MCPServer` (renamed from FastMCP) serves streamable HTTP at `http://127.0.0.1:8765/mcp`, and only loopback
@@ -752,7 +793,8 @@ when `mcp_max_pending_runs` MCP runs are queued or running (`active_count`), or 
 
 ### chatgpt.py (E)
 `maf chatgpt setup` renders `maf-mcp.service` (`maf serve [settings sources] --host --port --uds %t/maf/mcp.sock`,
-`RuntimeDirectory=maf` 0700, `EnvironmentFile=~/.config/maf/maf.env`, `RestartPreventExitStatus=2`, `KillMode=mixed`,
+`RuntimeDirectory=maf` 0700, `EnvironmentFile=~/.config/maf/maf.env`, `Environment=` lines for `MAF_BUDGET_USD` and an
+installed copy's `XDG_DATA_HOME` (`settings_sources`), `RestartPreventExitStatus=2`, `KillMode=mixed`,
 `TimeoutStopSec` = `mcp_stop_timeout(settings.claude_code_timeout_s)`: `MCP_STOP_SESSIONS` (3) sessions plus
 `MCP_STOP_MARGIN_S` (30 min), rounded up to the minute, `5h` by default, so a stop never SIGKILLs a Claude Code session
 whose spend would then be missing from the ledger; `UnitParams.stop_timeout`; bwrap-compatible hardening) and

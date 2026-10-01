@@ -186,7 +186,7 @@ The three runs not described above are earlier iterations, run while the framewo
 
 ## Installation
 
-The defaults assume the checkout is at **`~/MultiAgent`**. For another location, see [the config example](#configuration-reference).
+The commands below clone to **`~/MultiAgent`**, but the checkout can live anywhere. Run from its venv, maf keeps `workspaces/` and `inbox/` inside the checkout and gives Claude Code that venv's Python, with no config needed. If you clone elsewhere, change `~/MultiAgent` in the commands you copy.
 
 ### 1. System packages (Ubuntu 24.04)
 
@@ -245,11 +245,13 @@ cd ~/MultiAgent
 python3 -m venv .venv
 .venv/bin/pip install -e '.[science,dev]'
 .venv/bin/maf --help
-.venv/bin/python -m pytest -q          # offline, zero cost: "1437 passed"
+.venv/bin/maf --version                # maf 0.1.0
+.venv/bin/python -m pytest -q          # offline, zero cost: "1496 passed"
 ```
 
 - **The `science` extra** installs numpy, scipy and matplotlib. maf puts this venv's `bin/` first on Claude Code's `PATH`, so a run's simulations and plots use it.
-- **The venv must be at `~/MultiAgent/.venv`**, or `python_executable` must be set. If it is missing, Claude Code silently runs without the venv on its `PATH`.
+- **maf uses the venv it runs from.** `python_executable` defaults to the interpreter running maf, so starting `.venv/bin/maf` is enough. If you set `python_executable` to a path that does not exist, every command prints `maf: warning: python_executable … does not exist …` on stderr (for `maf-mcp.service`, in its journal), and Claude Code runs without that venv.
+- **Run from the checkout, maf keeps its data there.** An editable install (`pip install -e`) is detected as a checkout: `workspaces_path` defaults to `<checkout>/workspaces` and `mcp_inbox` to `<checkout>/inbox`, both ignored by git. A non-editable install uses `~/.local/share/maf/workspaces` and `~/.local/share/maf/inbox` (`$XDG_DATA_HOME/maf/…` if set). Switching between the two (or to another checkout) moves the default, so runs made before are looked for in the new place: `maf resume` and `maf export` then stop with exit 2 and name the `--workspaces` the run was made with, instead of starting over in an empty tree.
 - **`dev`** adds pytest.
 
 ### 5. API keys: use a private env file
@@ -271,13 +273,21 @@ GEMINI_API_KEY=...
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Then load the keys into the `maf` process only, with a shell function in `~/.bashrc` (the function itself contains no secrets):
+Then load the keys into the `maf` process only, with a shell function in `~/.bashrc` (the function itself contains no secrets). Run this in your checkout. It appends the function with the checkout's real path, so it works wherever you cloned:
 
 ```bash
-maf() { ( set -a; . ~/.config/maf/maf.env; set +a; exec ~/MultiAgent/.venv/bin/maf "$@" ); }
+cd ~/MultiAgent      # your checkout
+printf 'maf() { ( set -a; . ~/.config/maf/maf.env; set +a; exec %q "$@" ); }\n' "$PWD/.venv/bin/maf" >> ~/.bashrc
+tail -n 1 ~/.bashrc
 ```
 
-Open a new shell, or run `source ~/.bashrc`. The rest of this README calls this function as `maf`. If your checkout is not at `~/MultiAgent`, change the `exec` path in the function to match.
+For a clone at `~/MultiAgent`, the line it added reads:
+
+```bash
+maf() { ( set -a; . ~/.config/maf/maf.env; set +a; exec /home/you/MultiAgent/.venv/bin/maf "$@" ); }
+```
+
+Open a new shell, or run `source ~/.bashrc`. The rest of this README calls this function as `maf`. If you move the checkout, run the `printf` line again from the new place and delete the old line.
 
 Claude Code's sandbox cannot read `~/.config`, so the agent cannot read the file either. maf never puts `ANTHROPIC_API_KEY` in Claude Code's environment. It hands the key over through a per-call 0600 file that is deleted after the call.
 
@@ -288,7 +298,7 @@ Runs are written to `~/Obsidian/MultiAgent/runs/<run_id>/` by default (`vault_pa
 1. Install Obsidian. Development used the snap: `sudo snap install obsidian --classic`.
 2. Choose **Open folder as vault** and pick **`~/Obsidian/MultiAgent`** itself, not `~/Obsidian`, because deliverable links use vault-root paths.
 
-Large build trees stay outside the vault, in `~/MultiAgent/workspaces/<run_id>/`. Only `deliverables/` is copied into the vault.
+Large build trees stay outside the vault, in `<checkout>/workspaces/<run_id>/` (`~/MultiAgent/workspaces/<run_id>/` for the clone above; `workspaces_path`). Only `deliverables/` is copied into the vault.
 
 ### 7. FreeRTOS kernel (only for FreeRTOS code runs)
 
@@ -815,7 +825,7 @@ For very long sessions, development also used a one-line config, `~/.config/maf/
 maf --config ~/.config/maf/thesis-long.yaml resume <run_id>
 ```
 
-`--config` replaces `~/.config/maf/config.yaml` for that command; it is not layered on top. Copy any other settings you rely on (for example `workspaces_path` and `python_executable` for a checkout outside `~/MultiAgent`) into `thesis-long.yaml`.
+`--config` replaces `~/.config/maf/config.yaml` for that command; it is not layered on top. Copy any other settings you rely on (for example `vault_path` or `budget_usd`) into `thesis-long.yaml`. The checkout-based defaults (`workspaces_path`, `mcp_inbox`, `python_executable`) need no copying.
 
 <details>
 <summary>What actually happened in the development thesis run (from its ledger)</summary>
@@ -873,7 +883,7 @@ rm -rf /tmp/thesis && cp -r ~/Obsidian/MultiAgent/runs/<run_id>/deliverables /tm
 
 `reports/` and `plots/` come out byte-identical. `thesis.md` and `document.md` differ from the vault copy only in image-embed paths: maf's export rewrites `![[x.png]]` to vault-root links such as `![[runs/<run_id>/deliverables/plots/x.png]]`, and `reproduce.py` writes the short form again. The test logs differ only in their timing lines.
 
-If you fix something by hand in `~/MultiAgent/workspaces/<run_id>/`, run `maf export <run_id>` to rewrite `deliverables/`. It makes no model calls and works at any status. The development thesis export was 100 files, 17.9 MB. Obsidian renders the LaTeX (`$…$`, `$$…$$`) and the 14 embedded PNGs natively.
+If you fix something by hand in the workspace (`~/MultiAgent/workspaces/<run_id>/` for the clone above), run `maf export <run_id>` to rewrite `deliverables/`. It makes no model calls and works at any status. The development thesis export was 100 files, 17.9 MB. Obsidian renders the LaTeX (`$…$`, `$$…$$`) and the 14 embedded PNGs natively.
 
 ---
 
@@ -943,7 +953,7 @@ The prompt goes on stdin, and the argv looks like this:
   --allowedTools 'Read(./**)' 'Edit(./**)' Glob Grep Bash --disallowedTools WebFetch WebSearch
 ```
 
-**Working directory.** The cwd is `~/MultiAgent/workspaces/<run_id>/`.
+**Working directory.** The cwd is `<workspaces_path>/<run_id>/`, by default `<checkout>/workspaces/<run_id>/`.
 
 **`--settings` JSON.** It turns on the bubblewrap sandbox with `failIfUnavailable: true`. Writes are allowed only to the workspace and a private `TMPDIR=/tmp/maf-<12 hex>`. There is no network: `allowedDomains` is empty. Read and Edit are denied on `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config`, `~/.claude`, shell rc files and histories, and the vault.
 
@@ -989,7 +999,7 @@ cd ~/MultiAgent && scripts/chatgpt-setup-wizard.sh
 What it does, which you can also do by hand:
 
 1. **Install tunnel-client.** `scripts/install-tunnel-client.sh` installs a pinned v0.0.15 with a SHA-256 check to `~/.local/bin/tunnel-client`.
-2. **Install the units.** `maf chatgpt setup` installs `maf-mcp.service` and `maf-tunnel.service` as systemd user units. It writes 0600 templates `~/.config/maf/maf.env` and `~/.config/maf/tunnel.env`, but never overwrites filled-in files. It creates the input inbox `~/MultiAgent/inbox` with mode 0700. An existing inbox is left as it is, so run `chmod 700 ~/MultiAgent/inbox` yourself.
+2. **Install the units.** `maf chatgpt setup` installs `maf-mcp.service` and `maf-tunnel.service` as systemd user units. It writes 0600 templates `~/.config/maf/maf.env` and `~/.config/maf/tunnel.env`, but never overwrites filled-in files. It creates the input inbox (`mcp_inbox`, by default `<checkout>/inbox`, so `~/MultiAgent/inbox` for the clone above) with mode 0700. An existing inbox is left as it is, so run `chmod 700 ~/MultiAgent/inbox` (your inbox path) yourself. The units run the `maf` of the venv you ran setup with, wherever the checkout is. For a non-editable install, whose inbox and workspaces default to `$XDG_DATA_HOME/maf/`, setup also writes your shell's `XDG_DATA_HOME` (if set to an absolute path) into `maf-mcp.service`, so the service uses the same inbox and workspaces as the CLI.
 3. **Create a tunnel.** On platform.openai.com go to *Settings → Organization → Tunnels → Create tunnel*. Copy the `tunnel_…` id.
 4. **Create a runtime key.** Make a **Restricted** API key with only *Tunnels: Read + Use*. Never use your `OPENAI_API_KEY` here.
 5. **Fill in the env files.** `tunnel.env` gets `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY`. `maf.env` gets the three provider keys; services do not read `~/.bashrc`.
@@ -1029,7 +1039,7 @@ For the smoke run, `get_run_status` returns `"status": "completed", "spent_usd":
 | Highest budget a client may request; also the default MCP budget | $5 | `mcp_max_budget_usd` |
 | Rolling 24 h spend of MCP-started runs (CLI runs don't count) | $25 | `mcp_daily_budget_usd` |
 | MCP runs queued or running at once (they run one at a time) | 2 | `mcp_max_pending_runs` |
-| Input files | only from `~/MultiAgent/inbox` | `mcp_inbox` |
+| Input files | only from `<checkout>/inbox` (`~/MultiAgent/inbox` above) | `mcp_inbox` |
 | `Origin` headers accepted | none | `mcp_allowed_origins`, e.g. `["https://chatgpt.com"]` |
 
 The `--review` gate is always off for MCP runs. A $5 code run gets its execution session, but usually no fix pass. For bigger work, use the CLI, or continue the run with `maf resume RUN_ID --budget 25`. A resumed MCP run still counts toward the daily cap for 24 hours after it was created.
@@ -1047,15 +1057,15 @@ None of this protects against processes running as you, or against a compromised
 
 ## Command reference
 
-The global options `--vault PATH`, `--workspaces PATH` and `--config PATH` work before or after the subcommand. `maf <command> --help` shows each command's flags.
+The global options `--vault PATH`, `--workspaces PATH` and `--config PATH` work before or after the subcommand. `maf <command> --help` shows each command's flags, and `maf --version` prints the version.
 
 | Command | Flags | What it does |
 |---|---|---|
-| `maf run "BRIEF"` | `--file PATH` (repeatable), `--budget USD`, `--tier default\|max`, `--review`, `--no-wait` | Creates a run and executes it. A missing `--file` fails before anything is created (exit 2). |
-| `maf resume RUN_ID` | `--note TEXT`, `--budget USD` (a new absolute cap), `--extra-round` | Continues a paused, failed, stopped or crashed run. `--extra-round` is for `completed_with_issues` runs only. |
-| `maf status RUN_ID` | `--json` | One run. `--json` prints the whole `run.md` frontmatter as JSON. |
+| `maf run "BRIEF"` | `--file PATH` (repeatable), `--budget USD`, `--tier default\|max`, `--review` or `--no-review`, `--no-wait` | Creates a run and executes it. `--review`/`--no-review` override the config's `review` for this run. A missing `--file` fails before anything is created (exit 2). |
+| `maf resume RUN_ID` | `--note TEXT`, `--budget USD` (a new absolute cap), `--extra-round` | Continues a paused, failed, stopped or crashed run. `--extra-round` is for `completed_with_issues` runs only. Refused (exit 2, nothing changed) when `run.md` records the workspace under another `workspaces_path` and nothing is at the current one. |
+| `maf status RUN_ID` | `--json` | One run. `--json` prints the whole `run.md` frontmatter as JSON. Warns on stderr when `resume` and `export` would refuse the run because its workspace is recorded elsewhere. |
 | `maf list` | `--json`, `--limit N` (default 20) | Runs, newest first. `--json` gives `run_id`, `status`, `stage`, `spent_usd`, `created`. |
-| `maf export RUN_ID` | | Rewrites `deliverables/` from the workspace. No model calls; any status. |
+| `maf export RUN_ID` | | Rewrites `deliverables/` from the workspace. No model calls; any status. Exit 1 when the export is refused (too large, run busy, no workspace), 2 for an unknown run or a workspace recorded under another `workspaces_path`. |
 | `maf serve` | `--host`, `--port`, `--uds PATH`, `--env-file PATH`; or `--stdio [--env-file PATH]` | The MCP endpoint for the ChatGPT app. `--uds` serves HTTP on a 0600 Unix socket instead of the TCP port. `--stdio` serves MCP over stdin/stdout. `--env-file` loads provider keys from a private 0600 `KEY=value` file. Normally run by `maf-mcp.service`. |
 | `maf chatgpt setup` | `--no-reload`, `--tunnel-client PATH`, `--health-port N` | Installs the systemd user units and 0600 env templates. |
 | `maf chatgpt status` | `--lines N` (default 10), `--tunnel-client PATH` | Checks the units, logs, MCP health and tunnel readiness. Shows no secrets. |
@@ -1094,7 +1104,7 @@ Later rounds add a `-rN` suffix, for example `03-execution-r2` and `04-crosschec
 ├── assets/
 └── deliverables/       exported artifacts (for code/mixed: the whole workspace tree minus pipeline state and build output)
 
-~/MultiAgent/workspaces/<run_id>/     Claude Code's working tree: inputs/, .maf/ (prompts, review-note.md, run.log), FreeRTOS-Kernel/
+<checkout>/workspaces/<run_id>/       Claude Code's working tree: inputs/, .maf/ (prompts, review-note.md, run.log), FreeRTOS-Kernel/
 ```
 
 ### Handoff contract
@@ -1163,9 +1173,9 @@ A code or mixed run that stops `failed` or `budget_exceeded` after execution wro
 | `run`/`resume` ended `completed` or `awaiting_review`, or `run --no-wait` started | 0 |
 | `run`/`resume` ended `completed_with_issues` (stderr starts with `completed with issues:`) | 2 |
 | `run`/`resume` ended `failed` or `budget_exceeded` | 1 |
-| A usage error, an unknown run, or a bad config (stderr starts with `usage:` from argparse, or with `maf:`). Nothing runs. | 2 |
+| A usage error, an unknown run, a bad config, or (for `resume`/`export`) a run whose workspace is recorded under another `workspaces_path` (stderr starts with `usage:` from argparse, or with `maf:`). Nothing runs. | 2 |
 | `status` / `list` | 0 (an unknown run gives 2) |
-| `export` | 0 exported, 1 refused, 2 unknown run |
+| `export` | 0 exported, 1 refused, 2 unknown run or workspace recorded elsewhere |
 | `chatgpt setup` | 0 installed, 1 `systemctl --user daemon-reload` failed, 2 usage error |
 | `chatgpt status` | 0 ready, 1 not ready, 2 usage error |
 
@@ -1201,13 +1211,18 @@ Every call appends one line to `runs/<id>/ledger.jsonl`. This is a real line fro
 1. built-in defaults;
 2. the YAML file: `--config`, else `$MAF_CONFIG`, else `~/.config/maf/config.yaml`;
 3. the environment variables `MAF_VAULT`, `MAF_WORKSPACES` and `MAF_BUDGET_USD`;
-4. the CLI flags `--vault`, `--workspaces`, and `--budget`/`--tier`/`--review` on `run`.
+4. the CLI flags `--vault`, `--workspaces`, and `--budget`/`--tier`/`--review`/`--no-review` on `run`.
 
 **Rules:**
 
 - Only one YAML file is read. `--config` or `$MAF_CONFIG` replaces `~/.config/maf/config.yaml`; files are not merged.
 - A missing config file means all defaults.
-- Unknown top-level keys are an error (exit 2, `maf: bad configuration: …`).
+- The config is checked when it loads, before any run is created or anything is spent. These are errors (exit 2, `maf: bad configuration: …`):
+  - unknown keys at the top level (the message names each one and suggests the closest known key, such as `claude_code_timout_s (did you mean claude_code_timeout_s?)`) or inside a block such as `output_limits` (the message names the key and the block's allowed keys);
+  - a model ID in the selected tier or in `stage_model_overrides` that has no price for today (the message lists the known model IDs);
+  - a `claude_code_tmp_base` too long for the sandbox's socket paths;
+  - a bare `Read`/`Edit`/`Write` rule in `claude_code_tools`.
+- A `python_executable` that does not exist is only a warning (`maf: warning: …` on stderr), so `--help` and prose runs still work.
 - Path values expand `~`.
 
 The most used keys:
@@ -1215,8 +1230,8 @@ The most used keys:
 | Key | Default | Meaning |
 |---|---|---|
 | `vault_path` | `~/Obsidian/MultiAgent` | Obsidian vault; runs go to `<vault>/runs/<run_id>/` |
-| `workspaces_path` | `~/MultiAgent/workspaces` | Build trees. Must be outside the vault. |
-| `python_executable` | `~/MultiAgent/.venv/bin/python` | Its `bin/` goes first on Claude Code's `PATH` |
+| `workspaces_path` | `<checkout>/workspaces` | Build trees. Must be outside the vault. |
+| `python_executable` | the Python running maf | Its `bin/` goes first on Claude Code's `PATH` |
 | `budget_usd` | `25` | Default per-run cap (used at creation) |
 | `claude_code_timeout_s` | `5400` | Wall clock of one Claude Code session (one continuation after a timeout) |
 | `freertos_path` | `~/.local/share/maf/FreeRTOS-Kernel` | Kernel copied into code-mode workspaces (`null` = none) |
@@ -1227,52 +1242,52 @@ The most used keys:
 | Key | Default | Meaning |
 |---|---|---|
 | `vault_path` | `~/Obsidian/MultiAgent` | Obsidian vault; runs go to `<vault>/runs/<run_id>/` |
-| `workspaces_path` | `~/MultiAgent/workspaces` | Build trees. Must be outside the vault. |
-| `python_executable` | `~/MultiAgent/.venv/bin/python` | Its `bin/` goes first on Claude Code's `PATH` |
+| `workspaces_path` | `<checkout>/workspaces`; installed copies `~/.local/share/maf/workspaces` | Build trees. Must be outside the vault. A run's workspace is `<workspaces_path>/<run_id>`, so changing this moves where existing runs are looked for (`resume` and `export` refuse a run whose recorded workspace is not at the new place, naming the old root). |
+| `python_executable` | the Python running maf (its venv) | Its `bin/` goes first on Claude Code's `PATH`. A missing one is a warning. |
 | `claude_executable` | `~/.local/bin/claude` | Claude Code CLI |
 | `budget_usd` | `25` | Default per-run cap (used at creation) |
 | `tier` | `default` | `default` or `max` |
-| `review` | `false` | Pause after strategy. There is no `--no-review` flag to undo `true` for a single run. |
+| `review` | `false` | Pause after strategy. `maf run --review` or `--no-review` overrides it for one run. |
 | `max_crosscheck_loops` | `2` | Extra execution + cross-check rounds after round 1 |
-| `stage_model_overrides` | `{}` | `{stage: {role: model}}` |
-| `output_limits` | chatgpt 16000, gemini 32000, claude 64000, `claude_code_budget_usd` 8.0 | Max output tokens per call; budget of one Claude Code session. **Typos in these sub-keys are silently ignored.** |
+| `stage_model_overrides` | `{}` | `{stage: {role: model}}`. Every model must be in the price table, or the config is refused. |
+| `output_limits` | chatgpt 16000, gemini 32000, claude 64000, `claude_code_budget_usd` 8.0 | Max output tokens per call; budget of one Claude Code session. An unknown sub-key is an error. |
 | `claude_code_timeout_s` | `5400` | Wall clock of one Claude Code session (one continuation after a timeout) |
 | `claude_code_bash_timeout_s` | `null` (75% of the session timeout) | Longest single Bash command |
 | `claude_code_min_session_usd` / `_share` | `3.0` / `0.25` | Minimum session budget |
 | `claude_code_preflight_budget_usd` | `null` (a cap of about $0.44 on Opus) | Sandbox preflight budget cap. The preflight cost $0.03–0.06 in development. |
-| `claude_code_tmp_base` | `/tmp` | Parent of the private `TMPDIR`. At most 15 bytes, so the sandbox's socket paths fit. |
-| `claude_code_tools` | `Read(./**)`, `Edit(./**)`, `Glob`, `Grep`, `Bash` | Allowed tools. A bare `Read`/`Edit`/`Write` is rejected. |
+| `claude_code_tmp_base` | `/tmp` | Parent of the private `TMPDIR`. At most 15 bytes (for a 4-digit uid), so the sandbox's socket paths fit; checked at load. |
+| `claude_code_tools` | `Read(./**)`, `Edit(./**)`, `Glob`, `Grep`, `Bash` | Allowed tools. A bare `Read`/`Edit`/`Write` is rejected at load. |
 | `provider_timeout_s` | `600` | HTTP timeout of the OpenAI, Gemini and Anthropic calls |
 | `freertos_path` | `~/.local/share/maf/FreeRTOS-Kernel` | Kernel copied into code-mode workspaces (`null` = none) |
-| `export_exclude` | `.maf .git FreeRTOS-Kernel __pycache__ *.pyc .pytest_cache .mypy_cache .ruff_cache .venv venv node_modules .DS_Store` | Extra patterns left out of the export (and skipped by lint and the source audit). Setting it replaces this list. Pipeline state (`.maf`, `.claude`), version control, the kernel, `inputs/` and build output (`build/*`, `*.o`, `*.elf`, …) are always excluded. |
-| `export_include` / `export_max_mb` | `[]` / `200` | Patterns brought back after the excludes / the export size cap |
+| `export_exclude` | `[]` | Extra patterns left out of the export (and skipped by lint and the source audit). They add to the built-in list, which always applies: pipeline state (`.maf`, `.claude`), version control, the kernel, `inputs/`, build output (`build/*`, `*.o`, `*.elf`, …), caches and virtualenvs (`__pycache__`, `*.pyc`, `.venv`, `node_modules`, …). |
+| `export_include` / `export_max_mb` | `[]` / `200` | Patterns brought back after the excludes, built-in ones included (never pipeline state, version control, the kernel or `inputs/`) / the export size cap |
 | `cleanroom_budget_usd` | `1.5` | Clean-room rebuild budget |
 | `source_audit` / `source_audit_max_refs` | `true` / `60` | Gemini audit of cited references |
 | `mcp_host` / `mcp_port` | `127.0.0.1` / `8765` | `maf serve` address (loopback only) |
-| `mcp_inbox` | `~/MultiAgent/inbox` | The only place `start_run` files may come from |
+| `mcp_inbox` | `<checkout>/inbox`; installed copies `~/.local/share/maf/inbox` | The only place `start_run` files may come from (`null`: none) |
 | `mcp_max_budget_usd` / `mcp_daily_budget_usd` / `mcp_max_pending_runs` | `5` / `25` / `2` | Limits for ChatGPT-started runs |
 | `mcp_allowed_origins` | `[]` | Exact Origins accepted by `maf serve` |
 
 </details>
+
+`<checkout>` is the source checkout maf runs from: the directory holding `pyproject.toml` and `src/maf/`, which an editable install (`pip install -e`) keeps using. A non-editable install has no checkout and uses `$XDG_DATA_HOME/maf/` (default `~/.local/share/maf/`) instead; `maf chatgpt setup` copies an absolute `XDG_DATA_HOME` into the service for such an install, since systemd does not read your shell's. A checkout anywhere needs no path settings; existing runs keep their workspaces as long as `workspaces_path` stays the same. If it changes, explicitly or because maf now runs from another checkout or install, `maf resume` and `maf export` stop with exit 2 before anything runs and name the `--workspaces` to pass.
 
 **Example configs.** A minimal one (all keys optional):
 
 ```yaml
 # ~/.config/maf/config.yaml -- every key is optional
 vault_path: ~/Obsidian/MultiAgent
-workspaces_path: ~/MultiAgent/workspaces
 budget_usd: 10
+export_exclude: [results/raw]      # added to the built-in excludes
 ```
 
-For a checkout outside `~/MultiAgent` (here `~/src/MultiAgent`):
+To keep build trees somewhere else, for example on a bigger disk:
 
 ```yaml
-workspaces_path: ~/src/MultiAgent/workspaces
-python_executable: ~/src/MultiAgent/.venv/bin/python
-mcp_inbox: ~/src/MultiAgent/inbox
+workspaces_path: /data/maf/workspaces
 ```
 
-Also change the path in the [`maf()` shell function](#5-api-keys-use-a-private-env-file) to `~/src/MultiAgent/.venv/bin/maf`.
+maf looks for every run's workspace under `workspaces_path`, so move existing workspaces along. A run whose workspace is not at the new place is refused by `maf resume` and `maf export` (exit 2, nothing runs or changes), with a message naming the recorded path and the `--workspaces` that finds it; `maf status` prints the same as a warning.
 
 **Default file locations:**
 
@@ -1282,7 +1297,8 @@ Also change the path in the [`maf()` shell function](#5-api-keys-use-a-private-e
 | Provider keys (your env file, and the ChatGPT service's) | `~/.config/maf/maf.env` (0600) |
 | Tunnel id and runtime key | `~/.config/maf/tunnel.env` (0600) |
 | Per-call Anthropic key files | `~/.config/maf/secrets/` (0700; deleted after each call) |
-| Clean-room copies | `~/MultiAgent/workspaces/.maf-cleanroom/<run_id>/` |
+| Workspaces and the ChatGPT inbox | `<checkout>/workspaces/<run_id>/`, `<checkout>/inbox/` (installed copies: `~/.local/share/maf/…`) |
+| Clean-room copies | `<workspaces_path>/.maf-cleanroom/<run_id>/` |
 | systemd user units | `~/.config/systemd/user/maf-{mcp,tunnel}.service` (templates in `contrib/systemd/`) |
 
 ---
@@ -1326,16 +1342,18 @@ Also change the path in the [`maf()` shell function](#5-api-keys-use-a-private-e
 | Symptom | Cause and fix |
 |---|---|
 | `failed: … Claude Code's Bash sandbox is unavailable (bwrap: …)` or `sandbox preflight failed` | Bubblewrap cannot create namespaces. On Ubuntu 24.04, install the [AppArmor profile](#2-bubblewrap-and-apparmor-ubuntu-2404) and check with `bwrap --ro-bind / / --dev /dev --unshare-all true && echo ok`. Then `maf resume RUN_ID`. |
-| `failed to create bridge sockets` / socket path errors | The sandbox's Unix socket paths are too long. maf uses a short `TMPDIR` under `claude_code_tmp_base` (`/tmp`). Keep that at 15 bytes or fewer; maf refuses longer values before calling Claude Code. |
+| `failed to create bridge sockets` / socket path errors | The sandbox's Unix socket paths are too long. maf uses a short `TMPDIR` under `claude_code_tmp_base` (`/tmp`). Keep that at 15 bytes or fewer; maf refuses longer values when the config loads. |
 | `ANTHROPIC_API_KEY is not set …`, `OPENAI_API_KEY is not set` or `GEMINI_API_KEY is not set` | Keys are read lazily, so the run failed at its first call needing that key. Load `~/.config/maf/maf.env` (see [keys](#5-api-keys-use-a-private-env-file)), then `maf resume RUN_ID`. |
 | `budget exceeded: …` / `raise the cap with: maf resume RUN_ID --budget USD` | Expected behaviour: the next call's worst case did not fit. Resume with a higher absolute cap. Small prose runs need about $3; code runs need about $10 left for a full Claude Code session. |
 | `failed: <stage>: ClaudeCodeTimeout: the Claude Code <purpose> session and its one continuation both timed out …`, for example `failed: execution: ClaudeCodeTimeout: the Claude Code execution session …` or `failed: crosscheck: ClaudeCodeTimeout: the Claude Code fixes session …` | Two 90-minute sessions in a row timed out. Their work stays in the workspace. Resume with a `--note` asking for shorter commands, and/or a config with a longer `claude_code_timeout_s`. |
 | Exit 2 with `completed with issues: …` | Not a crash. Read `## Acceptance`, `## Relaxed Criteria` and `## Limitations` in `05-final.md`. Accept the result, or run `maf resume RUN_ID --extra-round [--budget USD]`. |
-| Exit 2 with `usage: …` or `maf: …` | A usage or config error (argparse errors print `usage: maf …` then `maf <command>: error: …`), for example an unknown YAML key, workspaces inside the vault, or `resume` of a `completed_with_issues` run without `--extra-round`. Nothing ran. |
+| Exit 2 with `usage: …` or `maf: …` | A usage or config error (argparse errors print `usage: maf …` then `maf <command>: error: …`), for example an unknown YAML key (also inside `output_limits`), a model ID without a price, workspaces inside the vault, or `resume` of a `completed_with_issues` run without `--extra-round`. Nothing ran. |
+| `maf: run … has its workspace at … (run.md), but workspaces_path … puts it at …, which does not exist` (exit 2 from `resume` or `export`; a `maf: warning:` from `status`) | The run was made with another `workspaces_path`: a `--workspaces`, `MAF_WORKSPACES` or config value left out now, or a default that moved because maf runs from another checkout, a non-editable install, or with another `XDG_DATA_HOME`. Nothing ran or changed. Pass the `--workspaces` the message names (or set `workspaces_path` to it), or move the workspace to the new place. |
 | `resume`: `already running in another process` | Another `maf` process holds `runs/<id>/.lock`. Wait for it, or stop it first. |
 | `failed` after a strategy edit at the review gate | Your `02-strategy.md` no longer validates. The error lists the problems (missing sections, bad `AC-n` lines). Fix them and `maf resume`. |
-| Run went to `~/MultiAgent/workspaces` though the repo is elsewhere | The defaults assume `~/MultiAgent`. Set `workspaces_path`, `python_executable` and `mcp_inbox` ([example](#configuration-reference)). |
-| Simulations fail with `No module named numpy` in the workspace | `python_executable`'s venv is missing or lacks the `science` extra: `.venv/bin/pip install -e '.[science]'`. |
+| `maf: warning: python_executable … does not exist` | The configured interpreter is gone (a deleted or moved venv), so Claude Code runs without it. Remove `python_executable` from the config to use the venv maf runs from, or point it at the right one. |
+| Runs go to `~/.local/share/maf/workspaces` | maf is a non-editable install, so it has no checkout to keep data in. Reinstall with `pip install -e .` from the checkout, or set `workspaces_path` and `mcp_inbox`. |
+| Simulations fail with `No module named numpy` in the workspace | The venv maf runs from (or `python_executable`) lacks the `science` extra: `.venv/bin/pip install -e '.[science]'`. |
 | Allocator `make` fails at `freertos` with `FreeRTOS-Kernel/... No such file or directory` | Pass `FRTOS="$HOME/.local/share/maf/FreeRTOS-Kernel"`. |
 | Allocator `make` fails at `plots` with `No module named 'matplotlib'` | Pass `PY="$HOME/MultiAgent/.venv/bin/python"`. |
 | Allocator `make` stops at `NEGATIVE CONTROL NOT TRIGGERED` | The known flaky race (up to about 8% of runs). Re-run `make freertos-negative FRTOS="$HOME/.local/share/maf/FreeRTOS-Kernel"`; without `FRTOS=` it fails to compile. |
@@ -1347,7 +1365,7 @@ Also change the path in the [`maf()` shell function](#5-api-keys-use-a-private-e
 
 ```bash
 cd ~/MultiAgent
-.venv/bin/python -m pytest -q        # 1437 passed in ~30 s: offline, no API keys needed, zero cost
+.venv/bin/python -m pytest -q        # 1496 passed in ~30 s: offline, no API keys needed, zero cost
 ```
 
 ```text

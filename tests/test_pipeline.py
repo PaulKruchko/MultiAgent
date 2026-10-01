@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ import pytest
 from maf.config import Settings
 from maf.handoff import HandoffInvalid, HandoffKind, HandoffMeta, build_handoff
 from maf.ledger import metered_call
-from maf.pipeline import ALLOWED_INDEX_UPDATES, REVIEW_NOTE_REL, Pipeline, Step, next_step
+from maf.pipeline import ALLOWED_INDEX_UPDATES, REVIEW_NOTE_REL, Pipeline, Step, WorkspaceMoved, next_step
 from maf.providers import CompletionRequest, ProviderError
 from maf.stages.base import NoteOut, StageContext, StageOutput
 from maf.stages.final import CLEANROOM_ROOT, REPRO_EXIT, REPRO_LOG, cleanroom_dir
@@ -752,6 +753,103 @@ def test_second_concurrent_run_of_same_id_is_rejected(h: Harness) -> None:
         release.set()
         worker.join(5)
     assert results and results[0].status == RunStatus.COMPLETED
+
+
+# --------------------------------------------------------------------------- a workspace recorded elsewhere
+
+
+def _moved_root(h: Harness, tmp_path: Path) -> tuple[Pipeline, list[Path]]:
+    """A pipeline on the same vault whose ``workspaces_path`` is another root (the default moved with the installation,
+    or ``--workspaces`` left out), with a providers factory that records every workspace it is built for."""
+    built: list[Path] = []
+    fakes = h.fakes.factory()
+
+    def factory(settings: Settings, workspace: Path):  # type: ignore[no-untyped-def]
+        built.append(workspace)
+        return fakes(settings, workspace)
+
+    moved = Pipeline(h.settings.model_copy(update={"workspaces_path": tmp_path / "elsewhere"}),
+                     providers_factory=factory, backends=h.backends, clock=h.clock)
+    return moved, built
+
+
+def test_resume_refuses_a_run_whose_workspace_is_recorded_under_another_root(h: Harness, tmp_path: Path) -> None:
+    """A resume must not build providers for, or run paid sessions in, a fresh empty tree at the new root: it is refused
+    before anything is written, naming both paths and the --workspaces that finds the run again."""
+    h["execution"].script = [lambda ctx: (_ for _ in ()).throw(RuntimeError("crash"))]
+    run_id = h.pipeline.run(h.pipeline.create("x").run_id).run_id
+    run_md = h.pipeline.vault.paths(run_id).run_md
+    before = run_md.read_text(encoding="utf-8")
+    recorded = h.pipeline.status(run_id).workspace
+    moved, built = _moved_root(h, tmp_path)
+    calls = {stage: h[stage].calls for stage in STAGE_ORDER}
+
+    with pytest.raises(WorkspaceMoved) as caught:
+        moved.resume(run_id, note="go on", budget_usd=50.0)
+    message = str(caught.value)
+    assert recorded in message and str(tmp_path / "elsewhere" / run_id) in message
+    assert f"--workspaces {h.settings.workspaces_path}" in message and "workspaces_path" in message
+    assert isinstance(caught.value, ValueError)  # the CLI's usage error (exit 2)
+    assert run_md.read_text(encoding="utf-8") == before  # status, budget and error unchanged
+    assert built == [] and all(not f.calls for f in h.fakes.all())
+    assert {stage: h[stage].calls for stage in STAGE_ORDER} == calls
+    assert not (tmp_path / "elsewhere").exists()  # not even the review note's directory
+
+    for stuck in (RunStatus.RUNNING, RunStatus.PENDING):  # a crashed or queued run, continued by run()
+        index = h.pipeline.status(run_id)
+        index.status = stuck
+        h.pipeline.vault.write_index(index)
+        stuck_md = run_md.read_text(encoding="utf-8")
+        with pytest.raises(WorkspaceMoved):
+            moved.run(run_id)
+        assert run_md.read_text(encoding="utf-8") == stuck_md
+    assert built == []
+
+
+def test_extra_round_and_export_refuse_a_workspace_recorded_under_another_root(h: Harness, tmp_path: Path) -> None:
+    h["crosscheck"].default = lambda ctx: StageOutput(notes=[], index_updates={"unresolved_critical": 1})
+    run_id = h.pipeline.run(h.pipeline.create("x").run_id).run_id
+    assert h.pipeline.status(run_id).status == RunStatus.COMPLETED_WITH_ISSUES
+    run_md = h.pipeline.vault.paths(run_id).run_md
+    before = run_md.read_text(encoding="utf-8")
+    moved, built = _moved_root(h, tmp_path)
+
+    with pytest.raises(WorkspaceMoved):
+        moved.resume(run_id, extra_round=True)
+    with pytest.raises(WorkspaceMoved):
+        moved.export(run_id)
+    assert run_md.read_text(encoding="utf-8") == before and built == []
+    assert moved.resume(run_id).status == RunStatus.COMPLETED_WITH_ISSUES  # a no-op resume stays a no-op
+    with pytest.raises(WorkspaceMoved, match="does not exist"):
+        moved.check_workspace(moved.status(run_id))
+    h.pipeline.check_workspace(h.pipeline.status(run_id))  # the root it was recorded under
+
+
+def test_a_workspace_found_at_the_new_root_or_recorded_there_resumes(h: Harness, tmp_path: Path) -> None:
+    """The guard only stops a resume that would start from nothing: a tree moved along with ``workspaces_path``, or a
+    run whose recorded path matches (missing or not), continues as before."""
+    h["execution"].script = [lambda ctx: (_ for _ in ()).throw(RuntimeError("crash"))]
+    run_id = h.pipeline.run(h.pipeline.create("x").run_id).run_id
+    moved, built = _moved_root(h, tmp_path)
+    (tmp_path / "elsewhere").mkdir()
+    h.pipeline.vault.paths(run_id).workspace.rename(tmp_path / "elsewhere" / run_id)
+
+    assert moved.resume(run_id).status == RunStatus.COMPLETED
+    assert built == [tmp_path / "elsewhere" / run_id]
+
+    h["execution"].script = [lambda ctx: (_ for _ in ()).throw(RuntimeError("crash"))]
+    again = h.pipeline.run(h.pipeline.create("y").run_id).run_id
+    shutil.rmtree(h.pipeline.vault.paths(again).workspace)  # deleted, but where run.md says: not a move
+    assert h.pipeline.resume(again).status == RunStatus.COMPLETED
+
+
+def test_runs_recorded_without_a_workspace_are_not_checked(h: Harness, tmp_path: Path) -> None:
+    run_id = h.pipeline.create("x").run_id
+    index = h.pipeline.status(run_id)
+    index.workspace = ""
+    h.pipeline.vault.write_index(index)
+    moved, built = _moved_root(h, tmp_path)
+    assert moved.run(run_id).status == RunStatus.COMPLETED and built == [tmp_path / "elsewhere" / run_id]
 
 
 # --------------------------------------------------------------------------- export (maf export)
