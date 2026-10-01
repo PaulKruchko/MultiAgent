@@ -1,0 +1,49 @@
+{
+  "id": "resp_68d9a1c0f2b4819a",
+  "object": "response",
+  "created_at": 1790596800,
+  "model": "gpt-6-sol-2026-08-14",
+  "status": "completed",
+  "incomplete_details": null,
+  "error": null,
+  "instructions": "You are the strategist.",
+  "max_output_tokens": 16000,
+  "parallel_tool_calls": true,
+  "tool_choice": "auto",
+  "tools": [],
+  "reasoning": {
+    "effort": "high",
+    "summary": null
+  },
+  "text": {
+    "format": {
+      "type": "text"
+    }
+  },
+  "output": [
+    {
+      "id": "msg_68d9a1c7a1e0819a",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "refusal",
+          "refusal": "I can't help with that."
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 300,
+    "input_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0
+    },
+    "output_tokens": 12,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 312
+  }
+}

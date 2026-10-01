@@ -1,0 +1,26 @@
+TLSF stress: TLSF_ALIGN=8 HDR=16 MIN_BLOCK=32 sizeof(void*)=8
+
+== Part A: seeded randomized integrity stress ==
+stress seed=0xc0ffee heap=65536 ops=200000 allocs=94026 frees=93784 failed_allocs=12190 max_live=281 L_crosschecks=201 -> ok
+stress seed=0x5eed0001 heap=65536 ops=200000 allocs=93756 frees=93505 failed_allocs=12739 max_live=279 L_crosschecks=201 -> ok
+stress seed=0xdeadbeef heap=65536 ops=200000 allocs=93840 frees=93603 failed_allocs=12557 max_live=276 L_crosschecks=201 -> ok
+
+== Part B: fragmentation workloads (ext_frag = 1 - L/F, phys_frag = 1 - largest_free/F) ==
+  small_uniform: sizes U[8,256]
+  mixed: 70% U[16,128], 25% U[129,2048], 5% U[2049,16384]
+  pow2: 2^k, k U[3,12]
+  pressure: U[16,512], 2048 slots on 128 KiB (exhaustion)
+| workload | seed | heap | slots | ops | live requested | used footprint | free payload F | largest alloc L | largest free block | header+rounding overhead | final ext_frag | mean ext_frag | max ext_frag | final phys_frag | mean phys_frag | max phys_frag | failed/attempted allocs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small_uniform | 0x1001 | 262144 | 1024 | 100000 | 66462 | 78464 | 180768 | 163824 | 169240 | 12002 | 0.0937 | 0.0875 | 0.1264 | 0.0638 | 0.0555 | 0.1102 | 0/50253 |
+| mixed | 0x1002 | 262144 | 256 | 100000 | 86999 | 89888 | 169840 | 114672 | 117664 | 2889 | 0.3248 | 0.3811 | 0.7791 | 0.3072 | 0.3669 | 0.7710 | 0/50063 |
+| pow2 | 0x1003 | 262144 | 256 | 100000 | 92944 | 95376 | 164352 | 94192 | 94560 | 2432 | 0.4269 | 0.4376 | 0.6758 | 0.4246 | 0.4254 | 0.6634 | 0/50068 |
+| pressure | 0x1004 | 131072 | 2048 | 100000 | 107749 | 124448 | 3584 | 224 | 224 | 16699 | 0.9375 | 0.9311 | 0.9722 | 0.9375 | 0.9302 | 0.9722 | 31774/66247 |
+
+Operation-count maxima over the whole stress run:
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       467082       3       1       1         1      1         0
+malloc_fail      69863       2       0       0         0      0         0
+free            467082       0       1       2         2      0         2
+
+STRESS PASSED (0 errors)

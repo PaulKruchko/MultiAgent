@@ -1,0 +1,72 @@
+TLSF unit tests: TLSF_ALIGN=16 HDR=16 MIN_BLOCK=32 CTRL=1776 FL_COUNT=13 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 13324
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 304, successful fits: 460046, good-fit rejections (block fits but class rounded above): 57728
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       500447       3       1       1         1      1         0
+malloc_fail      72332       2       0       0         0      0         0
+free            499280       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1638656 checks, 0 failures
+UNIT TESTS PASSED
+TLSF unit tests: TLSF_ALIGN=32 HDR=32 MIN_BLOCK=64 CTRL=1664 FL_COUNT=12 SL_COUNT=16 MAX_REGION=1048576 MAX_ALLOC=1015776 sizeof(void*)=8
+[ RUN  ] test_init_invalid
+[  OK  ] test_init_invalid
+[ RUN  ] test_trivial
+[  OK  ] test_trivial
+[ RUN  ] test_alignment
+[  OK  ] test_alignment
+[ RUN  ] test_exact_fit_and_split
+[  OK  ] test_exact_fit_and_split
+[ RUN  ] test_coalesce
+[  OK  ] test_coalesce
+[ RUN  ] test_exhaustion_recovery
+[  OK  ] test_exhaustion_recovery
+[ RUN  ] test_independent_heaps
+[  OK  ] test_independent_heaps
+[ RUN  ] test_mapping_transitions
+  boundary requests exercised: 24412
+[  OK  ] test_mapping_transitions
+[ RUN  ] test_fit_invariant
+  hole sizes: 176, successful fits: 432224, good-fit rejections (block fits but class rounded above): 52352
+[  OK  ] test_fit_invariant
+[ RUN  ] test_lock_hooks
+[  OK  ] test_lock_hooks
+[ RUN  ] test_inspector_stray_bits
+[  OK  ] test_inspector_stray_bits
+
+Operation-count maxima over all unit tests (TLSF_STATS):
+op               calls  bitmap  insert  remove  neighbor  split  coalesce
+malloc_ok       489899       3       1       1         1      1         0
+malloc_fail      69260       2       0       0         0      0         0
+free            489132       0       1       2         2      0         2
+[ RUN  ] check_bounds
+[  OK  ] check_bounds
+
+1630017 checks, 0 failures
+UNIT TESTS PASSED

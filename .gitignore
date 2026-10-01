@@ -57,6 +57,7 @@ cover/
 
 # Django stuff:
 *.log
+!examples/**/logs/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -216,3 +217,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MultiAgent framework
+.venv/
+workspaces/
+__pycache__/
+# mcp_inbox default: private input files for runs started from ChatGPT
+inbox/

@@ -1,0 +1,23 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "text": "{\"sources\": [\"a"
+          }
+        ]
+      },
+      "finish_reason": "MAX_TOKENS",
+      "index": 0
+    }
+  ],
+  "usage_metadata": {
+    "prompt_token_count": 5000,
+    "candidates_token_count": 32000,
+    "total_token_count": 37000
+  },
+  "model_version": "gemini-3.8-flash",
+  "response_id": "Yx3ZaK2pLpGz"
+}

@@ -1,0 +1,11 @@
+{
+  "prompt_feedback": {
+    "block_reason": "PROHIBITED_CONTENT"
+  },
+  "usage_metadata": {
+    "prompt_token_count": 700,
+    "total_token_count": 700
+  },
+  "model_version": "gemini-3.8-flash",
+  "response_id": "Zb1"
+}
